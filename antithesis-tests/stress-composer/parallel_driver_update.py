@@ -18,7 +18,11 @@ pk = tbl_schema['pk']
 # get non-pk columns
 cols = [f'col_{col}' for col in range(tbl_schema['colCount']) if col != pk]
 # print(cols)
-con = limbo.connect('stress_composer.db')
+try:
+    con = limbo.connect('stress_composer.db')
+except limbo.OperationalError as e:
+    print(f'Failed to open stress_composer.db. Exiting... {e}')
+    exit(0)
 cur = con.cursor()
 
 # insert up to 100 rows in the selected table
