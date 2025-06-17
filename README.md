@@ -217,6 +217,12 @@ terms or conditions.
 [contribution guide]: https://github.com/tursodatabase/limbo/blob/main/CONTRIBUTING.md
 [MIT license]: https://github.com/tursodatabase/limbo/blob/main/LICENSE.md
 
+## Partners
+
+Thanks to all the partners of Limbo!
+
+<a href="https://blacksmith.sh"><img src="assets/blacksmith.svg"></a>
+
 ## Contributors
 
 Thanks to all the contributors to Limbo!
