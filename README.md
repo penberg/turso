@@ -42,6 +42,8 @@ In the future, we will be also working on:
 
 ## Getting Started
 
+Please see the [Limbo Database Manual](docs/manual.md) for more information.
+
 <details>
 <summary>💻 Command Line</summary>
 <br>
