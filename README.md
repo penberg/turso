@@ -221,7 +221,9 @@ terms or conditions.
 
 Thanks to all the partners of Limbo!
 
-<a href="https://blacksmith.sh"><img src="assets/blacksmith.svg"></a>
+<a href="https://blacksmith.sh"><img src="assets/blacksmith.svg" width="400"></a>
+
+<a href="https://antithesis.com/"><img src="assets/antithesis.jpg" width="400"></a>
 
 ## Contributors
 
