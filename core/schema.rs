@@ -31,6 +31,8 @@ pub struct Schema {
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
     pub schema_version: u32,
+    /// views stored in the schema
+    pub views: HashMap<String, Arc<View>>,
 }
 
 impl Schema {
@@ -38,6 +40,7 @@ impl Schema {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         let has_indexes = std::collections::HashSet::new();
         let indexes: HashMap<String, Vec<Arc<Index>>> = HashMap::new();
+        let views: HashMap<String, Arc<View>> = HashMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -49,6 +52,7 @@ impl Schema {
             has_indexes,
             indexes_enabled,
             schema_version: 0,
+            views,
         }
     }
 
@@ -57,6 +61,16 @@ impl Schema {
             .indexes
             .iter()
             .any(|idx| idx.1.iter().any(|i| i.name == name))
+    }
+
+    pub fn add_view(&mut self, view: View) {
+        let name = normalize_ident(&view.name);
+        self.views.insert(name, Arc::new(view));
+    }
+
+    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
+        let name = normalize_ident(name);
+        self.views.get(&name).cloned()
     }
 
     pub fn add_btree_table(&mut self, table: Rc<BTreeTable>) {
@@ -277,6 +291,31 @@ impl Schema {
                         }
                     }
                 }
+                "view" => {
+                    let name_value = record_cursor.get_value(&row, 1)?;
+                    let RefValue::Text(name_text) = name_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let name = name_text.as_str();
+
+                    let sql_value = record_cursor.get_value(&row, 4)?;
+                    let RefValue::Text(sql_text) = sql_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let sql = sql_text.as_str();
+
+                    // Parse the CREATE VIEW statement to extract the SELECT
+                    let mut parser = Parser::new(sql.as_bytes());
+                    match parser.next() {
+                        Ok(Some(Cmd::Stmt(Stmt::CreateView { select, .. }))) => {
+                            let view = View::new(name.to_string(), sql.to_string(), *select);
+                            self.add_view(view);
+                        }
+                        _ => {
+                            trace!("Failed to parse view SQL: {}", sql);
+                        }
+                    }
+                }
                 _ => {}
             };
             drop(record_cursor);
@@ -321,6 +360,17 @@ impl Schema {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct View {
+    pub name: String,
+}
+
+impl View {
+    pub fn new(name: String, _sql: String, _select_stmt: ast::Select) -> Self {
+        Self { name }
     }
 }
 

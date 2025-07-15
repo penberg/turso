@@ -6,6 +6,7 @@ mod ext;
 mod fast_lock;
 mod function;
 mod functions;
+mod incremental;
 mod info;
 mod io;
 #[cfg(feature = "json")]
@@ -283,6 +284,7 @@ impl Database {
                 wal_checkpoint_disabled: Cell::new(false),
                 capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
                 closed: Cell::new(false),
+                table_event_registry: crate::incremental::view::TableEventRegistry::new(),
             });
             if let Err(e) = conn.register_builtins() {
                 return Err(LimboError::ExtensionError(e));
@@ -337,6 +339,7 @@ impl Database {
             wal_checkpoint_disabled: Cell::new(false),
             capture_data_changes: RefCell::new(CaptureDataChangesMode::Off),
             closed: Cell::new(false),
+            table_event_registry: crate::incremental::view::TableEventRegistry::new(),
         });
 
         if let Err(e) = conn.register_builtins() {
@@ -515,6 +518,8 @@ pub struct Connection {
     wal_checkpoint_disabled: Cell<bool>,
     capture_data_changes: RefCell<CaptureDataChangesMode>,
     closed: Cell<bool>,
+    /// Registry for table change events for incremental view maintenance
+    table_event_registry: crate::incremental::view::TableEventRegistry,
 }
 
 impl Connection {
@@ -866,9 +871,13 @@ impl Connection {
         let mut schema = self.schema.borrow_mut();
         {
             let syms = self.syms.borrow();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, &mut schema, &syms, None)
-            {
+            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(
+                rows,
+                &mut schema,
+                &syms,
+                None,
+                Some(&self.table_event_registry),
+            ) {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {e}");

@@ -171,6 +171,7 @@ pub fn translate_create_table(
 pub enum SchemaEntryType {
     Table,
     Index,
+    View,
 }
 
 impl SchemaEntryType {
@@ -178,6 +179,7 @@ impl SchemaEntryType {
         match self {
             SchemaEntryType::Table => "table",
             SchemaEntryType::Index => "index",
+            SchemaEntryType::View => "view",
         }
     }
 }

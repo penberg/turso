@@ -33,10 +33,12 @@ pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod update;
 mod values;
+pub(crate) mod view;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::translate::delete::translate_delete;
+use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -96,6 +98,36 @@ pub fn translate(
             connection.clone(),
             program,
         )?,
+        // CREATE VIEW needs access to connection for table event registry
+        ast::Stmt::CreateView {
+            view_name, select, ..
+        } => view::translate_create_view(
+            schema,
+            &view_name.name.0,
+            &select,
+            connection.clone(),
+            program,
+        )?,
+        // CREATE TABLE needs access to connection for table event registry
+        ast::Stmt::CreateTable {
+            temporary,
+            if_not_exists,
+            tbl_name,
+            body,
+        } => {
+            let prog = crate::translate::schema::translate_create_table(
+                tbl_name.clone(),
+                temporary,
+                *body,
+                if_not_exists,
+                schema,
+                program,
+            )?;
+            // Create table event stream for the newly created table
+            let table_name = normalize_ident(&tbl_name.name.0);
+            connection.table_event_registry.create_stream(&table_name);
+            prog
+        }
         stmt => translate_inner(schema, stmt, syms, program)?,
     };
 

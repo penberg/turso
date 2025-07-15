@@ -1,5 +1,6 @@
 #![allow(unused_variables)]
 use crate::function::AlterTableFunc;
+use crate::incremental::view::TableChangeEvent;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::storage::btree::{integrity_check, IntegrityCheckError, IntegrityCheckState};
 use crate::storage::database::FileMemoryStorage;
@@ -4736,7 +4737,7 @@ pub fn op_insert(
         key_reg,
         record_reg,
         flag,
-        table_name: _,
+        table_name,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -4759,26 +4760,26 @@ pub fn op_insert(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    let key = match &state.registers[*key_reg].get_owned_value() {
+        Value::Integer(i) => *i,
+        _ => unreachable!("expected integer key"),
+    };
+
+    let record = match &state.registers[*record_reg] {
+        Register::Record(r) => std::borrow::Cow::Borrowed(r),
+        Register::Value(value) => {
+            let x = 1;
+            let regs = &state.registers[*record_reg..*record_reg + 1];
+            let new_regs = [&state.registers[*record_reg]];
+            let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+            std::borrow::Cow::Owned(record)
+        }
+        Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
+    };
+
     {
         let mut cursor_ref = state.get_cursor(*cursor_id);
         let cursor = cursor_ref.as_btree_mut();
-
-        let key = match &state.registers[*key_reg].get_owned_value() {
-            Value::Integer(i) => *i,
-            _ => unreachable!("expected integer key"),
-        };
-
-        let record = match &state.registers[*record_reg] {
-            Register::Record(r) => std::borrow::Cow::Borrowed(r),
-            Register::Value(value) => {
-                let x = 1;
-                let regs = &state.registers[*record_reg..*record_reg + 1];
-                let new_regs = [&state.registers[*record_reg]];
-                let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
-                std::borrow::Cow::Owned(record)
-            }
-            Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
-        };
 
         // query planner must emit NewRowId/NotExists/etc op-codes which will properly reposition cursor
         return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record.as_ref())), true));
@@ -4791,6 +4792,18 @@ pub fn op_insert(
         cursor.root_page()
     };
     if root_page != 1 {
+        // Emit table change event for incremental view maintenance (only for data tables, not schema)
+        let change_event = TableChangeEvent::Insert {
+            table_name: table_name.clone(),
+            row_key: key,
+            record: record.clone().into_owned(),
+        };
+        program
+            .connection
+            .table_event_registry
+            .emit_change(change_event);
+
+        // Update last_insert_rowid for data table inserts
         state.op_insert_state = OpInsertState::UpdateLastRowid;
     } else {
         state.pc += 1;
@@ -4829,11 +4842,36 @@ pub fn op_delete(
     let Insn::Delete { cursor_id } = insn else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    // Get row key and root page before deleting
+    let (row_key, root_page) = {
+        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = cursor.as_btree_mut();
+        let row_key = return_if_io!(cursor.rowid()).unwrap_or(0);
+        let root_page = cursor.root_page();
+        (row_key, root_page)
+    };
+
     {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         return_if_io!(cursor.delete());
     }
+
+    // Only emit change events for data tables, not schema modifications
+    if root_page != 1 {
+        // Emit table change event for incremental view maintenance
+        // Note: We don't have table_name in Delete instruction, so we'll emit a generic delete event
+        // TODO: We could get the table name from the cursor metadata if needed
+        let change_event = TableChangeEvent::Delete {
+            table_name: format!("table_{}", cursor_id), // Temporary - we'd need cursor metadata for real table name
+            row_key,
+        };
+        program
+            .connection
+            .table_event_registry
+            .emit_change(change_event);
+    }
+
     let prev_changes = program.n_change.get();
     program.n_change.set(prev_changes + 1);
     state.pc += 1;
@@ -5653,6 +5691,7 @@ pub fn op_parse_schema(
                 &mut new_schema,
                 &conn.syms.borrow(),
                 state.mv_tx_id,
+                Some(&conn.table_event_registry),
             )?;
         }
         conn.schema.replace(new_schema);
@@ -5667,6 +5706,7 @@ pub fn op_parse_schema(
                 &mut new_schema,
                 &conn.syms.borrow(),
                 state.mv_tx_id,
+                Some(&conn.table_event_registry),
             )?;
         }
 

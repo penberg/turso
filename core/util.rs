@@ -1,5 +1,6 @@
 use crate::translate::expr::WalkControl;
 use crate::{
+    incremental::view::IncrementalView,
     schema::{self, Column, Schema, Type},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
@@ -53,6 +54,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx_id: Option<u64>,
+    table_event_registry: Option<&crate::incremental::view::TableEventRegistry>,
 ) -> Result<()> {
     if let Some(mut rows) = rows {
         rows.set_mv_tx_id(mv_tx_id);
@@ -66,7 +68,7 @@ pub fn parse_schema_rows(
                 StepResult::Row => {
                     let row = rows.row().unwrap();
                     let ty = row.get::<&str>(0)?;
-                    if !["table", "index"].contains(&ty) {
+                    if !["table", "index", "view"].contains(&ty) {
                         continue;
                     }
                     match ty {
@@ -92,7 +94,13 @@ pub fn parse_schema_rows(
                                 schema.add_virtual_table(vtab);
                             } else {
                                 let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
+                                let table_name = table.name.clone();
                                 schema.add_btree_table(Rc::new(table));
+
+                                // Create table event stream for incremental view maintenance
+                                if let Some(registry) = table_event_registry {
+                                    registry.create_stream(&table_name);
+                                }
                             }
                         }
                         "index" => {
@@ -122,6 +130,10 @@ pub fn parse_schema_rows(
                                     }
                                 }
                             }
+                        }
+                        "view" => {
+                            let sql: &str = row.get::<&str>(4)?;
+                            IncrementalView::from_sql(sql)?;
                         }
                         _ => continue,
                     }
