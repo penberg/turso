@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use napi::iterator::Generator;
-use napi::{bindgen_prelude::ObjectFinalize, Env, JsUnknown};
+use napi::{bindgen_prelude::*, Env, JsValue, sys};
 use napi_derive::napi;
 use turso_core::{LimboError, StepResult};
 
@@ -112,7 +112,7 @@ impl Database {
         env: Env,
         pragma_name: String,
         options: Option<PragmaOptions>,
-    ) -> napi::Result<JsUnknown> {
+    ) -> napi::Result<sys::napi_value> {
         let sql = format!("PRAGMA {pragma_name}");
         let stmt = self.prepare(sql)?;
         match options {
@@ -125,7 +125,7 @@ impl Database {
                             return to_js_value(&env, &row[0]);
                         }
                         turso_core::StepResult::Done => {
-                            return Ok(env.get_undefined()?.into_unknown())
+                            return unsafe { <() as ToNapiValue>::to_napi_value(env.raw(), ()) }
                         }
                         turso_core::StepResult::IO => {
                             stmt.run_once().map_err(into_napi_error)?;
@@ -266,7 +266,7 @@ impl Statement {
     }
 
     #[napi]
-    pub fn get(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
+    pub fn get(&self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<sys::napi_value> {
         let mut stmt = self.check_and_bind(env, args)?;
 
         loop {
@@ -279,12 +279,12 @@ impl Statement {
                         PresentationMode::Raw => {
                             let mut raw_obj = env.create_array(row.len() as u32)?;
                             for (idx, value) in row.get_values().enumerate() {
-                                let js_value = to_js_value(&env, value);
-
-                                raw_obj.set(idx as u32, js_value)?;
+                                let js_value = to_js_value(&env, value)?;
+                                let js_val = unsafe { Unknown::from_raw_unchecked(env.raw(), js_value) };
+                                raw_obj.set_element(idx as u32, js_val)?;
                             }
 
-                            return Ok(raw_obj.coerce_to_object()?.into_unknown());
+                            return Ok(raw_obj.raw());
                         }
                         PresentationMode::Pluck => {
                             let (_, value) =
@@ -297,20 +297,22 @@ impl Statement {
                             return Ok(js_value);
                         }
                         PresentationMode::None => {
-                            let mut obj = env.create_object()?;
+                            let mut obj = Object::new(&env)?;
 
                             for (idx, value) in row.get_values().enumerate() {
                                 let key = stmt.get_column_name(idx);
-                                let js_value = to_js_value(&env, value);
-
-                                obj.set_named_property(&key, js_value)?;
+                                let js_value = to_js_value(&env, value)?;
+                                let js_val = unsafe { Unknown::from_raw_unchecked(env.raw(), js_value) };
+                                obj.set_named_property(&key, js_val)?;
                             }
 
-                            return Ok(obj.into_unknown());
+                            return Ok(obj.raw());
                         }
                     }
                 }
-                turso_core::StepResult::Done => return Ok(env.get_undefined()?.into_unknown()),
+                turso_core::StepResult::Done => {
+                    return unsafe { <() as ToNapiValue>::to_napi_value(env.raw(), ()) };
+                },
                 turso_core::StepResult::IO => {
                     stmt.run_once().map_err(into_napi_error)?;
                     continue;
@@ -326,20 +328,20 @@ impl Statement {
     }
 
     #[napi]
-    pub fn run(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<RunResult> {
+    pub fn run(&self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<RunResult> {
         self.run_and_build_info_object(|| self.run_internal(env, args))
     }
 
-    fn run_internal(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
+    fn run_internal(&self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<sys::napi_value> {
         let stmt = self.check_and_bind(env, args)?;
 
         self.internal_all(env, stmt)
     }
 
-    fn run_and_build_info_object<T, E>(
+    fn run_and_build_info_object<T>(
         &self,
-        query_fn: impl FnOnce() -> Result<T, E>,
-    ) -> Result<RunResult, E> {
+        query_fn: impl FnOnce() -> napi::Result<T>,
+    ) -> napi::Result<RunResult> {
         let total_changes_before = self.database.conn.total_changes();
 
         query_fn()?;
@@ -361,7 +363,7 @@ impl Statement {
     pub fn iterate(
         &self,
         env: Env,
-        args: Option<Vec<JsUnknown>>,
+        args: Option<Vec<Unknown>>,
     ) -> napi::Result<IteratorStatement> {
         if let Some(some_args) = args.as_ref() {
             if some_args.iter().len() != 0 {
@@ -378,7 +380,7 @@ impl Statement {
     }
 
     #[napi]
-    pub fn all(&self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<JsUnknown> {
+    pub fn all(&self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<sys::napi_value> {
         let stmt = self.check_and_bind(env, args)?;
 
         self.internal_all(env, stmt)
@@ -388,8 +390,8 @@ impl Statement {
         &self,
         env: Env,
         mut stmt: RefMut<'_, turso_core::Statement>,
-    ) -> napi::Result<JsUnknown> {
-        let mut results = env.create_empty_array()?;
+    ) -> napi::Result<sys::napi_value> {
+        let mut results = env.create_array(0)?;
         let mut index = 0;
         loop {
             match stmt.step().map_err(into_napi_error)? {
@@ -401,9 +403,10 @@ impl Statement {
                             let mut raw_array = env.create_array(row.len() as u32)?;
                             for (idx, value) in row.get_values().enumerate() {
                                 let js_value = to_js_value(&env, value)?;
-                                raw_array.set(idx as u32, js_value)?;
+                                let js_val = unsafe { Unknown::from_raw_unchecked(env.raw(), js_value) };
+                                raw_array.set_element(idx as u32, js_val)?;
                             }
-                            results.set_element(index, raw_array.coerce_to_object()?)?;
+                            results.set_element(index, raw_array)?;
                             index += 1;
                             continue;
                         }
@@ -414,16 +417,18 @@ impl Statement {
                                     "Pluck mode requires at least one column in the result",
                                 ))?;
                             let js_value = to_js_value(&env, value)?;
-                            results.set_element(index, js_value)?;
+                            let js_val = unsafe { Unknown::from_raw_unchecked(env.raw(), js_value) };
+                            results.set_element(index, js_val)?;
                             index += 1;
                             continue;
                         }
                         PresentationMode::None => {
-                            let mut obj = env.create_object()?;
+                            let mut obj = Object::new(&env)?;
                             for (idx, value) in row.get_values().enumerate() {
                                 let key = stmt.get_column_name(idx);
-                                let js_value = to_js_value(&env, value);
-                                obj.set_named_property(&key, js_value)?;
+                                let js_value = to_js_value(&env, value)?;
+                                let js_val = unsafe { Unknown::from_raw_unchecked(env.raw(), js_value) };
+                                obj.set_named_property(&key, js_val)?;
                             }
                             results.set_element(index, obj)?;
                             index += 1;
@@ -445,7 +450,7 @@ impl Statement {
             }
         }
 
-        Ok(results.into_unknown())
+        Ok(results.raw())
     }
 
     #[napi]
@@ -475,7 +480,7 @@ impl Statement {
     }
 
     #[napi]
-    pub fn bind(&mut self, env: Env, args: Option<Vec<JsUnknown>>) -> napi::Result<Self, String> {
+    pub fn bind(&mut self, env: Env, args: Option<Vec<Unknown>>) -> napi::Result<Self, String> {
         self.check_and_bind(env, args)
             .map_err(with_sqlite_error_message)?;
         self.binded = true;
@@ -488,7 +493,7 @@ impl Statement {
     fn check_and_bind(
         &self,
         env: Env,
-        args: Option<Vec<JsUnknown>>,
+        args: Option<Vec<Unknown>>,
     ) -> napi::Result<RefMut<'_, turso_core::Statement>> {
         let mut stmt = self.inner.borrow_mut();
         stmt.reset();
@@ -507,7 +512,7 @@ impl Statement {
 
             if args.len() == 1 {
                 if matches!(args[0].get_type()?, napi::ValueType::Object) {
-                    let obj: napi::JsObject =
+                    let obj: Object =
                         args.into_iter().next().unwrap().coerce_to_object()?;
 
                     if obj.is_array()? {
@@ -529,8 +534,8 @@ impl Statement {
 
 fn bind_positional_params(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    args: Vec<JsUnknown>,
-) -> Result<(), napi::Error> {
+    args: Vec<Unknown>,
+) -> napi::Result<()> {
     for (i, elem) in args.into_iter().enumerate() {
         let value = from_js_value(elem)?;
         stmt.bind_at(NonZeroUsize::new(i + 1).unwrap(), value);
@@ -540,8 +545,8 @@ fn bind_positional_params(
 
 fn bind_host_params(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    obj: &napi::JsObject,
-) -> Result<(), napi::Error> {
+    obj: &Object,
+) -> napi::Result<()> {
     if first_key_is_number(obj) {
         bind_numbered_params(stmt, obj)?;
     } else {
@@ -551,21 +556,28 @@ fn bind_host_params(
     Ok(())
 }
 
-fn first_key_is_number(obj: &napi::JsObject) -> bool {
-    napi::JsObject::keys(obj)
-        .iter()
-        .flatten()
-        .filter(|key| matches!(obj.has_own_property(key), Ok(result) if result))
-        .take(1)
-        .any(|key| str::parse::<u32>(key).is_ok())
+fn first_key_is_number(obj: &Object) -> bool {
+    if let Ok(keys) = obj.get_property_names() {
+        if let Ok(length) = keys.get_array_length() {
+            if length > 0 {
+                if let Ok(key) = keys.get_element::<String>(0) {
+                    return str::parse::<u32>(&key).is_ok();
+                }
+            }
+        }
+    }
+    false
 }
 
 fn bind_numbered_params(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    obj: &napi::JsObject,
-) -> Result<(), napi::Error> {
-    for key in napi::JsObject::keys(obj)?.iter() {
-        let Ok(param_idx) = str::parse::<u32>(key) else {
+    obj: &Object,
+) -> napi::Result<()> {
+    let keys = obj.get_property_names()?;
+    let length = keys.get_array_length()?;
+    for idx in 0..length {
+        let key: String = keys.get_element(idx)?;
+        let Ok(param_idx) = str::parse::<u32>(&key) else {
             return Err(napi::Error::new(
                 napi::Status::GenericFailure,
                 "cannot mix numbers and strings",
@@ -578,15 +590,15 @@ fn bind_numbered_params(
             ));
         };
 
-        stmt.bind_at(non_zero, from_js_value(obj.get_named_property(key)?)?);
+        stmt.bind_at(non_zero, from_js_value(obj.get_named_property(&key)?)?);
     }
     Ok(())
 }
 
 fn bind_named_params(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    obj: &napi::JsObject,
-) -> Result<(), napi::Error> {
+    obj: &Object,
+) -> napi::Result<()> {
     for idx in 1..stmt.parameters_count() + 1 {
         let non_zero_idx = NonZero::new(idx).unwrap();
 
@@ -597,7 +609,7 @@ fn bind_named_params(
             )));
         };
 
-        let value = obj.get_named_property::<napi::JsUnknown>(&name[1..])?;
+        let value = obj.get_named_property::<Unknown>(&name[1..])?;
         stmt.bind_at(non_zero_idx, from_js_value(value)?);
     }
 
@@ -606,8 +618,8 @@ fn bind_named_params(
 
 fn bind_positional_param_array(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    obj: &napi::JsObject,
-) -> Result<(), napi::Error> {
+    obj: &Object,
+) -> napi::Result<()> {
     assert!(obj.is_array()?, "bind_array can only be called with arrays");
 
     for idx in 1..obj.get_array_length()? {
@@ -622,8 +634,8 @@ fn bind_positional_param_array(
 
 fn bind_single_param(
     stmt: &mut RefMut<'_, turso_core::Statement>,
-    obj: napi::JsUnknown,
-) -> Result<(), napi::Error> {
+    obj: Unknown,
+) -> napi::Result<()> {
     stmt.bind_at(NonZero::new(1).unwrap(), from_js_value(obj)?);
     Ok(())
 }
@@ -638,7 +650,7 @@ pub struct IteratorStatement {
 
 #[napi]
 impl Generator for IteratorStatement {
-    type Yield = JsUnknown;
+    type Yield = Unknown<'static>;
 
     type Next = ();
 
@@ -656,25 +668,30 @@ impl Generator for IteratorStatement {
                         PresentationMode::Raw => {
                             let mut raw_array = self.env.create_array(row.len() as u32).ok()?;
                             for (idx, value) in row.get_values().enumerate() {
-                                let js_value = to_js_value(&self.env, value);
-                                raw_array.set(idx as u32, js_value).ok()?;
+                                let js_value = to_js_value(&self.env, value).ok()?;
+                                let js_val = unsafe { Unknown::from_raw_unchecked(self.env.raw(), js_value) };
+                                raw_array.set_element(idx as u32, js_val).ok()?;
                             }
 
-                            return Some(raw_array.coerce_to_object().ok()?.into_unknown());
+                            let raw_val = raw_array.raw();
+                            return unsafe { Some(Unknown::from_raw_unchecked(self.env.raw(), raw_val)) };
                         }
                         PresentationMode::Pluck => {
                             let (_, value) = row.get_values().enumerate().next()?;
-                            return to_js_value(&self.env, value).ok();
+                            let js_val = to_js_value(&self.env, value).ok()?;
+                            return unsafe { Some(Unknown::from_raw_unchecked(self.env.raw(), js_val)) };
                         }
                         PresentationMode::None => {
-                            let mut js_row = self.env.create_object().ok()?;
+                            let mut js_row = Object::new(&self.env).ok()?;
                             for (idx, value) in row.get_values().enumerate() {
                                 let key = stmt.get_column_name(idx);
-                                let js_value = to_js_value(&self.env, value);
-                                js_row.set_named_property(&key, js_value).ok()?;
+                                let js_value = to_js_value(&self.env, value).ok()?;
+                                let js_val = unsafe { Unknown::from_raw_unchecked(self.env.raw(), js_value) };
+                                js_row.set_named_property(&key, js_val).ok()?;
                             }
 
-                            return Some(js_row.into_unknown());
+                            let raw_val = js_row.raw();
+                            return unsafe { Some(Unknown::from_raw_unchecked(self.env.raw(), raw_val)) };
                         }
                     }
                 }
@@ -689,23 +706,38 @@ impl Generator for IteratorStatement {
     }
 }
 
-fn to_js_value(env: &napi::Env, value: &turso_core::Value) -> napi::Result<JsUnknown> {
+fn to_js_value(env: &napi::Env, value: &turso_core::Value) -> napi::Result<sys::napi_value> {
     match value {
-        turso_core::Value::Null => Ok(env.get_null()?.into_unknown()),
-        turso_core::Value::Integer(i) => Ok(env.create_int64(*i)?.into_unknown()),
-        turso_core::Value::Float(f) => Ok(env.create_double(*f)?.into_unknown()),
-        turso_core::Value::Text(s) => Ok(env.create_string(s.as_str())?.into_unknown()),
-        turso_core::Value::Blob(b) => Ok(env.create_buffer_copy(b.as_slice())?.into_unknown()),
+        turso_core::Value::Null => {
+            let mut result = std::ptr::null_mut();
+            unsafe {
+                sys::napi_get_null(env.raw(), &mut result);
+            }
+            Ok(result)
+        },
+        turso_core::Value::Integer(i) => {
+            unsafe { ToNapiValue::to_napi_value(env.raw(), *i) }
+        },
+        turso_core::Value::Float(f) => {
+            unsafe { ToNapiValue::to_napi_value(env.raw(), *f) }
+        },
+        turso_core::Value::Text(s) => {
+            unsafe { ToNapiValue::to_napi_value(env.raw(), s.as_str()) }
+        },
+        turso_core::Value::Blob(b) => {
+            let buf = Buffer::from(b.as_slice());
+            unsafe { ToNapiValue::to_napi_value(env.raw(), buf) }
+        },
     }
 }
 
-fn from_js_value(value: JsUnknown) -> napi::Result<turso_core::Value> {
+fn from_js_value(value: Unknown) -> napi::Result<turso_core::Value> {
     match value.get_type()? {
         napi::ValueType::Undefined | napi::ValueType::Null | napi::ValueType::Unknown => {
             Ok(turso_core::Value::Null)
         }
         napi::ValueType::Boolean => {
-            let b = value.coerce_to_bool()?.get_value()?;
+            let b = value.coerce_to_bool()?;
             Ok(turso_core::Value::Integer(b as i64))
         }
         napi::ValueType::Number => {
@@ -801,7 +833,7 @@ fn into_napi_error_with_message(
 
 #[inline]
 fn with_sqlite_error_message(err: napi::Error) -> napi::Error<String> {
-    napi::Error::new("SQLITE_ERROR".to_owned(), err.reason)
+    napi::Error::new("SQLITE_ERROR".to_owned(), err.reason.clone())
 }
 
 #[inline]
