@@ -901,7 +901,7 @@ fn test_snapshot_isolation_tx_visible1() {
     ]);
 
     let current_tx = new_tx(4, 4, TransactionState::Preparing);
-    let current_tx = current_tx.read().unwrap();
+    let current_tx = current_tx.read;
 
     let rv_visible = |begin: TxTimestampOrID, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
