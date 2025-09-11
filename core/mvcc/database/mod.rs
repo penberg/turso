@@ -127,7 +127,7 @@ impl Transaction {
         self.read_set.insert(id);
     }
 
-    fn insert_to_write_set(&mut self, id: RowID) {
+    fn insert_to_write_set(&self, id: RowID) {
         self.write_set.insert(id);
     }
 }
@@ -352,7 +352,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .txs
                     .get(&self.tx_id)
                     .ok_or(LimboError::TxTerminated)?;
-                let tx = tx.value().write();
+                let tx = tx.value();
                 match tx.state.load() {
                     TransactionState::Terminated => {
                         return Err(LimboError::TxTerminated);
@@ -819,7 +819,7 @@ impl DeleteRowStateMachine {
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock> {
     rows: SkipMap<RowID, RwLock<Vec<RowVersion>>>,
-    txs: SkipMap<TxID, RwLock<Transaction>>,
+    txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
     clock: Clock,
@@ -869,7 +869,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .txs
             .get(&tx_id)
             .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let mut tx = tx.value().write();
+        let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id;
         let row_version = RowVersion {
@@ -878,7 +878,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             row,
         };
         tx.insert_to_write_set(id);
-        drop(tx);
         self.insert_version(id, row_version);
         Ok(())
     }
@@ -942,7 +941,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .txs
                     .get(&tx_id)
                     .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                let tx = tx.value().read();
+                let tx = tx.value();
                 assert_eq!(tx.state, TransactionState::Active);
                 // A transaction cannot delete a version that it cannot see,
                 // nor can it conflict with it.
@@ -952,7 +951,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if is_write_write_conflict(&self.txs, &tx, rv) {
                     drop(row_versions);
                     drop(row_versions_opt);
-                    drop(tx);
                     self.rollback_tx(tx_id, pager);
                     return Err(LimboError::WriteWriteConflict);
                 }
@@ -960,12 +958,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
                 drop(row_versions);
                 drop(row_versions_opt);
-                drop(tx);
                 let tx = self
                     .txs
                     .get(&tx_id)
                     .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                let mut tx = tx.value().write();
+                let tx = tx.value();
                 tx.insert_to_write_set(id);
                 return Ok(true);
             }
@@ -990,7 +987,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
         let tx = self.txs.get(&tx_id).unwrap();
-        let tx = tx.value().read();
+        let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         if let Some(row_versions) = self.rows.get(&id) {
             let row_versions = row_versions.value().read();
@@ -1065,7 +1062,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
 
         let tx = self.txs.get(&tx_id).unwrap();
-        let tx = tx.value().read();
+        let tx = tx.value();
         let mut rows = self.rows.range(min_bound..max_bound);
         loop {
             // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
@@ -1083,7 +1080,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn find_last_visible_version(
         &self,
-        tx: &parking_lot::lock_api::RwLockReadGuard<'_, parking_lot::RawRwLock, Transaction>,
+        tx: &Transaction,
         row: crossbeam_skiplist::map::Entry<
             '_,
             RowID,
@@ -1107,7 +1104,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("seek_rowid(bound={:?}, lower_bound={})", bound, lower_bound,);
 
         let tx = self.txs.get(&tx_id).unwrap();
-        let tx = tx.value().read();
+        let tx = tx.value();
         if lower_bound {
             self.rows
                 .lower_bound(bound)
@@ -1153,7 +1150,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     tx_id
                 );
                 tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
-                self.txs.insert(tx_id, RwLock::new(tx));
+                self.txs.insert(tx_id, tx);
             }
         }
 
@@ -1170,7 +1167,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let begin_ts = self.get_timestamp();
         let tx = Transaction::new(tx_id, begin_ts);
         tracing::trace!("begin_tx(tx_id={})", tx_id);
-        self.txs.insert(tx_id, RwLock::new(tx));
+        self.txs.insert(tx_id, tx);
 
         // TODO: we need to tie a pager's read transaction to a transaction ID, so that future refactors to read
         // pages from WAL/DB read from a consistent state to maintiain snapshot isolation.
@@ -1212,12 +1209,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// * `tx_id` - The ID of the transaction to abort.
     pub fn rollback_tx(&self, tx_id: TxID, pager: Rc<Pager>) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
-        let tx = tx_unlocked.value().write();
+        let tx = tx_unlocked.value();
         assert_eq!(tx.state, TransactionState::Active);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
         let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
-        drop(tx);
 
         if self.is_exclusive_tx(&tx_id) {
             self.release_exclusive_tx(&tx_id);
@@ -1233,7 +1229,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        let tx = tx_unlocked.value().read();
+        let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
         pager.end_read_tx().unwrap();
@@ -1296,7 +1292,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // a transaction started before this row version ended, ergo row version is needed
                         // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
                         self.txs.iter().any(|tx| {
-                            let tx = tx.value().read();
+                            let tx = tx.value();
                             // FIXME: verify!
                             match tx.state.load() {
                                 TransactionState::Active | TransactionState::Preparing => {
@@ -1351,7 +1347,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn get_begin_timestamp(&self, ts_or_id: &TxTimestampOrID) -> u64 {
         match ts_or_id {
             TxTimestampOrID::Timestamp(ts) => *ts,
-            TxTimestampOrID::TxID(tx_id) => self.txs.get(tx_id).unwrap().value().read().begin_ts,
+            TxTimestampOrID::TxID(tx_id) => self.txs.get(tx_id).unwrap().value().begin_ts,
         }
     }
 
@@ -1542,14 +1538,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
 pub(crate) fn is_write_write_conflict(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
+    txs: &SkipMap<TxID, Transaction>,
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
     match rv.end {
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let te = txs.get(&rv_end).unwrap();
-            let te = te.value().read();
+            let te = te.value();
             if te.tx_id == tx.tx_id {
                 return false;
             }
@@ -1568,14 +1564,14 @@ impl RowVersion {
     pub fn is_visible_to(
         &self,
         tx: &Transaction,
-        txs: &SkipMap<TxID, RwLock<Transaction>>,
+        txs: &SkipMap<TxID, Transaction>,
     ) -> bool {
         is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
     }
 }
 
 fn is_begin_visible(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
+    txs: &SkipMap<TxID, Transaction>,
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
@@ -1583,7 +1579,7 @@ fn is_begin_visible(
         TxTimestampOrID::Timestamp(rv_begin_ts) => tx.begin_ts >= rv_begin_ts,
         TxTimestampOrID::TxID(rv_begin) => {
             let tb = txs.get(&rv_begin).unwrap();
-            let tb = tb.value().read();
+            let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
                 TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
@@ -1605,7 +1601,7 @@ fn is_begin_visible(
 }
 
 fn is_end_visible(
-    txs: &SkipMap<TxID, RwLock<Transaction>>,
+    txs: &SkipMap<TxID, Transaction>,
     current_tx: &Transaction,
     row_version: &RowVersion,
 ) -> bool {
@@ -1613,7 +1609,7 @@ fn is_end_visible(
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let other_tx = txs.get(&rv_end).unwrap();
-            let other_tx = other_tx.value().read();
+            let other_tx = other_tx.value();
             let visible = match other_tx.state.load() {
                 // V's sharp mind discovered an issue with the hekaton paper which basically states that a
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
