@@ -95,9 +95,6 @@ async fn main() -> Result<()> {
         println!("Database file size: {} bytes", metadata.len());
     }
 
-    // Clean up database file
-    std::fs::remove_file(db_path).ok();
-
     Ok(())
 }
 

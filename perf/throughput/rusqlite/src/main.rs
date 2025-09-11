@@ -90,9 +90,6 @@ fn main() -> Result<()> {
         "Database file exists: {}",
         std::path::Path::new(db_path).exists()
     );
-    if let Ok(metadata) = std::fs::metadata(db_path) {
-        println!("Database file size: {} bytes", metadata.len());
-    }
 
     Ok(())
 }
