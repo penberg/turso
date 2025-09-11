@@ -27,9 +27,13 @@ fn main() -> Result<()> {
     );
 
     let db_path = "write_throughput_test.db";
-
     if std::path::Path::new(db_path).exists() {
         std::fs::remove_file(db_path).expect("Failed to remove existing database");
+    }
+
+    let wal_path = "write_throughput_test.db-wal";
+    if std::path::Path::new(wal_path).exists() {
+        std::fs::remove_file(wal_path).expect("Failed to remove existing database");
     }
 
     let _conn = setup_database(db_path)?;
