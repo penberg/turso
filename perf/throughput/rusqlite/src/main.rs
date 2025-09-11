@@ -122,6 +122,8 @@ fn worker_thread(
     let conn = Connection::open(&db_path)?;
 
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    
+    let mut stmt = conn.prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")?;
 
     start_barrier.wait();
 
@@ -133,10 +135,7 @@ fn worker_thread(
 
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-            conn.execute(
-                "INSERT INTO test_table (id, data) VALUES (?, ?)",
-                [&id.to_string(), &format!("data_{}", id)],
-            )?;
+            stmt.execute([&id.to_string(), &format!("data_{}", id)])?;
             total_inserts += 1;
         }
 

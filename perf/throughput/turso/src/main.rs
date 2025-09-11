@@ -139,6 +139,8 @@ async fn worker_thread(
     mode: TransactionMode,
 ) -> Result<u64> {
     let conn = db.connect()?;
+    
+    let mut stmt = conn.prepare("INSERT INTO test_table (id, data) VALUES (?, ?)").await?;
 
     start_barrier.wait();
 
@@ -154,8 +156,7 @@ async fn worker_thread(
 
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-            conn.execute(
-                "INSERT INTO test_table (id, data) VALUES (?, ?)",
+            stmt.execute(
                 turso::params::Params::Positional(vec![
                     turso::Value::Integer(id as i64),
                     turso::Value::Text(format!("data_{}", id)),
