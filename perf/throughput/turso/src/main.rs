@@ -1,8 +1,15 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 use tokio::runtime::Runtime;
 use turso::{Builder, Database, Result};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TransactionMode {
+    Legacy,
+    Mvcc,
+    Concurrent,
+}
 
 #[derive(Parser)]
 #[command(name = "write-throughput")]
@@ -16,6 +23,9 @@ struct Args {
 
     #[arg(short = 'i', long = "iterations", default_value = "10")]
     iterations: usize,
+
+    #[arg(short = 'm', long = "mode", default_value = "legacy")]
+    mode: TransactionMode,
 }
 
 #[tokio::main]
@@ -23,8 +33,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     println!(
-        "Running write throughput benchmark with {} threads, {} batch size, {} iterations",
-        args.threads, args.batch_size, args.iterations
+        "Running write throughput benchmark with {} threads, {} batch size, {} iterations, mode: {:?}",
+        args.threads, args.batch_size, args.iterations, args.mode
     );
 
     let db_path = "write_throughput_test.db";
@@ -36,7 +46,7 @@ async fn main() -> Result<()> {
         std::fs::remove_file(wal_path).expect("Failed to remove existing database");
     }
 
-    let db = setup_database(db_path).await?;
+    let db = setup_database(db_path, args.mode).await?;
 
     let start_barrier = Arc::new(Barrier::new(args.threads));
     let mut handles = Vec::new();
@@ -55,6 +65,7 @@ async fn main() -> Result<()> {
                 args.batch_size,
                 args.iterations,
                 barrier,
+                args.mode,
             ))
         });
 
@@ -98,8 +109,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn setup_database(db_path: &str) -> Result<Database> {
-    let db = Builder::new_local(db_path).build().await?;
+async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database> {
+    let builder = Builder::new_local(db_path);
+    let db = match mode {
+        TransactionMode::Legacy => builder.build().await?,
+        TransactionMode::Mvcc | TransactionMode::Concurrent => builder.with_mvcc(true).build().await?,
+    };
     let conn = db.connect()?;
 
     conn.execute(
@@ -121,6 +136,7 @@ async fn worker_thread(
     batch_size: usize,
     iterations: usize,
     start_barrier: Arc<Barrier>,
+    mode: TransactionMode,
 ) -> Result<u64> {
     let conn = db.connect()?;
 
@@ -130,7 +146,11 @@ async fn worker_thread(
     let mut total_inserts = 0;
 
     for iteration in 0..iterations {
-        conn.execute("BEGIN", ()).await?;
+        let begin_stmt = match mode {
+            TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
+            TransactionMode::Concurrent => "BEGIN CONCURRENT",
+        };
+        conn.execute(begin_stmt, ()).await?;
 
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
