@@ -31,6 +31,7 @@
 //! * Optimistic reads and writes
 //! * Garbage collection
 
+pub mod bwtree;
 pub mod clock;
 pub mod cursor;
 pub mod database;

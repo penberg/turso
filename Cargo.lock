@@ -4254,6 +4254,7 @@ dependencies = [
  "rustix 1.0.7",
  "ryu",
  "serde",
+ "smallvec",
  "sorted-vec",
  "strum",
  "strum_macros",
@@ -4424,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.1.5"
+version = "0.2.0-pre.1"
 dependencies = [
  "anyhow",
  "clap",

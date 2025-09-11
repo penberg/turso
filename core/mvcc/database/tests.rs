@@ -1009,8 +1009,8 @@ fn test_snapshot_isolation_tx_visible1() {
 
     let rv_visible = |begin: TxTimestampOrID, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
-            begin,
-            end,
+            begin: AtomicU64::new(begin.into()),
+            end: AtomicU64::new(end.map(|e| e.into()).unwrap_or(0)),
             row: generate_simple_string_row(1, 1, "testme"),
         };
         tracing::debug!("Testing visibility of {row_version:?}");

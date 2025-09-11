@@ -1373,6 +1373,7 @@ dependencies = [
  "regex-syntax",
  "rustix",
  "ryu",
+ "smallvec",
  "strum",
  "strum_macros",
  "tempfile",
