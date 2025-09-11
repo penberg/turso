@@ -113,7 +113,9 @@ async fn setup_database(db_path: &str, mode: TransactionMode) -> Result<Database
     let builder = Builder::new_local(db_path);
     let db = match mode {
         TransactionMode::Legacy => builder.build().await?,
-        TransactionMode::Mvcc | TransactionMode::Concurrent => builder.with_mvcc(true).build().await?,
+        TransactionMode::Mvcc | TransactionMode::Concurrent => {
+            builder.with_mvcc(true).build().await?
+        }
     };
     let conn = db.connect()?;
 
@@ -139,8 +141,10 @@ async fn worker_thread(
     mode: TransactionMode,
 ) -> Result<u64> {
     let conn = db.connect()?;
-    
-    let mut stmt = conn.prepare("INSERT INTO test_table (id, data) VALUES (?, ?)").await?;
+
+    let mut stmt = conn
+        .prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")
+        .await?;
 
     start_barrier.wait();
 
@@ -156,12 +160,10 @@ async fn worker_thread(
 
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-            stmt.execute(
-                turso::params::Params::Positional(vec![
-                    turso::Value::Integer(id as i64),
-                    turso::Value::Text(format!("data_{}", id)),
-                ]),
-            )
+            stmt.execute(turso::params::Params::Positional(vec![
+                turso::Value::Integer(id as i64),
+                turso::Value::Text(format!("data_{}", id)),
+            ]))
             .await?;
             total_inserts += 1;
         }
