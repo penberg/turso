@@ -127,7 +127,7 @@ pub struct BwTree<K, V> {
 impl<K, V> BwTree<K, V>
 where
     K: Clone + Ord + Hash,
-    V: Clone + PartialEq,
+    V: Clone + PartialEq + Eq + Hash,
 {
     pub fn new() -> Self {
         let mut mapping_table = BTreeMap::new();
@@ -448,48 +448,87 @@ where
         }
     }
     
-    /// Apply all delta records to create consolidated key-value entries
-    /// Simple implementation that works for most cases
-    fn apply_deltas(&self, mut node_ptr: *mut Node<K, V>) -> Vec<(K, SmallVec<[V; 2]>)> {
-        let mut entries = BTreeMap::new();
-        
+    /// Apply all delta records - ULTRA OPTIMIZED with deduplication and NO COLLECT()
+    fn apply_deltas(&self, node_ptr: *mut Node<K, V>) -> Vec<(K, SmallVec<[V; 2]>)> {
         unsafe {
-            // Walk through delta chain and apply operations
-            while !node_ptr.is_null() {
-                match &*node_ptr {
+            // Fast path: base-only case
+            if let Node::LeafBase(base) = &*node_ptr {
+                return base.entries.clone();
+            }
+            
+            let mut unique_deltas = Vec::new();
+            let mut seen_kv = HashSet::new();
+            let mut current = node_ptr;
+            let mut base_entries = None;
+            let mut estimated_size = 0;
+            
+            // Pass 1: Collect unique deltas with deduplication (reference BwTree style)
+            while !current.is_null() {
+                match &*current {
                     Node::LeafBase(base) => {
-                        // Add all base page entries
-                        for (key, values) in &base.entries {
-                            let entry = entries.entry(key.clone()).or_insert_with(SmallVec::new);
-                            entry.extend(values.iter().cloned());
-                        }
-                        break; // Reached base page
+                        base_entries = Some(&base.entries);
+                        estimated_size = base.entries.len();
+                        break;
                     }
                     Node::InsertDelta(delta) => {
-                        // Add value for key
-                        let entry = entries.entry(delta.key.clone()).or_insert_with(SmallVec::new);
-                        entry.push(delta.value.clone());
-                        node_ptr = delta.next;
+                        let kv = (delta.key.clone(), delta.value.clone());
+                        if seen_kv.insert(kv.clone()) {
+                            unique_deltas.push(('I', kv));
+                        }
+                        current = delta.next;
                     }
                     Node::DeleteDelta(delta) => {
-                        // Remove specific value for key
-                        if let Some(values) = entries.get_mut(&delta.key) {
-                            values.retain(|v| v != &delta.value);
+                        let kv = (delta.key.clone(), delta.value.clone());
+                        if seen_kv.insert(kv.clone()) {
+                            unique_deltas.push(('D', kv));
                         }
-                        node_ptr = delta.next;
+                        current = delta.next;
                     }
                     Node::SplitDelta(delta) => {
-                        // Split deltas don't modify key-value data
-                        node_ptr = delta.next;
+                        current = delta.next;
                     }
                 }
             }
+            
+            // Reverse to get chronological order (oldest first)
+            unique_deltas.reverse();
+            
+            // Pass 2: Build result directly with minimal allocations
+            let mut result_map = BTreeMap::new();
+            
+            // Start with base entries
+            if let Some(base) = base_entries {
+                for (key, values) in base {
+                    result_map.insert(key.clone(), values.clone());
+                }
+            }
+            
+            // Apply unique deltas in chronological order
+            for (op, (key, value)) in unique_deltas {
+                match op {
+                    'I' => {
+                        result_map.entry(key)
+                            .or_insert_with(SmallVec::new)
+                            .push(value);
+                    }
+                    'D' => {
+                        if let Some(values) = result_map.get_mut(&key) {
+                            values.retain(|v| v != &value);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            
+            // Build final result - NO COLLECT()! Direct Vec construction
+            let mut result = Vec::with_capacity(estimated_size);
+            for (key, values) in result_map {
+                if !values.is_empty() {
+                    result.push((key, values));
+                }
+            }
+            result
         }
-        
-        // BTreeMap maintains sorted order, filter empty entries
-        entries.into_iter()
-            .filter(|(_, values)| !values.is_empty())
-            .collect()
     }
     
     /// Get the depth of delta chain for pre-allocation
@@ -674,7 +713,7 @@ pub struct BwTreeIterator<K, V> {
 impl<K, V> BwTree<K, V> 
 where
     K: Clone + Ord + Hash,
-    V: Clone + PartialEq,
+    V: Clone + PartialEq + Eq + Hash,
 {
     /// Iterate over all key-value pairs - optimized to reuse consolidated data
     pub fn iter(&self) -> BwTreeIterator<K, V> {
@@ -800,89 +839,6 @@ pub struct BwTreeRangeIterator<K, V> {
     position: usize,
 }
 
-// Optimized implementation for types that support Hash + Eq for deduplication
-impl<K, V> BwTree<K, V>
-where
-    K: Clone + Ord + Hash,
-    V: Clone + PartialEq + Eq + Hash,
-{
-    /// Ultra-optimized apply_deltas with deduplication for Hash+Eq types
-    fn apply_deltas_optimized(&self, node_ptr: *mut Node<K, V>) -> Vec<(K, SmallVec<[V; 2]>)> {
-        unsafe {
-            // Quick check for base-only case
-            if let Node::LeafBase(base) = &*node_ptr {
-                return base.entries.clone();
-            }
-            
-            let mut unique_deltas = Vec::new();
-            let mut seen_kv = HashSet::new();
-            let mut current = node_ptr;
-            let mut base_entries = None;
-            
-            // Pass 1: Collect unique deltas in reverse order (chain traversal order)
-            while !current.is_null() {
-                match &*current {
-                    Node::LeafBase(base) => {
-                        base_entries = Some(&base.entries);
-                        break;
-                    }
-                    Node::InsertDelta(delta) => {
-                        let kv = (delta.key.clone(), delta.value.clone());
-                        if seen_kv.insert(kv.clone()) {
-                            unique_deltas.push(('I', kv));
-                        }
-                        current = delta.next;
-                    }
-                    Node::DeleteDelta(delta) => {
-                        let kv = (delta.key.clone(), delta.value.clone());
-                        if seen_kv.insert(kv.clone()) {
-                            unique_deltas.push(('D', kv));
-                        }
-                        current = delta.next;
-                    }
-                    Node::SplitDelta(delta) => {
-                        current = delta.next;
-                    }
-                }
-            }
-            
-            // Reverse to get chronological order
-            unique_deltas.reverse();
-            
-            // Pass 2: Build result directly
-            let mut result_map = BTreeMap::new();
-            
-            // Start with base entries
-            if let Some(base) = base_entries {
-                for (key, values) in base {
-                    result_map.insert(key.clone(), values.clone());
-                }
-            }
-            
-            // Apply deltas in chronological order
-            for (op, (key, value)) in unique_deltas {
-                match op {
-                    'I' => {
-                        result_map.entry(key)
-                            .or_insert_with(SmallVec::new)
-                            .push(value);
-                    }
-                    'D' => {
-                        if let Some(values) = result_map.get_mut(&key) {
-                            values.retain(|v| v != &value);
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            
-            // Remove empty entries and collect
-            result_map.into_iter()
-                .filter(|(_, values)| !values.is_empty())
-                .collect()
-        }
-    }
-}
 
 impl<K: Clone, V: Clone> Iterator for BwTreeRangeIterator<K, V> {
     type Item = (K, V);
