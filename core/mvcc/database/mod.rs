@@ -40,8 +40,7 @@ impl RowID {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
-
+#[derive(Clone, Debug, PartialEq, PartialOrd, Hash)]
 pub struct Row {
     pub id: RowID,
     pub data: Vec<u8>,
@@ -71,6 +70,18 @@ impl PartialEq for RowVersion {
         self.begin.load(std::sync::atomic::Ordering::Acquire) == other.begin.load(std::sync::atomic::Ordering::Acquire) &&
         self.end.load(std::sync::atomic::Ordering::Acquire) == other.end.load(std::sync::atomic::Ordering::Acquire) &&
         self.row == other.row
+    }
+}
+
+// Manual Eq implementation 
+impl Eq for RowVersion {}
+
+// Manual Hash implementation since AtomicU64 doesn't implement it
+impl std::hash::Hash for RowVersion {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.begin.load(std::sync::atomic::Ordering::Acquire).hash(state);
+        self.end.load(std::sync::atomic::Ordering::Acquire).hash(state);
+        self.row.hash(state);
     }
 }
 

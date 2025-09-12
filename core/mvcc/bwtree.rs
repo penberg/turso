@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use parking_lot::{RwLock, Mutex};
 use smallvec::SmallVec;
@@ -272,9 +272,7 @@ where
     }
 
     /// Delete a specific value for a key  
-    pub fn delete(&self, key: &K, value: &V) -> bool 
-    where 
-        V: PartialEq,
+    pub fn delete(&self, key: &K, value: &V) -> bool
     {
         loop {
             let leaf_pid = self.find_leaf_page(key);
@@ -328,9 +326,7 @@ where
     }
     
     /// Check if a key-value pair exists in the page
-    fn key_value_exists(&self, key: &K, value: &V, node_ptr: *mut Node<K, V>) -> bool 
-    where 
-        V: PartialEq,
+    fn key_value_exists(&self, key: &K, value: &V, node_ptr: *mut Node<K, V>) -> bool
     {
         if node_ptr.is_null() {
             return false;
@@ -453,7 +449,7 @@ where
     }
     
     /// Apply all delta records to create consolidated key-value entries
-    /// Uses a direct BTreeMap approach to maintain sorted order during construction
+    /// Simple implementation that works for most cases
     fn apply_deltas(&self, mut node_ptr: *mut Node<K, V>) -> Vec<(K, SmallVec<[V; 2]>)> {
         let mut entries = BTreeMap::new();
         
@@ -490,8 +486,34 @@ where
             }
         }
         
-        // BTreeMap maintains sorted order, so just collect into Vec
-        entries.into_iter().collect()
+        // BTreeMap maintains sorted order, filter empty entries
+        entries.into_iter()
+            .filter(|(_, values)| !values.is_empty())
+            .collect()
+    }
+    
+    /// Get the depth of delta chain for pre-allocation
+    fn get_delta_chain_depth(&self, mut node_ptr: *mut Node<K, V>) -> usize {
+        let mut depth = 0;
+        unsafe {
+            while !node_ptr.is_null() {
+                match &*node_ptr {
+                    Node::LeafBase(_) => break,
+                    Node::InsertDelta(delta) => {
+                        depth += 1;
+                        node_ptr = delta.next;
+                    }
+                    Node::DeleteDelta(delta) => {
+                        depth += 1;
+                        node_ptr = delta.next;
+                    }
+                    Node::SplitDelta(delta) => {
+                        node_ptr = delta.next;
+                    }
+                }
+            }
+        }
+        depth
     }
     
     /// Schedule cleanup of old delta chain (simplified)
@@ -776,6 +798,90 @@ pub struct BwTreeRangeIterator<K, V> {
     keys: Vec<K>,
     values: Vec<V>,
     position: usize,
+}
+
+// Optimized implementation for types that support Hash + Eq for deduplication
+impl<K, V> BwTree<K, V>
+where
+    K: Clone + Ord + Hash,
+    V: Clone + PartialEq + Eq + Hash,
+{
+    /// Ultra-optimized apply_deltas with deduplication for Hash+Eq types
+    fn apply_deltas_optimized(&self, node_ptr: *mut Node<K, V>) -> Vec<(K, SmallVec<[V; 2]>)> {
+        unsafe {
+            // Quick check for base-only case
+            if let Node::LeafBase(base) = &*node_ptr {
+                return base.entries.clone();
+            }
+            
+            let mut unique_deltas = Vec::new();
+            let mut seen_kv = HashSet::new();
+            let mut current = node_ptr;
+            let mut base_entries = None;
+            
+            // Pass 1: Collect unique deltas in reverse order (chain traversal order)
+            while !current.is_null() {
+                match &*current {
+                    Node::LeafBase(base) => {
+                        base_entries = Some(&base.entries);
+                        break;
+                    }
+                    Node::InsertDelta(delta) => {
+                        let kv = (delta.key.clone(), delta.value.clone());
+                        if seen_kv.insert(kv.clone()) {
+                            unique_deltas.push(('I', kv));
+                        }
+                        current = delta.next;
+                    }
+                    Node::DeleteDelta(delta) => {
+                        let kv = (delta.key.clone(), delta.value.clone());
+                        if seen_kv.insert(kv.clone()) {
+                            unique_deltas.push(('D', kv));
+                        }
+                        current = delta.next;
+                    }
+                    Node::SplitDelta(delta) => {
+                        current = delta.next;
+                    }
+                }
+            }
+            
+            // Reverse to get chronological order
+            unique_deltas.reverse();
+            
+            // Pass 2: Build result directly
+            let mut result_map = BTreeMap::new();
+            
+            // Start with base entries
+            if let Some(base) = base_entries {
+                for (key, values) in base {
+                    result_map.insert(key.clone(), values.clone());
+                }
+            }
+            
+            // Apply deltas in chronological order
+            for (op, (key, value)) in unique_deltas {
+                match op {
+                    'I' => {
+                        result_map.entry(key)
+                            .or_insert_with(SmallVec::new)
+                            .push(value);
+                    }
+                    'D' => {
+                        if let Some(values) = result_map.get_mut(&key) {
+                            values.retain(|v| v != &value);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            
+            // Remove empty entries and collect
+            result_map.into_iter()
+                .filter(|(_, values)| !values.is_empty())
+                .collect()
+        }
+    }
 }
 
 impl<K: Clone, V: Clone> Iterator for BwTreeRangeIterator<K, V> {
