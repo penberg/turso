@@ -176,6 +176,9 @@ impl Schema {
 
     /// Get all materialized views that depend on a given table
     pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
+        if self.table_to_materialized_views.is_empty() {
+            return Vec::new();
+        }
         let table_name = normalize_ident(table_name);
         self.table_to_materialized_views
             .get(&table_name)
