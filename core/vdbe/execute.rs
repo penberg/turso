@@ -2102,7 +2102,7 @@ pub fn op_transaction(
     );
     let conn = program.connection.clone();
     let write = matches!(tx_mode, TransactionMode::Write);
-    if write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
+    if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
         return Err(LimboError::ReadOnly);
     }
 
@@ -7091,7 +7091,7 @@ pub fn op_open_ephemeral(
                 .block(|| pager.with_header(|header| header.page_size))?
                 .get();
 
-            let buffer_pool = program.connection._db.buffer_pool.clone();
+            let buffer_pool = program.connection.db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
             let pager = Rc::new(Pager::new(

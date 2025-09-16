@@ -325,7 +325,7 @@ impl Database {
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         self.is_open.set(false);
-        let _ = self._db.take();
+        let _ = self.db.take();
         let _ = self.conn.take().unwrap();
         Ok(())
     }

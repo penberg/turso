@@ -55,7 +55,7 @@ fn bench(c: &mut Criterion) {
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    TransitionResult::Io(io) => io.wait(db.db.io.as_ref()).unwrap(),
                     TransitionResult::Continue => continue,
                     TransitionResult::Done(_) => break,
                 }
@@ -85,7 +85,7 @@ fn bench(c: &mut Criterion) {
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    TransitionResult::Io(io) => io.wait(db.db.io.as_ref()).unwrap(),
                     TransitionResult::Continue => continue,
                     TransitionResult::Done(_) => break,
                 }
@@ -121,7 +121,7 @@ fn bench(c: &mut Criterion) {
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    TransitionResult::Io(io) => io.wait(db.db.io.as_ref()).unwrap(),
                     TransitionResult::Continue => continue,
                     TransitionResult::Done(_) => break,
                 }
