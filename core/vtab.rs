@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
@@ -215,10 +216,19 @@ impl VirtualTableCursor {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ExtVirtualTable {
     implementation: Rc<VTabModuleImpl>,
-    table_ptr: *const c_void,
+    table_ptr: AtomicPtr<c_void>,
+}
+
+impl Clone for ExtVirtualTable {
+    fn clone(&self) -> Self {
+        Self {
+            implementation: self.implementation.clone(),
+            table_ptr: AtomicPtr::new(self.table_ptr.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
 }
 
 impl ExtVirtualTable {
@@ -262,7 +272,7 @@ impl ExtVirtualTable {
         let (schema, table_ptr) = module.implementation.create(args)?;
         let vtab = ExtVirtualTable {
             implementation: module.implementation.clone(),
-            table_ptr,
+            table_ptr: AtomicPtr::new(table_ptr as *mut c_void),
         };
         Ok((vtab, schema))
     }
@@ -281,7 +291,10 @@ impl ExtVirtualTable {
         let ext_conn_ptr = NonNull::new(Box::into_raw(Box::new(conn))).expect("null pointer");
         // store the leaked connection pointer on the table so it can be freed on drop
         let Some(cursor) = NonNull::new(unsafe {
-            (self.implementation.open)(self.table_ptr, ext_conn_ptr.as_ptr()) as *mut c_void
+            (self.implementation.open)(
+                self.table_ptr.load(std::sync::atomic::Ordering::Relaxed),
+                ext_conn_ptr.as_ptr(),
+            ) as *mut c_void
         }) else {
             return Err(LimboError::ExtensionError("Open returned null".to_string()));
         };
@@ -294,7 +307,7 @@ impl ExtVirtualTable {
         let newrowid = 0i64;
         let rc = unsafe {
             (self.implementation.update)(
-                self.table_ptr,
+                self.table_ptr.load(std::sync::atomic::Ordering::Relaxed),
                 arg_count as i32,
                 ext_args.as_ptr(),
                 &newrowid as *const _ as *mut i64,
@@ -313,7 +326,9 @@ impl ExtVirtualTable {
     }
 
     fn destroy(&self) -> crate::Result<()> {
-        let rc = unsafe { (self.implementation.destroy)(self.table_ptr) };
+        let rc = unsafe {
+            (self.implementation.destroy)(self.table_ptr.load(std::sync::atomic::Ordering::Relaxed))
+        };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError(rc.to_string())),
