@@ -1,4 +1,3 @@
-#![allow(clippy::arc_with_non_send_sync)]
 extern crate core;
 
 mod assert;
@@ -282,7 +281,6 @@ impl Database {
         Self::open_with_flags(io, path, db_file, flags, opts)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(
         io: Arc<dyn IO>,
         path: &str,
@@ -301,7 +299,6 @@ impl Database {
         )
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
@@ -344,7 +341,6 @@ impl Database {
         Ok(db)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
@@ -357,7 +353,6 @@ impl Database {
         Self::open_with_flags_bypass_registry_internal(io, path, wal_path, db_file, flags, opts)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn open_with_flags_bypass_registry_internal(
         io: Arc<dyn IO>,
         path: &str,
@@ -707,7 +702,6 @@ impl Database {
     /// Open a new database file with optionally specifying a VFS without an existing database
     /// connection and symbol table to register extensions.
     #[cfg(feature = "fs")]
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_new<S>(
         path: &str,
         vfs: Option<S>,
