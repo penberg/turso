@@ -1,7 +1,7 @@
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
-        dbsp::{Delta, HashableRow, RowKeyZSet},
+        dbsp::{Delta, HashableRow, RowKeyZSet, SimpleZSet},
         view::{IncrementalView, ViewTransactionState},
     },
     return_if_io,
@@ -78,6 +78,16 @@ impl MaterializedViewCursor {
             execute_state: ExecuteState::Uninitialized,
             seek_state: SeekState::Init,
         })
+    }
+
+    pub fn reset(&mut self) {
+        self.btree_cursor.reset();
+        // SimpleZSet doesn't have clear(), recreate it
+        self.uncommitted = SimpleZSet::new();
+        self.last_tx_state_len = 0;
+        self.current_row = None;
+        self.execute_state = ExecuteState::Uninitialized;
+        self.seek_state = SeekState::Init;
     }
 
     /// Compute transaction changes lazily on first access

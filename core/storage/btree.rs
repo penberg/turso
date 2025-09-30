@@ -686,6 +686,14 @@ impl BTreeCursor {
         cursor
     }
 
+    pub fn reset(&mut self) {
+        self.state = CursorState::None;
+        self.balance_state = BalanceState {
+            sub_state: BalanceSubState::Start,
+            balance_info: RefCell::new(None),
+        };
+    }
+
     pub fn has_rowid(&self) -> bool {
         match &self.index_info {
             Some(index_key_info) => index_key_info.has_rowid,

@@ -276,6 +276,12 @@ impl PragmaVirtualTableCursor {
         self.pos as i64
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.pos = 0;
+        self.stmt = None;
+        self.arg = None;
+    }
+
     pub(crate) fn next(&mut self) -> crate::Result<bool> {
         let stmt = self
             .stmt

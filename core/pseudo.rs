@@ -6,6 +6,10 @@ pub struct PseudoCursor {
 }
 
 impl PseudoCursor {
+    pub fn reset(&mut self) {
+        self.current = None;
+    }
+
     pub fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }

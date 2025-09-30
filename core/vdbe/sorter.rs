@@ -130,6 +130,16 @@ impl Sorter {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.records.clear();
+        self.current = None;
+        self.key_len = 0;
+        // index_key_info is Rc, can't be modified - it's set during OpenPseudo and doesn't change
+        self.chunks.clear();
+        self.chunk_heap.clear();
+        self.current_buffer_size = 0;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty() && self.chunks.is_empty()
     }

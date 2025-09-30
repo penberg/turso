@@ -423,6 +423,14 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             _ => Value::Null,
         })
     }
+
+    fn reset(&mut self) {
+        self.json = Jsonb::new(0, None);
+        self.path_to_current_value = InPlaceJsonPath::new_root();
+        self.rowid = 0;
+        self.columns = Columns::default();
+        self.traversal_states.clear();
+    }
 }
 
 fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {

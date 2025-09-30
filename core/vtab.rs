@@ -194,6 +194,13 @@ impl VirtualTableCursor {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        match self {
+            VirtualTableCursor::Pragma(cursor) => cursor.reset(),
+            VirtualTableCursor::External(cursor) => cursor.reset(),
+            VirtualTableCursor::Internal(cursor) => cursor.write().reset(),
+        }
+    }
     pub(crate) fn rowid(&self) -> i64 {
         match self {
             VirtualTableCursor::Pragma(cursor) => cursor.rowid(),
@@ -370,6 +377,10 @@ impl ExtVirtualTableCursor {
         })
     }
 
+    fn reset(&mut self) {
+        self.conn_ptr = None;
+    }
+
     fn rowid(&self) -> i64 {
         unsafe { (self.implementation.rowid)(self.cursor.as_ptr()) }
     }
@@ -467,4 +478,5 @@ pub trait InternalVirtualTableCursor: Send + Sync {
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+    fn reset(&mut self);
 }

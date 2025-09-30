@@ -2383,6 +2383,16 @@ impl Cursor {
             _ => panic!("Cursor is not a materialized view cursor"),
         }
     }
+    
+    pub fn reset(&mut self) {
+        match self {
+            Self::BTree(cursor) => cursor.reset(),
+            Self::Pseudo(cursor) => cursor.reset(),
+            Self::Sorter(cursor) => cursor.reset(),
+            Self::Virtual(cursor) => cursor.reset(),
+            Self::MaterializedView(cursor) => cursor.reset(),
+        }
+    }
 }
 
 #[derive(Debug)]

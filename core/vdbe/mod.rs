@@ -395,7 +395,11 @@ impl ProgramState {
             self.registers
                 .resize_with(max_resgisters, || Register::Value(Value::Null));
         }
-        self.cursors.iter_mut().for_each(|c| *c = None);
+        self.cursors.iter_mut().for_each(|c| {
+            if let Some(c) = c {
+                c.reset();
+            }
+        });
         self.registers
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
