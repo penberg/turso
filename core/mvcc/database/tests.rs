@@ -1077,11 +1077,11 @@ fn test_snapshot_isolation_tx_visible1() {
     let current_tx = new_tx(4, 4, TransactionState::Preparing);
 
     let rv_visible = |begin: TxTimestampOrID, end: Option<TxTimestampOrID>| {
-        let row_version = RowVersion {
+        let row_version = RowVersion::new(
             begin,
             end,
-            row: generate_simple_string_row((-2).into(), 1, "testme"),
-        };
+            generate_simple_string_row((-2).into(), 1, "testme"),
+        );
         tracing::debug!("Testing visibility of {row_version:?}");
         row_version.is_visible_to(&current_tx, &txs)
     };

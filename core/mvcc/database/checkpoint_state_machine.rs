@@ -145,6 +145,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // This value will be used at the end of the checkpoint to update the corresponding value in
         // the MVCC store, so that we don't checkpoint the same row versions again on the next checkpoint.
         let mut max_timestamp = self.checkpointed_txid_max_old;
+        let guard = &crossbeam_epoch::pin();
 
         // Since table ids are negative, and we want schema changes (table_id=-1) to be processed first, we iterate in reverse order.
         // Reliance on SkipMap ordering is a bit yolo-swag fragile, but oh well.
@@ -157,23 +158,33 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
                 continue;
             }
-            let row_versions = entry.value().read();
+            // Traverse version chain
+            let mut current = entry.value().load(std::sync::atomic::Ordering::Acquire, guard);
             let mut exists_in_db_file = false;
-            for (i, version) in row_versions.iter().enumerate() {
-                let is_last = i == row_versions.len() - 1;
-                if let TxTimestampOrID::Timestamp(ts) = &version.begin {
-                    if *ts <= self.checkpointed_txid_max_old {
+            let mut is_last = current.is_null();
+
+            while !current.is_null() {
+                let node = unsafe { current.deref() };
+                let next = node.load_next(guard);
+                is_last = next.is_null();
+
+                let begin = node.version.load_begin();
+                let end = node.version.load_end();
+
+                if let TxTimestampOrID::Timestamp(ts) = begin {
+                    if ts <= self.checkpointed_txid_max_old {
                         exists_in_db_file = true;
                     }
 
                     let current_version_ts =
-                        if let Some(TxTimestampOrID::Timestamp(ts_end)) = version.end {
-                            ts_end.max(*ts)
+                        if let Some(TxTimestampOrID::Timestamp(ts_end)) = end {
+                            ts_end.max(ts)
                         } else {
-                            *ts
+                            ts
                         };
                     if current_version_ts <= self.checkpointed_txid_max_old {
                         // already checkpointed. TODO: garbage collect row versions after checkpointing.
+                        current = next;
                         continue;
                     }
 
@@ -197,17 +208,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                     max_timestamp = max_timestamp.max(current_version_ts);
                     if is_last {
-                        let is_delete = version.end.is_some();
+                        let is_delete = end.is_some();
                         let is_delete_of_table =
-                            is_delete && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+                            is_delete && node.version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                         let is_create_of_table = !exists_in_db_file
                             && !is_delete
-                            && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+                            && node.version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
 
                         // We might need to create or destroy a B-tree in the pager during checkpoint if a row in root page 1 is deleted or created.
                         let special_write = if is_delete_of_table {
                             let root_page =
-                                get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
+                                get_table_id_or_root_page_from_sqlite_schema(&node.version.row.data);
                             assert!(root_page > 0, "rootpage is positive integer");
                             let root_page = root_page as u64;
                             let table_id = *self
@@ -223,14 +234,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 Some(SpecialWrite::BTreeDestroy {
                                     table_id,
                                     root_page,
-                                    num_columns: version.row.column_count,
+                                    num_columns: node.version.row.column_count,
                                 })
                             } else {
                                 None
                             }
                         } else if is_create_of_table {
                             let table_id =
-                                get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
+                                get_table_id_or_root_page_from_sqlite_schema(&node.version.row.data);
                             let table_id = MVTableId::from(table_id);
                             Some(SpecialWrite::BTreeCreate { table_id })
                         } else {
@@ -240,10 +251,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in the database file.
                         let should_be_deleted_from_db_file = is_delete && exists_in_db_file;
                         if !is_delete || should_be_deleted_from_db_file {
-                            self.write_set.push((version.clone(), special_write));
+                            self.write_set.push((node.version.clone(), special_write));
                         }
                     }
                 }
+                current = next;
             }
         }
         self.checkpointed_txid_max_new = max_timestamp;
@@ -486,7 +498,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let (row_version, _) = self.get_current_row_version(write_set_index).unwrap();
 
                 // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                if row_version.load_end().is_some() {
                     // This is a delete operation
                     let state_machine = self
                         .mvstore
