@@ -301,6 +301,16 @@ impl PageCache {
             return Ok(None);
         }
 
+        // Debug assertion: A loaded, non-dirty page should match what's on disk.
+        // This invariant is critical for cache coherency.
+        #[cfg(debug_assertions)]
+        if page.is_loaded() && !page.is_dirty() {
+            trace!(
+                "Page {} is clean in cache - it should match disk (verify with verify_page_matches_disk)",
+                page.get().id
+            );
+        }
+
         entry.bump_ref();
         Ok(Some(page))
     }
@@ -483,7 +493,6 @@ impl PageCache {
         }
     }
 
-    #[cfg(test)]
     pub fn keys(&mut self) -> Vec<PageCacheKey> {
         self.map.keys().copied().collect()
     }
@@ -535,6 +544,50 @@ impl PageCache {
     #[cfg(test)]
     fn ref_of(&self, key: &PageCacheKey) -> Option<u8> {
         self.map.get(key).map(|&ptr| unsafe { (*ptr).ref_bit })
+    }
+
+    /// Debug check: verify that a specific page is either dirty or matches the provided disk data.
+    /// This is a debugging tool to ensure cache coherency.
+    ///
+    /// # Arguments
+    /// * `page_id` - The page ID to check
+    /// * `disk_data` - The data read from disk for this page
+    ///
+    /// # Panics
+    /// Panics if the page is clean (not dirty) but doesn't match the disk data,
+    /// indicating a cache coherency bug.
+    #[cfg(debug_assertions)]
+    pub fn verify_page_matches_disk(&self, page_id: usize, disk_data: &[u8]) {
+        let key = PageCacheKey::new(page_id);
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            let page = &entry.page;
+
+            // Skip if page is not loaded
+            if !page.is_loaded() {
+                return;
+            }
+
+            // If page is dirty, we expect it to differ from disk, so skip check
+            if page.is_dirty() {
+                tracing::trace!(
+                    "Page {page_id} is dirty, skipping coherency check (expected to differ from disk)"
+                );
+                return;
+            }
+
+            // Page is clean and loaded - it MUST match what's on disk
+            if let Some(contents) = page.get().contents.as_ref() {
+                let cache_data = contents.buffer.as_slice();
+                assert_eq!(
+                    cache_data, disk_data,
+                    "CACHE COHERENCY BUG: Clean page {} in cache doesn't match disk!\n\
+                     This means the page was modified without being marked dirty, or was cleaned without being written.",
+                    page_id
+                );
+                tracing::trace!("Page {page_id} cache coherency verified - matches disk");
+            }
+        }
     }
 }
 
