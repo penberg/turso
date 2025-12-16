@@ -149,6 +149,14 @@ pub struct PageInner {
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
+    /// Hash of page content when loaded or after marked dirty.
+    /// Used to detect pages modified before being marked dirty.
+    #[cfg(feature = "simulator")]
+    pub content_hash: AtomicU64,
+    /// Set to true when add_dirty() is called, cleared on load/clear_dirty.
+    /// Used to track if a page has been properly marked dirty before modification.
+    #[cfg(feature = "simulator")]
+    pub dirty_snapshot_taken: AtomicBool,
 }
 
 /// WAL tag not set
@@ -196,6 +204,16 @@ const PAGE_DIRTY: usize = 0b1000;
 /// Page's contents are loaded in memory.
 const PAGE_LOADED: usize = 0b10000;
 
+/// Compute a hash of page contents for detecting modifications.
+/// Used by the simulator to verify pages are marked dirty before modification.
+#[cfg(feature = "simulator")]
+fn compute_page_hash(contents: &PageContent) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = rapidhash::fast::RapidHasher::default();
+    hasher.write(contents.buffer.as_slice());
+    hasher.finish()
+}
+
 impl Page {
     pub fn new(id: i64) -> Self {
         assert!(id >= 0, "page id should be positive");
@@ -206,6 +224,10 @@ impl Page {
                 id: id as usize,
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
+                #[cfg(feature = "simulator")]
+                content_hash: AtomicU64::new(0),
+                #[cfg(feature = "simulator")]
+                dirty_snapshot_taken: AtomicBool::new(false),
             }),
         }
     }
@@ -245,6 +267,16 @@ impl Page {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
         self.clear_wal_tag();
+
+        #[cfg(feature = "simulator")]
+        {
+            // Reset tracking - page will need add_dirty() again before next modification
+            self.get().dirty_snapshot_taken.store(false, Ordering::Release);
+            if let Some(ref contents) = self.get().contents {
+                let hash = compute_page_hash(contents);
+                self.get().content_hash.store(hash, Ordering::Release);
+            }
+        }
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -332,6 +364,28 @@ impl Page {
         let (f, s) = self.wal_tag_pair();
         f == target_frame && s == epoch && !self.is_dirty() && self.is_loaded() && !self.is_locked()
     }
+
+    /// Update the content hash for detecting modify-before-dirty bugs.
+    /// This should be called when a page is loaded from disk or WAL.
+    #[cfg(feature = "simulator")]
+    pub fn update_content_hash(&self) {
+        if let Some(ref contents) = self.get().contents {
+            let hash = compute_page_hash(contents);
+            self.get().content_hash.store(hash, Ordering::Release);
+            // Only reset dirty_snapshot_taken if the page is NOT dirty.
+            // If the page is dirty, it means add_dirty() was already called and the
+            // subjournal has the original content - we should preserve that state.
+            // This handles cases like upsert_page_in_cache() during balance where
+            // dirty pages get their IDs reassigned but should retain their snapshot state.
+            if !self.is_dirty() {
+                self.get().dirty_snapshot_taken.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// No-op when simulator feature is not enabled.
+    #[cfg(not(feature = "simulator"))]
+    pub fn update_content_hash(&self) {}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1306,6 +1360,8 @@ impl Pager {
     ) -> Result<IOResult<PageRef>> {
         let page = return_if_io!(self.allocate_page());
         btree_init_page(&page, page_type, offset, self.usable_space());
+        // Update content hash after btree_init_page modifies the page
+        page.update_content_hash();
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
@@ -1687,6 +1743,49 @@ impl Pager {
             "page {} must be loaded in add_dirty() so its contents can be subjournaled",
             page.get().id
         );
+
+        #[cfg(feature = "simulator")]
+        {
+            // If dirty_snapshot_taken is already true, the page was already properly
+            // subjournaled and we can skip the hash check. This handles the case where
+            // add_dirty() is called multiple times on the same page within a transaction
+            // (e.g., HeaderRefMut marks page 1 dirty, then later code also calls add_dirty).
+            let already_snapshotted = page.get().dirty_snapshot_taken.load(Ordering::Acquire);
+            let is_dirty = page.is_dirty();
+
+            if !already_snapshotted {
+                // Verify page hasn't been modified since loading or last add_dirty call.
+                // If this assertion fails, it means page contents were modified BEFORE
+                // add_dirty() was called, which breaks rollback safety because the
+                // subjournal will capture modified (not original) content.
+                let current_hash = compute_page_hash(page.get_contents());
+                let original_hash = page.get().content_hash.load(Ordering::Acquire);
+
+                // Only check if the page has a recorded hash (non-zero means it was tracked)
+                if original_hash != 0 && current_hash != original_hash {
+                    // Log detailed state before asserting
+                    tracing::error!(
+                        "add_dirty hash mismatch: page={}, is_dirty={}, dirty_snapshot_taken={}, original_hash={:#x}, current_hash={:#x}",
+                        page.get().id, is_dirty, already_snapshotted, original_hash, current_hash
+                    );
+                }
+                turso_assert!(
+                    original_hash == 0 || current_hash == original_hash,
+                    "BUG DETECTED: Page {} was modified BEFORE add_dirty() was called! \
+                     Original hash: {:#x}, Current hash: {:#x}. \
+                     This breaks rollback safety - the subjournal will capture modified content.",
+                    page.get().id,
+                    original_hash,
+                    current_hash
+                );
+
+                // Mark that dirty snapshot has been taken
+                page.get().dirty_snapshot_taken.store(true, Ordering::Release);
+                // Update hash to current content (for future add_dirty calls)
+                page.get().content_hash.store(current_hash, Ordering::Release);
+            }
+        }
+
         self.subjournal_page_if_required(page)?;
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
@@ -2458,6 +2557,8 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+                // Update content hash after initialization for modify-before-dirty detection
+                page1.update_content_hash();
                 let c = begin_write_btree_page(self, &page1)?;
 
                 *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
@@ -2751,6 +2852,9 @@ impl Pager {
         })?;
         page.set_loaded();
         page.clear_wal_tag();
+        // Store hash of loaded content for detecting modify-before-dirty bugs
+        page.update_content_hash();
+
         Ok(())
     }
 
@@ -2877,6 +2981,8 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: us
         page.set_loaded();
         page.clear_wal_tag();
         page.get().contents = Some(PageContent::new(offset, buffer));
+        // Set initial content hash for modify-before-dirty detection
+        page.update_content_hash();
     }
     page
 }
@@ -2911,6 +3017,9 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         DatabaseHeader::SIZE, // offset of 100 bytes
         (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
     );
+
+    // Update content hash after initialization for modify-before-dirty detection
+    page.update_content_hash();
 
     page
 }

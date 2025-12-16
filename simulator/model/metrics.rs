@@ -149,6 +149,8 @@ impl InteractionStats {
             Query::DropIndex(_) => self.drop_index_count += 1,
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
+            // Savepoint-related queries - no dedicated counter for now
+            Query::Savepoint(_) | Query::RollbackTo(_) | Query::ReleaseSavepoint(_) => {}
         }
     }
 }
