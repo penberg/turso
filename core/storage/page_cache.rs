@@ -294,7 +294,7 @@ impl PageCache {
 
         if clean_page {
             page.clear_loaded();
-            let _ = page.get().buffer.take();
+            // Data stays allocated - just cleared LOADED flag
         }
 
         // Remove from map first
@@ -539,9 +539,8 @@ impl PageCache {
                 }
 
                 self.map.remove(&key);
-                // Clean the page
+                // Clean the page - data stays allocated, just clear LOADED flag
                 page.clear_loaded();
-                let _ = page.get().buffer.take();
 
                 // Remove from queue
                 unsafe {
@@ -576,11 +575,10 @@ impl PageCache {
             }
         }
 
-        // Clean all pages
+        // Clean all pages - data stays allocated, just clear LOADED flag
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
-            let _ = entry.page.get().buffer.take();
         }
 
         self.map.clear();
@@ -700,11 +698,7 @@ mod tests {
     }
 
     pub fn page_with_content(page_id: usize) -> PageRef {
-        let page = Arc::new(Page::new(page_id as i64));
-        {
-            let inner = page.get();
-            inner.buffer = Some(crate::Buffer::new_temporary(4096));
-        }
+        let page = Arc::new(Page::new(page_id as i64, 4096));
         page.set_loaded();
         page
     }
@@ -1155,7 +1149,7 @@ mod tests {
                     let id_page = rng.next_u64() % max_pages;
                     let key = PageCacheKey::new(id_page as usize);
                     #[allow(clippy::arc_with_non_send_sync)]
-                    let page = Arc::new(Page::new(id_page as i64));
+                    let page = Arc::new(Page::new(id_page as i64, 4096));
 
                     if cache.peek(&key, false).is_some() {
                         continue; // Skip duplicate page ids

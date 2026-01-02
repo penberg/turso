@@ -161,52 +161,77 @@ pub struct PageInner {
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
-    /// The actual page data buffer. None if not loaded.
-    pub buffer: Option<Buffer>,
+    /// The actual page data. Allocated once at page creation, never replaced.
+    /// Use `is_valid()` to check if page data is loaded before accessing.
+    pub data: Box<[u8]>,
     /// Overflow cells during btree operations
     pub overflow_cells: Vec<OverflowCell>,
+    /// Content hash for detecting concurrent modifications (debug only)
+    #[cfg(debug_assertions)]
+    pub content_hash: AtomicU64,
 }
 
-// Methods moved from PageContent - these provide btree page access
+// Methods for page data access
 impl PageInner {
-    /// Creates a new PageInner from an Arc<Buffer> (for backward compatibility).
-    /// The Arc is unwrapped to get ownership of the Buffer, or copied if needed.
+    /// Creates a PageInner from an Arc<Buffer> for parsing/inspection purposes.
+    /// This is NOT for use in the page cache - use Page::new() instead.
     pub fn new(buffer: Arc<Buffer>) -> Self {
-        // Try to unwrap the Arc, or copy the data if we can't
-        let owned_buffer = Arc::try_unwrap(buffer).unwrap_or_else(|arc| {
-            let new_buf = Buffer::new_temporary(arc.len());
-            new_buf.as_mut_slice().copy_from_slice(arc.as_slice());
-            new_buf
-        });
+        let data = buffer.as_slice().to_vec().into_boxed_slice();
         Self {
-            flags: AtomicUsize::new(0),
+            flags: AtomicUsize::new(PAGE_LOADED), // Mark as loaded for parsing
             id: 0,
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
-            buffer: Some(owned_buffer),
+            data,
             overflow_cells: Vec::new(),
+            #[cfg(debug_assertions)]
+            content_hash: AtomicU64::new(0),
         }
     }
 
-    /// Creates a new PageInner with an owned buffer.
-    pub fn from_buffer(buffer: Buffer) -> Self {
-        Self {
-            flags: AtomicUsize::new(0),
-            id: 0,
-            pin_count: AtomicUsize::new(0),
-            wal_tag: AtomicU64::new(TAG_UNSET),
-            buffer: Some(buffer),
-            overflow_cells: Vec::new(),
-        }
+    /// Returns true if page data is valid (loaded and not evicted).
+    /// Callers should assert this before accessing page data.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & PAGE_LOADED != 0
     }
-    /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+
+    /// Record the current content hash for later verification.
+    /// Call this after reading a page to checkpoint its state.
+    #[cfg(debug_assertions)]
+    pub fn record_content_hash(&self) {
+        let hash = self.compute_hash();
+        self.content_hash.store(hash, Ordering::Release);
+    }
+
+    /// Verify that page content hasn't changed since the last record_content_hash().
+    /// Returns true if content is unchanged or if no hash was recorded (hash == 0).
+    #[cfg(debug_assertions)]
+    pub fn verify_content_hash(&self) -> bool {
+        let expected = self.content_hash.load(Ordering::Acquire);
+        expected == 0 || expected == self.compute_hash()
+    }
+
+    /// Compute a fast hash of the page data (FNV-1a).
+    #[cfg(debug_assertions)]
+    fn compute_hash(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = FNV_OFFSET;
+        for byte in self.data.iter() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    /// Get the page data as a mutable slice. Panics if page not loaded.
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn as_ptr(&self) -> &mut [u8] {
-        self.buffer
-            .as_ref()
-            .expect("buffer not loaded")
-            .as_mut_slice()
+        assert!(self.is_valid(), "accessing stale page {}", self.id);
+        // SAFETY: data is always allocated, we just checked it's valid
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr() as *mut u8, self.data.len()) }
     }
 
     /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
@@ -677,16 +702,19 @@ const PAGE_LOADED: usize = 0b10000;
 const PAGE_SPILLED: usize = 0b100000;
 
 impl Page {
-    pub fn new(id: i64) -> Self {
+    pub fn new(id: i64, page_size: usize) -> Self {
         assert!(id >= 0, "page id should be positive");
+        assert!(page_size > 0, "page_size must be non-zero");
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
                 id: id as usize,
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
-                buffer: None,
+                data: vec![0u8; page_size].into_boxed_slice(),
                 overflow_cells: Vec::new(),
+                #[cfg(debug_assertions)]
+                content_hash: AtomicU64::new(0),
             }),
         }
     }
@@ -697,14 +725,10 @@ impl Page {
     }
 
     /// Returns a mutable reference to PageInner for accessing page contents.
-    /// Panics if the page buffer is not loaded.
+    /// Panics if the page is not loaded.
     pub fn get_contents(&self) -> &mut PageInner {
         let inner = self.get();
-        debug_assert!(
-            inner.buffer.is_some(),
-            "page {} buffer not loaded",
-            inner.id
-        );
+        assert!(inner.is_valid(), "page {} not loaded", inner.id);
         inner
     }
 
@@ -1590,7 +1614,7 @@ impl Pager {
 
             // Read the page data
             let page_buffer = Arc::new(self.buffer_pool.allocate(page_size as usize));
-            let page = Arc::new(Page::new(page_id as i64));
+            let page = Arc::new(Page::new(page_id as i64, page_size as usize));
             let c = subjournal.read_page(
                 current_offset,
                 page_buffer,
@@ -2243,7 +2267,8 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         assert!(page_idx >= 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
-        let page = Arc::new(Page::new(page_idx));
+        let page_size = self.page_size.load(Ordering::SeqCst) as usize;
+        let page = Arc::new(Page::new(page_idx, page_size));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
             turso_assert!(
@@ -3759,9 +3784,10 @@ impl Pager {
                     default_header.reserved_space
                 );
 
-                self.buffer_pool
-                    .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool);
+                let page_size = default_header.page_size.get() as usize;
+                self.page_size.store(page_size as u32, Ordering::SeqCst);
+                self.buffer_pool.finalize_with_page_size(page_size)?;
+                let page = allocate_new_page(1, page_size);
 
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
@@ -3854,7 +3880,10 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
-                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                            let page = allocate_new_page(
+                                new_db_size as i64,
+                                header.page_size.get() as usize,
+                            );
                             self.add_dirty(&page)?;
                             let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
@@ -4025,11 +4054,12 @@ impl Pager {
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
+                    let page_size = self.page_size.load(Ordering::SeqCst) as usize;
 
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                            allocate_new_page(new_db_size as i64, page_size);
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {
@@ -4049,7 +4079,7 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = allocate_new_page(new_db_size as i64, page_size);
                     {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
@@ -4207,15 +4237,10 @@ impl Pager {
     }
 }
 
-pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef {
-    let page = Arc::new(Page::new(page_id));
-    {
-        let buffer = buffer_pool.get_page();
-        let inner = page.get();
-        inner.buffer = Some(buffer);
-        page.set_loaded();
-        page.clear_wal_tag();
-    }
+pub fn allocate_new_page(page_id: i64, page_size: usize) -> PageRef {
+    let page = Arc::new(Page::new(page_id, page_size));
+    page.set_loaded();
+    page.clear_wal_tag();
     page
 }
 
@@ -4229,18 +4254,12 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         default_header.reserved_space = reserved_space_bytes;
     }
 
-    let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
-
-    {
-        let inner = page.get();
-        inner.buffer = Some(Buffer::new_temporary(
-            default_header.page_size.get() as usize
-        ));
-    }
-
-    page.get_contents().write_database_header(&default_header);
+    let page_size = default_header.page_size.get() as usize;
+    let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64, page_size));
     page.set_loaded();
     page.clear_wal_tag();
+
+    page.get_contents().write_database_header(&default_header);
 
     btree_init_page(
         &page,
@@ -4472,7 +4491,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut cache = cache.write();
                 let page_key = PageCacheKey::new(1);
-                let page = Page::new(1);
+                let page = Page::new(1, 4096);
                 // Set loaded so that we avoid eviction, as we evict the page from cache if it is not locked and not loaded
                 page.set_loaded();
                 cache.insert(page_key, Arc::new(page)).unwrap();

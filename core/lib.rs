@@ -1868,9 +1868,9 @@ impl Connection {
         page: &mut [u8],
         page_ref: Arc<Page>,
     ) -> Result<bool> {
-        let content = page_ref.get_contents();
+        let content = page_ref.get();
         // empty read - attempt to read absent page
-        if content.buffer.as_ref().is_none_or(|b| b.is_empty()) {
+        if !content.is_valid() {
             return Ok(false);
         }
         page.copy_from_slice(content.as_ptr());

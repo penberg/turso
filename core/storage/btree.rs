@@ -7758,14 +7758,8 @@ mod tests {
 
     #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> PageRef {
-        let page = Arc::new(Page::new(id as i64));
-
-        {
-            let inner = page.get();
-            inner.buffer = Some(Buffer::new_temporary(4096));
-        }
+        let page = Arc::new(Page::new(id as i64, 4096));
         page.set_loaded();
-
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
     }
@@ -9043,19 +9037,15 @@ mod tests {
 
         pager.io.step().unwrap();
 
+        // Set page size BEFORE allocating pages so they use correct size
+        pager
+            .set_initial_page_size(PageSize::new(page_size as u32).unwrap())
+            .unwrap();
+
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         for _ in 0..(database_size - 1) {
             let _res = pager.allocate_page().unwrap();
         }
-
-        pager
-            .io
-            .block(|| {
-                pager.with_header_mut(|header| {
-                    header.page_size = PageSize::new(page_size as u32).unwrap()
-                })
-            })
-            .unwrap();
 
         pager
     }

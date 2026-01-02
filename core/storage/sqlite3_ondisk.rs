@@ -565,13 +565,16 @@ pub fn finish_read_page(page_idx: usize, buffer: Buffer, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
     {
         let inner = page.get();
-        inner.buffer = Some(buffer);
+        // Copy from I/O buffer into page's fixed data allocation
+        let src = buffer.as_slice();
+        inner.data[..src.len()].copy_from_slice(src);
         page.clear_locked();
         page.set_loaded();
         // we set the wal tag only when reading page from log, or in allocate_page,
         // we clear it here for safety in case page is being re-loaded.
         page.clear_wal_tag();
     }
+    // buffer is dropped here, returning it to pool
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
