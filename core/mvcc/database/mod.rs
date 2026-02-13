@@ -34,6 +34,7 @@ use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use rustc_hash::FxHashMap as HashMap;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -2643,8 +2644,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 savepoint.deleted_table_versions.len(),
                 savepoint.deleted_index_versions.len());
 
+            // Collect table rowids affected by this savepoint for write set cleanup.
+            let mut affected_table_rowids: BTreeSet<RowID> = BTreeSet::new();
+
             // Remove created table versions
             for (rowid, version_id) in savepoint.created_table_versions {
+                affected_table_rowids.insert(rowid.clone());
                 if let Some(entry) = self.rows.get(&rowid) {
                     let mut versions = entry.value().write();
                     versions.retain(|rv| rv.id != version_id);
@@ -2670,6 +2675,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
             // Restore deleted table versions (clear end timestamp)
             for (rowid, version_id) in savepoint.deleted_table_versions {
+                affected_table_rowids.insert(rowid.clone());
                 if let Some(entry) = self.rows.get(&rowid) {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
@@ -2697,6 +2703,25 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             }
                         }
                     }
+                }
+            }
+
+            // Clean up write set: remove table rowids that no longer have any
+            // version belonging to this transaction. Without this, commit
+            // validation would find stale write set entries pointing to
+            // pre-existing committed versions and panic.
+            for rowid in &affected_table_rowids {
+                let has_tx_version = if let Some(entry) = self.rows.get(rowid) {
+                    let versions = entry.value().read();
+                    versions.iter().any(|rv| {
+                        matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                            || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                    })
+                } else {
+                    false
+                };
+                if !has_tx_version {
+                    tx.write_set.remove(rowid);
                 }
             }
 
