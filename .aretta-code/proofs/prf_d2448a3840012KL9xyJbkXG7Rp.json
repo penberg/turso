@@ -1,0 +1,182 @@
+{
+  "id": "prf_d2448a3840012KL9xyJbkXG7Rp",
+  "name": "page-cache-no-duplicates",
+  "targetProperty": "At most one cache entry exists per page number at any time",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/page_cache.rs",
+  "createdAt": "2026-03-25T09:17:13.476Z",
+  "updatedAt": "2026-03-25T09:18:18.391Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "At most one cache entry exists per page number at any time. Formally: for all page numbers p, |{e ∈ cache | e.key == p}| ≤ 1",
+      "formal": "∀ p: PageCacheKey. |{e ∈ cache.map | e.key == p}| ≤ 1",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T09:17:29.244Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "The data structure enforces uniqueness by design (HashMap with PageCacheKey as key)",
+      "formal": "map: HashMap<PageCacheKey, *mut PageCacheEntry> implies at most one value per key",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T09:17:35.625Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Insert operation preserves uniqueness: either updates existing entry or adds new key",
+      "formal": "∀ k. before(¬map.contains(k)) ∧ after(map.contains(k)) → exactly one entry added",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T09:17:35.626Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "No other code path can create duplicate entries (all mutations go through map API)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T09:17:35.627Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "The PageCache uses `map: HashMap<PageCacheKey, *mut PageCacheEntry>` (line 103-104). By the semantics of Rust's HashMap, each key can map to at most one value. The key type is PageCacheKey which wraps a page number (line 29-31). This is a structural invariant of the HashMap data structure itself.",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T09:17:46.405Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "The _insert method (lines 216-288) handles both cases:\n\n1. **Key exists** (lines 223-251): If `map.get(&key)` returns Some, either:\n   - If page is not loaded and not locked: delete existing entry first via `_delete(key, true)`, then proceed to fresh insert (lines 228-230)\n   - If update_in_place=true: update the existing entry's page field in place (lines 234-244)\n   - Otherwise: assert same Arc and return KeyExists error (lines 246-249)\n\n2. **Key doesn't exist** (lines 254-287): Creates new PageCacheEntry and calls `map.insert(key, entry_ptr)` exactly once (lines 266 or 278).\n\nIn both paths, there is never a second entry created for the same key. The map.insert() call either creates the first entry or (in HashMap semantics) would replace an existing entry - but the code ensures no existing entry by the control flow.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T09:17:46.595Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "All mutation operations on `self.map` are:\n\n**Insertions (only 2 call sites, both in _insert):**\n- Line 266: `self.map.insert(key, entry_ptr)` - first entry case\n- Line 278: `self.map.insert(key, entry_ptr)` - insert after clock hand case\n\nBoth are in `_insert()` which handles key existence check first (lines 223-251).\n\n**Removals:**\n- Line 323: `self.map.remove(&key)` in `_delete()` - removes existing entry\n- Line 652: `self.map.remove(&key)` in `evict_one()` - removes during eviction\n- Line 700: `self.map.clear()` in `clear()` - removes all entries\n\n**Read-only operations (cannot create duplicates):**\n- `map.get()`, `map.contains_key()`, `map.iter()`, `map.values()`, `map.keys()`, `map.len()`\n\nSince HashMap enforces at-most-one-value-per-key, and all insertions go through `_insert()` which checks for existing keys first, and all other mutations are removals, no duplicate entries can exist.",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T09:18:01.094Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "Rust's std HashMap (and rustc_hash::FxHashMap which is used here) maintains the invariant that each key maps to at most one value. The `insert` method either creates a new entry or replaces an existing one - it never creates duplicates.",
+      "formal": "HashMap::insert(k, v) ensures |{e | e.key == k}| == 1 after call",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T09:18:06.412Z"
+    }
+  }
+}

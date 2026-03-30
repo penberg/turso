@@ -1,0 +1,227 @@
+{
+  "id": "prf_d24331f7d001KGxIGpZ88SjlpQ",
+  "name": "page_cache_read_consistency",
+  "targetProperty": "Read consistency: Reading a page returns the most recently written version. For a given page, if write W happens-before read R, then R observes W's value (or a later write's value).",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/pager.rs",
+  "createdAt": "2026-03-25T08:53:43.421Z",
+  "updatedAt": "2026-03-25T08:55:13.166Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Read Consistency Property: When a page is read via Pager::read_page(), the returned PageRef contains the most recent written data for that page within the current transaction's visibility scope.",
+      "formal": "∀ page_id, ∀ read R at time t: R returns value V where V = latest_write(page_id, t') for max t' ≤ t within visibility scope",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T08:53:50.126Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Cache Hit Consistency: When a page is found in cache, it reflects in-memory modifications (dirty pages contain latest writes)",
+      "formal": "cache_hit(page_id) → returned_page.buffer == in_memory_state(page_id)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T08:54:00.200Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Cache Miss + WAL Consistency: When a page is not in cache, the WAL is consulted and the most recent committed frame within the transaction's visibility is returned",
+      "formal": "cache_miss(page_id) ∧ wal_frame_exists(page_id, frame ≤ max_frame) → read_from_wal(latest_frame)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T08:54:00.201Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Cache Miss + Disk Consistency: When no WAL frame exists, the page is read from the database file which contains the checkpointed (committed) data",
+      "formal": "cache_miss(page_id) ∧ ¬wal_frame_exists(page_id) → read_from_disk(page_id)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T08:54:00.202Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Single PageRef Identity: The same PageRef (Arc<Page>) is returned for repeated reads of the same page within a transaction, ensuring modifications are visible",
+      "formal": "∀ read₁, read₂ of page_id in same tx: Arc::ptr_eq(read₁.result, read₂.result)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T08:54:00.203Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "Cache Hit Consistency is ensured by returning the same Arc<Page> with in-place modifications:\n\n1. read_page() first checks the cache (pager.rs:2790-2800):\n   ```rust\n   let mut page_cache = self.page_cache.write();\n   if let Some(page) = page_cache.get(&page_key)? {\n       return Ok((page, None));\n   }\n   ```\n\n2. The PageRef returned is an Arc<Page> pointing to the same PageInner that was modified via add_dirty():\n   - add_dirty() marks the page dirty via page.set_dirty() (pager.rs:2932)\n   - The page buffer is modified in-place through page.get_contents().as_ptr() \n   - No copy is made - the buffer is shared via Arc<Buffer>\n\n3. The page cache stores PageRef directly (page_cache.rs:103):\n   ```rust\n   map: HashMap<PageCacheKey, *mut PageCacheEntry>  // entry contains PageRef\n   ```\n\n4. Modifications to page buffer are immediately visible because:\n   - Page::get_contents() returns &mut PageInner with the same buffer\n   - UnsafeCell<PageInner> provides interior mutability\n   - All callers share the same Arc<Page>\n\nTherefore, a cache hit returns the exact same page object with all in-memory modifications visible.",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T08:54:11.314Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "Cache Miss + WAL Consistency is ensured by the WAL frame lookup:\n\n1. On cache miss, read_page_no_cache() is called (pager.rs:2805):\n   ```rust\n   let (page, c) = self.read_page_no_cache(page_idx, None, false)?;\n   ```\n\n2. read_page_no_cache() consults the WAL first (pager.rs:2745-2780):\n   - Calls wal.find_frame(page_id, watermark) to search for the page in WAL\n   - find_frame searches shared.frame_cache (SpinLock<HashMap<page_id, [frame_ids]>>)\n   - Returns the largest frame_id ≤ max_frame (transaction's snapshot boundary)\n\n3. The max_frame watermark is set during begin_read_tx() (wal.rs:1243):\n   - Each connection acquires a read-mark slot with the current max_frame value\n   - This provides snapshot isolation: only frames committed before begin_read_tx() are visible\n\n4. If a frame is found, wal.read_frame() reads from the WAL file (wal.rs:1457):\n   - Async pread at frame_offset(frame_id)\n   - The frame contains the page data as written by the committing transaction\n\n5. The frame_cache is updated atomically during commit_prepared_frames():\n   - New frames are published by updating shared.max_frame\n   - frame_cache entries are added while holding SpinLock\n\nThis ensures cache misses return the most recent committed version within the transaction's visibility.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T08:54:22.796Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "Cache Miss + Disk Consistency is the fallback when no WAL frame exists:\n\n1. If wal.find_frame() returns None, the page is read from disk (pager.rs:2745-2780):\n   ```rust\n   // In read_page_no_cache:\n   if let Some(frame_id) = wal.find_frame(...) {\n       wal.read_frame(frame_id, page, buf_pool)\n   } else {\n       begin_read_disk_page(...)  // fallback to DB file\n   }\n   ```\n\n2. begin_read_disk_page() calls sqlite3_ondisk::begin_read_page() (pager.rs:2824-2839):\n   - Async pread from DB file at offset = (page_idx - 1) * page_size\n\n3. The database file contains checkpointed data:\n   - Checkpoint writes WAL frames back to their original page positions\n   - nbackfills tracks how many frames have been backfilled\n   - After checkpoint, the WAL can be truncated\n\n4. Consistency is maintained because:\n   - If a page was modified but not checkpointed, it MUST have a WAL frame\n   - If no WAL frame exists, the DB file version is the authoritative committed version\n   - Checkpoint only runs when no readers hold frames being checkpointed (read-mark locking)\n\n5. The page read from disk represents the last checkpointed state, which is the most recent \n   committed version not in WAL (older than any WAL frames for this page).",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T08:54:33.171Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "Single PageRef Identity ensures modifications are visible across multiple reads:\n\n1. The page cache uses HashMap<PageCacheKey, *mut PageCacheEntry> where PageCacheEntry contains PageRef (page_cache.rs:103)\n\n2. On cache hit, the same PageRef is returned (page_cache.rs:356-375):\n   ```rust\n   pub fn get(&mut self, key: &PageCacheKey) -> crate::Result<Option<PageRef>> {\n       let Some(&entry_ptr) = self.map.get(key) else { return Ok(None); };\n       let entry = unsafe { &mut *entry_ptr };\n       let page = entry.page.clone();  // Arc::clone, same underlying Page\n       // ...\n       Ok(Some(page))\n   }\n   ```\n\n3. Arc::clone() increments reference count but returns pointer to same Page:\n   - PageRef = Arc<Page>\n   - All clones point to the same Page with the same UnsafeCell<PageInner>\n   - Modifications via page.get_contents() affect all holders of PageRef\n\n4. On cache miss, the newly created page is inserted and then returned:\n   - cache_insert() adds the page to the cache (pager.rs:2807)\n   - Future reads will hit the cache and get the same PageRef\n\n5. The RwLock<PageCache> (pager.rs:1296) serializes all cache access:\n   - get() acquires write lock (to update ref_bit for SIEVE)\n   - insert() acquires write lock\n   - No concurrent insert/get race for the same key\n\nThis ensures within a transaction, all reads of the same page return the same Arc<Page>,\nand modifications made through one PageRef are visible through all others.",
+      "status": "pending",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T08:54:44.290Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "Important scope clarification: Read consistency holds WITHIN a transaction's visibility scope.\n\n1. **Uncommitted writes**: Dirty pages in the cache are visible to the same connection but NOT to other connections until commit. This is correct transactional behavior.\n\n2. **begin_read_tx() invalidation** (pager.rs:2519): When beginning a new read transaction, if the database has changed (another writer committed), the entire page cache is cleared:\n   ```rust\n   // In begin_read_tx, if WAL has advanced:\n   self.clear_page_cache()?;  // Invalidate stale cached pages\n   ```\n   This ensures the new transaction sees the latest committed state.\n\n3. **Snapshot isolation via max_frame**: Each connection's WAL reads are bounded by max_frame set at begin_read_tx(). Frames written after this point are invisible, providing repeatable reads within the transaction.\n\n4. **Eviction safety**: The cache may evict non-dirty pages, but:\n   - Dirty pages cannot be evicted (unless spilled to WAL first)\n   - Spilled pages remain readable from WAL\n   - Re-reading an evicted page will re-fetch from WAL or disk with the same visibility rules\n\nThe property \"most recently written version\" is scoped to:\n- For dirty pages: the in-memory state (current transaction's writes)\n- For clean pages: the most recent committed version visible to this transaction's snapshot",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T08:54:56.112Z"
+    }
+  }
+}

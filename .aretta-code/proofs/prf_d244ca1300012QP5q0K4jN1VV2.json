@@ -1,0 +1,250 @@
+{
+  "id": "prf_d244ca1300012QP5q0K4jN1VV2",
+  "name": "page-cache-wal-protocol",
+  "targetProperty": "Dirty pages are not flushed to the database file until their WAL frames are durable",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/pager.rs",
+  "createdAt": "2026-03-25T09:21:35.024Z",
+  "updatedAt": "2026-03-25T10:57:49.419Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Dirty pages are not flushed to the database file until their WAL frames are durable. This is the core WAL protocol ensuring crash-safety.",
+      "formal": "∀ page p. write_to_db(p) → WAL_frame_durable(p)",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T09:22:30.577Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Only checkpoint writes pages to DB file, not commit",
+      "formal": "write_to_db_file(p) ⇔ checkpoint_backfill(p)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T09:22:38.075Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Checkpoint only backfills frames that are already committed to WAL",
+      "formal": "checkpoint_backfill(p, frame) → frame ≤ shared.max_frame (committed)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T09:22:38.081Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Checkpoint determines max safe frame from nbackfills boundary",
+      "formal": "backfill_range = [nbackfills+1, max_safe_frame] where frames in range are durable",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T09:22:38.082Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "WAL frames are made durable (fsync) before being available for checkpoint",
+      "formal": "finish_append_frames_commit() called only after WAL fsync completes",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T09:22:38.083Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "Commit flow (pager.rs lines 3486-3736) writes only to WAL, never to DB file:\n1. PrepareWal → GetDbSize → ScanAndIssueReads → PrepareFrames → WaitWrites → WaitSync → WalCommitDone\n2. All frame writes go through `wal.append_frames_vectored()` (line 3205) which writes to WAL file\n3. The only code that writes to DB file is `write_pages_vectored()` which is called ONLY from checkpoint (wal.rs line 2548)\n4. Commit clears dirty_pages AFTER WAL commit (line 3725) but never touches DB file",
+      "status": "proved",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T09:22:50.251Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "Checkpoint backfills from `shared.nbackfills + 1` to `max_safe_frame` (wal.rs lines 2381-2418):\n- `oc.min_frame = nbackfills + 1` (line 2418)\n- `oc.max_frame = max_frame` where max_frame comes from `shared.max_frame.load()` (line 2382)\n- Only frames in `pages_to_checkpoint` list are backfilled, built from frame_cache entries in range [min_frame, max_frame] (lines 2425-2443)\n- `shared.max_frame` is only advanced by `finish_append_frames_commit()` AFTER commit completes (line 1829-1830)",
+      "status": "proved",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T09:22:50.311Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "The checkpoint determines max safe frame via `determine_max_safe_checkpoint_frame()` (wal.rs line 2397, 2678-2735):\n- This function examines read locks to find the minimum frame any reader is still using\n- Returns max_frame that is safe to backfill without invalidating any reader's snapshot\n- nbackfills tracks how many frames have been backfilled to DB; checkpoint only backfills frames AFTER nbackfills (line 2387: `needs_backfill = max_frame > nbackfills`)\n- After successful checkpoint, `nbackfills.store(ongoing_chkpt.max_frame)` (line 2600-2602)",
+      "status": "proved",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T09:23:03.252Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "The commit flow ensures WAL fsync before making frames visible (pager.rs lines 3675-3724):\n1. WaitWrites: Waits for all WAL write completions to finish (lines 3644-3672)\n2. WaitSync (SyncMode::Full): Submits `wal.sync()` and waits for fsync completion (lines 3677-3717)\n   - Comment at line 3686-3692 explicitly states: \"To protect against partial writes, we MUST ensure that all write Completions finish before submitting the fsync\"\n3. WalCommitDone: Only AFTER sync completes does it call:\n   - `wal.commit_prepared_frames()` - updates WAL index (line 3722)\n   - `wal.finish_append_frames_commit()` - advances shared.max_frame (line 3724)\n\nThe shared.max_frame is what checkpoint uses as its upper bound, so checkpoint can only see frames that have been durably synced.",
+      "status": "proved",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T09:23:03.317Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "CAVEAT: In SyncMode::Normal, WAL fsync is skipped on individual commits (line 3682-3683), but fsync still occurs on checkpoint and WAL restart. This trades durability of individual transactions for performance - a crash could lose the last committed transaction. However, the invariant still holds: checkpoint only backfills frames from shared.max_frame, which is only advanced after the writer completes (even without fsync). A crash mid-transaction (before WalCommitDone) would lose uncommitted frames, but those frames wouldn't be in shared.max_frame anyway.",
+      "formal": "SyncMode::Normal: fsync skipped on commit but checkpoint still respects shared.max_frame boundary",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T09:23:10.701Z"
+    },
+    "R5": {
+      "label": "R5",
+      "type": "reasoning",
+      "content": "Additional safeguard: checkpoint_shutdown() explicitly fsyncs WAL before checkpointing (pager.rs lines 4159-4161):\n```rust\n// fsync the wal syncronously before beginning checkpoint\nlet c = wal.sync(self.get_sync_type())?;\nself.io.wait_for_completion(c)?;\n```\nThis ensures that even for shutdown checkpoints, all WAL frames are durable before backfilling to DB.",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 11,
+      "createdAt": "2026-03-25T09:23:16.326Z"
+    }
+  }
+}

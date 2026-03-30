@@ -1,0 +1,317 @@
+{
+  "id": "prf_d248eb925001WnDDk0AAzQY6ry",
+  "name": "record-serialization-bijection",
+  "targetProperty": "Writing a value to a record and reading it back yields exactly the same value — no precision loss, encoding errors, or data corruption",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/sqlite3_ondisk.rs",
+  "createdAt": "2026-03-25T10:33:46.533Z",
+  "updatedAt": "2026-03-25T10:58:02.975Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Record Serialization Bijection: For every value type (NULL, Integer, Float, Text, Blob), the write-then-read operation is lossless. The same value that was written is returned when read.",
+      "formal": "forall v: Value. read(write(v)) == v",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5",
+        "G6"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T10:34:14.089Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "NULL values are preserved: write produces no bytes (serial type 0), read returns NULL",
+      "formal": "write(NULL) = [] AND read(0, []) = NULL",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T10:34:22.955Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Integer values are preserved: serial type selection matches value range, and encoding/decoding are inverse operations for all integer sizes (I8, I16, I24, I32, I48, I64, ConstInt0, ConstInt1)",
+      "formal": "forall i: i64. read(serial_type(i), write(i)) == i",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T10:34:22.956Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Float values are preserved: IEEE 754 double-precision encoding via to_be_bytes/from_be_bytes is bijective",
+      "formal": "forall f: f64. from_be_bytes(to_be_bytes(f)) == f",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T10:34:22.956Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Text values are preserved: length is encoded in serial type, bytes are copied verbatim, read returns same string",
+      "formal": "forall t: Text. read(text(len(t)), write(t)) == t",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T10:34:22.959Z"
+    },
+    "G5": {
+      "label": "G5",
+      "type": "obligation",
+      "content": "Blob values are preserved: length is encoded in serial type, bytes are copied verbatim, read returns same bytes",
+      "formal": "forall b: Blob. read(blob(len(b)), write(b)) == b",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T10:34:22.960Z"
+    },
+    "G6": {
+      "label": "G6",
+      "type": "obligation",
+      "content": "Serial type selection is deterministic and correct: the same value always produces the same serial type, and the type correctly identifies the encoding width",
+      "formal": "forall v: Value. serial_type(v) is deterministic AND size(serial_type(v)) == bytes_needed(v)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R6"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T10:34:22.961Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "Evidence for G1: NULL preservation is trivial.\n\n**Write side** (types.rs:452, 611):\n```rust\nValue::Null => {}  // No bytes written\n```\n\n**Serial type** (types.rs:2523):\n```rust\nValueRef::Null => SerialType::null()  // serial type = 0\n```\n\n**Read side** (sqlite3_ondisk.rs:965):\n```rust\nSerialTypeKind::Null => Ok((ValueRef::Null, 0))  // Returns NULL, consumes 0 bytes\n```\n\nThe round-trip is: NULL → (type=0, bytes=[]) → NULL. Trivially correct.",
+      "status": "proved",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T10:34:30.391Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "Evidence for G2: Integer preservation for all sizes.\n\n**Serial type selection** (types.rs:2524-2532):\n```rust\n0 => SerialType::const_int0(),                    // type 8\n1 => SerialType::const_int1(),                    // type 9  \ni if (I8_LOW..=I8_HIGH).contains(&i)   => i8(),   // [-128, 127] → type 1\ni if (I16_LOW..=I16_HIGH).contains(&i) => i16(),  // [-32768, 32767] → type 2\ni if (I24_LOW..=I24_HIGH).contains(&i) => i24(),  // [-8388608, 8388607] → type 3\ni if (I32_LOW..=I32_HIGH).contains(&i) => i32(),  // [-2^31, 2^31-1] → type 4\ni if (I48_LOW..=I48_HIGH).contains(&i) => i48(),  // [-2^47, 2^47-1] → type 5\n_ => i64()                                         // Full range → type 6\n```\n\n**Write/Read pairs for each size**:\n\n| Type | Write (types.rs) | Read (sqlite3_ondisk.rs) |\n|------|------------------|--------------------------|\n| ConstInt0 | No bytes | Returns 0 (line 1061) |\n| ConstInt1 | No bytes | Returns 1 (line 1062) |\n| I8 | `(i as i8).to_be_bytes()` | `buf[0] as i8 as i64` (line 971) |\n| I16 | `(i as i16).to_be_bytes()` | `i16::from_be_bytes` (line 982) |\n| I24 | `(i as i32).to_be_bytes()[1..]` | Sign-extend + `i32::from_be_bytes` (lines 994-1001) |\n| I32 | `(i as i32).to_be_bytes()` | `i32::from_be_bytes` (line 1014) |\n| I48 | `i.to_be_bytes()[2..]` | Sign-extend + `i64::from_be_bytes` (lines 1026-1037) |\n| I64 | `i.to_be_bytes()` | `i64::from_be_bytes` (line 1050) |\n\n**Critical insight**: The casts during write (e.g., `i as i8`) are safe because serial type selection guarantees the value fits in the target range. Sign extension during read correctly reconstructs the original value.",
+      "status": "proved",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T10:34:41.714Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "Evidence for G3: Float preservation via IEEE 754.\n\n**Write side** (types.rs:465-467, 2630-2631):\n```rust\nValue::Numeric(Numeric::Float(f)) => {\n    let fval: f64 = (*f).into();\n    out.extend_from_slice(&fval.to_be_bytes());\n}\n```\n\n**Read side** (sqlite3_ondisk.rs:1054-1059):\n```rust\nSerialTypeKind::F64 => {\n    let bytes: &[u8; 8] = buf.get(..8)...;\n    Ok((ValueRef::from_f64(f64::from_be_bytes(*bytes)), 8))\n}\n```\n\n**Analysis**:\n- `to_be_bytes()` converts f64 to 8 bytes in IEEE 754 big-endian format\n- `from_be_bytes()` converts 8 bytes back to f64\n- This is a direct memory representation round-trip — no precision loss\n\n**Special cases handled correctly**:\n- NaN: Bit pattern preserved (though NaN != NaN by IEEE semantics)\n- Infinity: Bit pattern preserved\n- Negative zero: Bit pattern preserved\n- Subnormals: Bit pattern preserved\n\nThe encoding is the exact IEEE 754 binary64 representation — mathematically bijective.",
+      "status": "proved",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T10:34:49.976Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "Evidence for G4: Text preservation.\n\n**Serial type** (types.rs:2535, 2442-2443):\n```rust\nValueRef::Text(t) => SerialType::text(t.value.len() as u64)\n// where text(size) = Self(13 + size * 2)\n```\n\n**Write side** (types.rs:469, 2633):\n```rust\nValue::Text(t) => out.extend_from_slice(t.value.as_bytes())\n```\n\n**Read side** (sqlite3_ondisk.rs:1071-1086):\n```rust\nSerialTypeKind::Text => {\n    let content_size = serial_type.size();  // (serial_type - 13) / 2\n    let data = buf.get(..content_size)...;\n    let val = unsafe { std::str::from_utf8_unchecked(data) };\n    Ok((ValueRef::Text(TextRef::new(val, TextSubtype::Text)), content_size))\n}\n```\n\n**Size calculation** (types.rs:2486):\n```rust\nSerialTypeKind::Text => (self.0 as usize - 13) / 2\n```\n\n**Round-trip**:\n1. Write: String of length N → serial_type = 13 + 2*N, bytes = raw UTF-8\n2. Read: size = (13 + 2*N - 13) / 2 = N, read N bytes, interpret as UTF-8\n\n**Note**: `from_utf8_unchecked` is safe because the original text was valid UTF-8 (from Rust String), and we're reading exactly what was written.",
+      "status": "proved",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 11,
+      "createdAt": "2026-03-25T10:34:58.862Z"
+    },
+    "R5": {
+      "label": "R5",
+      "type": "reasoning",
+      "content": "Evidence for G5: Blob preservation.\n\n**Serial type** (types.rs:2536, 2438-2439):\n```rust\nValueRef::Blob(b) => SerialType::blob(b.len() as u64)\n// where blob(size) = Self(12 + size * 2)\n```\n\n**Write side** (types.rs:470, 2634):\n```rust\nValue::Blob(b) => out.extend_from_slice(b)\n```\n\n**Read side** (sqlite3_ondisk.rs:1063-1069):\n```rust\nSerialTypeKind::Blob => {\n    let content_size = serial_type.size();  // (serial_type - 12) / 2\n    let data = buf.get(..content_size)...;\n    Ok((ValueRef::Blob(data), content_size))\n}\n```\n\n**Size calculation** (types.rs:2487):\n```rust\nSerialTypeKind::Blob => (self.0 as usize - 12) / 2\n```\n\n**Round-trip**:\n1. Write: Blob of length N → serial_type = 12 + 2*N, bytes = raw data\n2. Read: size = (12 + 2*N - 12) / 2 = N, read N bytes verbatim\n\nBlobs are the simplest case — raw bytes in, same raw bytes out. No encoding transformation.",
+      "status": "proved",
+      "parent": "G5",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G5",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 12,
+      "createdAt": "2026-03-25T10:35:05.180Z"
+    },
+    "R6": {
+      "label": "R6",
+      "type": "reasoning",
+      "content": "Evidence for G6: Serial type selection is deterministic and size-correct.\n\n**Determinism**: The `From<T: AsValueRef> for SerialType` implementation (types.rs:2519-2538) is a pure function with no side effects:\n- Pattern matching on value type (Null, Integer, Float, Text, Blob)\n- For integers: range checks using constants (I8_LOW/HIGH, etc.)\n- For Text/Blob: length calculation\n\n**Size correctness** (types.rs:2476-2487):\n```rust\npub const fn size(&self) -> usize {\n    match self.kind() {\n        SerialTypeKind::Null => 0,\n        SerialTypeKind::I8 => 1,\n        SerialTypeKind::I16 => 2,\n        SerialTypeKind::I24 => 3,\n        SerialTypeKind::I32 => 4,\n        SerialTypeKind::I48 => 6,\n        SerialTypeKind::I64 => 8,\n        SerialTypeKind::F64 => 8,\n        SerialTypeKind::ConstInt0 => 0,\n        SerialTypeKind::ConstInt1 => 0,\n        SerialTypeKind::Text => (self.0 as usize - 13) / 2,\n        SerialTypeKind::Blob => (self.0 as usize - 12) / 2,\n    }\n}\n```\n\n**Integer range alignment**:\n- I8: values in [-128, 127] fit in 1 byte (signed)\n- I16: values in [-32768, 32767] fit in 2 bytes\n- I24: values in [-2^23, 2^23-1] fit in 3 bytes\n- I32: values in [-2^31, 2^31-1] fit in 4 bytes\n- I48: values in [-2^47, 2^47-1] fit in 6 bytes\n- I64: all i64 values fit in 8 bytes\n\nThe write path uses `size()` to allocate space, and read path uses `size()` to know how many bytes to consume. Both use the same function, ensuring consistency.",
+      "status": "proved",
+      "parent": "G6",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G6",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 13,
+      "createdAt": "2026-03-25T10:35:14.581Z"
+    },
+    "I1": {
+      "label": "I1",
+      "type": "invariant",
+      "content": "Detailed analysis of I24/I48 sign extension correctness:\n\n**I24 Write** (types.rs:458, 2618-2620):\n```rust\nSerialTypeKind::I24 => out.extend_from_slice(&(*i as i32).to_be_bytes()[1..])\n```\nCasts i64 to i32 (safe because value is in I24 range), then takes bytes [1..4] (big-endian, so MSB is at [0]).\n\n**I24 Read** (sqlite3_ondisk.rs:994-1001):\n```rust\nlet sign_extension = (bytes[0] as i8 >> 7) as u8;  // 0x00 or 0xFF\nOk((ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([\n    sign_extension, bytes[0], bytes[1], bytes[2]\n]) as i64)), 3))\n```\n- If bytes[0] has bit 7 set (negative): sign_extension = 0xFF\n- If bytes[0] has bit 7 clear (positive): sign_extension = 0x00\n- Prepends sign extension byte to form valid 4-byte signed integer\n\n**Example**: -1000000 (0xFFF0BDC0 as i32)\n- Write: takes [1..4] = [0xF0, 0xBD, 0xC0]\n- Read: sign_extension = (0xF0 >> 7) = 0xFF, reconstruct [0xFF, 0xF0, 0xBD, 0xC0] = -1000000 ✓\n\n**I48 uses same logic** with 2-byte sign extension (lines 1026-1037).\n\nThe sign extension correctly reconstructs the original signed value.",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 14,
+      "createdAt": "2026-03-25T10:35:24.458Z"
+    }
+  }
+}

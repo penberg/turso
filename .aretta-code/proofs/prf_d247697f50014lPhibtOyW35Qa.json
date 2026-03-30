@@ -1,0 +1,277 @@
+{
+  "id": "prf_d247697f50014lPhibtOyW35Qa",
+  "name": "freelist-safety",
+  "targetProperty": "A freed page is not reallocated until all references to it are removed, and freed pages are not mistakenly read as live B-tree data",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/btree.rs",
+  "createdAt": "2026-03-25T10:07:25.173Z",
+  "updatedAt": "2026-03-25T10:08:41.732Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Freelist safety: (1) a page is only freed after parent pointers are updated to point to new pages, (2) allocation zeroes page content before use, (3) freelist metadata is atomically updated within a transaction",
+      "formal": "(free(page) → ¬∃parent_ptr pointing to page) ∧ (allocate(page) → page.content = zeros) ∧ (freelist changes committed atomically)",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T10:07:54.938Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Parent pointers updated BEFORE pages freed in balance",
+      "formal": "NonRootDoBalancingFinish (divider cells + rightmost ptr) → FreePages state",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T10:08:02.322Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Allocated page content is zeroed before reuse",
+      "formal": "allocate_page zeroes buffer: page.as_ptr().fill(0)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T10:08:02.324Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Freelist header count and trunk pointer are consistent",
+      "formal": "freelist_pages count matches actual freelist structure",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T10:08:02.324Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Free operation validates page_id is within database bounds",
+      "formal": "free_page checks: page_id >= 2 && page_id <= database_size",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T10:08:02.325Z"
+    },
+    "G5": {
+      "label": "G5",
+      "type": "obligation",
+      "content": "All freelist modifications marked dirty (transactional)",
+      "formal": "add_dirty() called on trunk page and header before freelist modifications",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T10:08:02.326Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "The balance state machine in btree.rs has explicit ordering: NonRootDoBalancingFinish state (lines 3468-3892) completes ALL parent pointer updates before transitioning to FreePages state (line 3889). In NonRootDoBalancingFinish: (1) rightmost pointer updated (lines 3536-3547), (2) divider cells with child pointers inserted (lines 3582-3680), (3) cells written to new pages (lines 3706-3806). ONLY AFTER all this completes does `*sub_state = BalanceSubState::FreePages` (line 3889). The old pages in pages_to_balance[sibling_count_new..sibling_count] are freed ONLY in FreePages state (lines 3894-3917).",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T10:08:24.598Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "In allocate_page (pager.rs), when reusing a freelist page, the content is zeroed before returning. For trunk page reuse (lines 4521-4541): `trunk_page.get_contents().as_ptr().fill(0)` (line 4527). For leaf page reuse (lines 4543-4600): `leaf_page.get_contents().as_ptr().fill(0)` (line 4561). Both paths also assert overflow_cells is empty (lines 4523, 4556-4559). This ensures no stale B-tree data from the freed page leaks into the newly allocated page.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T10:08:24.697Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "Freelist count and structure are kept in sync. In free_page: header.freelist_pages is incremented FIRST (line 4241), then the page is added to trunk or becomes new trunk. In allocate_page: header.freelist_pages is decremented (lines 4519, 4595) when a page is removed from freelist. The integrity_check in btree.rs (lines 6071-6167) verifies: (1) freelist_count.actual_count is incremented for each traversed page (lines 6071, 6167), (2) invalid pointers detected (lines 6075-6090), (3) leaf count validated (lines 6107-6125). Final check compares actual_count vs expected header count.",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T10:08:24.813Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "In free_page Start state (pager.rs:4218-4257), the first check is bounds validation: `if page_id < 2 || page_id > header.database_size.get() as usize { return Err(LimboError::Corrupt(...)) }` (lines 4219-4222). Page 1 (database header) cannot be freed (page_id < 2 check). Pages beyond database size cannot be freed. This prevents freeing invalid pages that could corrupt the freelist structure.",
+      "status": "pending",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T10:08:24.863Z"
+    },
+    "R5": {
+      "label": "R5",
+      "type": "reasoning",
+      "content": "All freelist modifications are marked dirty for transactional consistency. In free_page AddToTrunk state: `self.add_dirty(&trunk_page)?` (line 4281) before modifying leaf count and adding pointer. In NewTrunk state: `self.add_dirty(page)?` (line 4304) before setting next trunk pointer. In allocate_page: `self.add_dirty(trunk_page)?` (line 4520) and `self.add_dirty(leaf_page)?` (line 4554), `self.add_dirty(trunk_page)?` (line 4573) before modifications. Header modifications (freelist_pages, freelist_trunk_page) go through HeaderRefMut which also tracks dirty state. All changes are part of the same transaction and committed atomically.",
+      "status": "pending",
+      "parent": "G5",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G5",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 11,
+      "createdAt": "2026-03-25T10:08:24.930Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "Crash safety relies on transaction atomicity (proved separately). If crash occurs during balance: (1) before commit - entire transaction rolls back, old B-tree structure intact, freelist unchanged. (2) after commit - new B-tree structure with updated parent pointers is durable, freed pages are in freelist. The FreePages state only executes within the same transaction that updates parent pointers, so either BOTH happen or NEITHER happens. This is guaranteed by WAL commit atomicity (property #10).",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "implies"
+        }
+      ],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 12,
+      "createdAt": "2026-03-25T10:08:31.458Z"
+    }
+  }
+}

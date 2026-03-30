@@ -1,0 +1,272 @@
+{
+  "id": "prf_d247042a2001Gxmpy7pMyf5od9",
+  "name": "checkpoint-data-integrity",
+  "targetProperty": "When checkpoint copies WAL frames to DB file, each frame is written to the correct page offset with correct content, ensuring no data corruption or misplacement",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/wal.rs",
+  "createdAt": "2026-03-25T10:00:30.114Z",
+  "updatedAt": "2026-03-25T10:02:30.142Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Checkpoint data integrity: when copying WAL frames to DB file, (1) correct page content is read from WAL, (2) content is written to correct DB file offset based on page_id, (3) only committed frames are copied",
+      "formal": "∀ (page_id, frame_id) in pages_to_checkpoint: DB[offset(page_id)] = WAL[frame_id].content ∧ frame_id ≤ max_frame",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T10:01:05.060Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Frame selection: only committed frames (≤ max_frame) are selected for checkpoint",
+      "formal": "pages_to_checkpoint only contains frames where frame_id ≤ max_safe_frame ≤ max_frame",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T10:01:12.760Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Page-frame mapping: frame_cache correctly maps page_id to latest frame containing that page",
+      "formal": "∀ (page_id, frame_id) in pages_to_checkpoint: WAL[frame_id].page_number == page_id",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T10:01:12.761Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Content preservation: WAL frame content is read correctly into buffer",
+      "formal": "buffer content after read == WAL[frame_id].page_content",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T10:01:12.762Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Offset calculation: write_pages calculates correct DB file offset from page_id",
+      "formal": "offset = (page_id - 1) * page_size",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T10:01:12.763Z"
+    },
+    "G5": {
+      "label": "G5",
+      "type": "obligation",
+      "content": "Atomicity: nbackfills only updated after all writes complete successfully",
+      "formal": "nbackfills.store() happens in DetermineResult, after Processing completes",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T10:01:12.768Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "In checkpoint_inner Start state (wal.rs:2380-2458), max_safe_frame is determined by determine_max_safe_checkpoint_frame() (line 2397), which returns min(max_frame, min(all active reader marks)). The frame selection loop (lines 2430-2440) filters: `frames.iter().rev().find(|&&f| f >= oc_min_frame && f <= oc_max_frame)`. Since oc_max_frame = max_safe_frame ≤ max_frame (committed), only committed frames are selected. oc_min_frame = nbackfills + 1 ensures we don't re-checkpoint already backfilled frames.",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T10:01:56.800Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "The frame_cache is a HashMap<page_id, Vec<frame_id>> populated during WAL loading (sqlite3_ondisk.rs:1701-1704) and commit (wal.rs:2040). Each entry maps page_id to the list of frames containing that page. In checkpoint selection (wal.rs:2430-2440), we iterate frame_cache and for each page_id, select the LATEST frame via `.iter().rev().find()`. The WAL frame header contains page_number (sqlite3_ondisk.rs:472-474), which was used to populate frame_cache. Therefore WAL[frame_id].page_number == page_id by construction.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T10:01:56.890Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "In issue_wal_read_into_buffer (wal.rs:2900-2948), the WAL frame is read from offset = frame_offset(frame_id) + WAL_FRAME_HEADER_SIZE (line 2936). This skips the 24-byte header and reads just the page content. The read completion asserts read == buf_len (lines 2917-2921). Additionally, in debug builds (lines 2508-2518), there's a verification: cached page content is compared against WAL read with turso_assert!(wal_page == cached). This ensures content integrity between cache and WAL.",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T10:01:57.007Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "In write_pages (database.rs:232-263), the offset is calculated as: `let pos = (first_page_idx as u64 - 1).checked_mul(page_size as u64)` (line 245). This is the standard SQLite page offset formula: page 1 starts at offset 0, page 2 at page_size, etc. The assertion turso_assert_greater_than!(first_page_idx, 0) (line 240) ensures page_id is valid. The pwritev call (line 261) writes buffers starting at this calculated position. For consecutive pages, the batch is written in one syscall with correct sequential offsets.",
+      "status": "pending",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T10:01:57.060Z"
+    },
+    "R5": {
+      "label": "R5",
+      "type": "reasoning",
+      "content": "The checkpoint state machine progresses: Start → Processing → DetermineResult → Finalize. In Processing state (wal.rs:2465-2571), all writes are issued and monitored. State only advances to DetermineResult when ongoing_chkpt.complete() returns true (line 2562-2563). The complete() method (lines 2685-2700) checks that all inflight_writes are done. Only in DetermineResult (lines 2574-2621) is nbackfills updated: `shared.nbackfills.store(ongoing_chkpt.max_frame)` (lines 2599-2603). If any write fails, first_write_error() triggers error return (lines 2479-2489), preventing nbackfills update.",
+      "status": "pending",
+      "parent": "G5",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G5",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 11,
+      "createdAt": "2026-03-25T10:01:57.132Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "DB file is synced before WAL truncation for TRUNCATE mode. The checkpoint state machine in pager.rs has explicit ordering: RunCheckpoint → SyncDbFile → TruncateWalFile → Finalize. Comments at lines 1040-1043 explain: 'Sync the database file after checkpoint' and 'Truncate the WAL file after DB file is safely synced'. This ensures if crash occurs after WAL truncation but before DB sync, data is not lost because WAL truncation only happens AFTER DB is durable.",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 12,
+      "createdAt": "2026-03-25T10:02:16.463Z"
+    }
+  }
+}

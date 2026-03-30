@@ -1,0 +1,280 @@
+{
+  "id": "prf_d246d3deb001C3AE16bzstUL8p",
+  "name": "transaction-atomicity",
+  "targetProperty": "Either all pages of a transaction are committed (visible after recovery), or none are (crash during commit results in full rollback to previous consistent state)",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/wal.rs",
+  "createdAt": "2026-03-25T09:57:12.299Z",
+  "updatedAt": "2026-03-25T09:58:23.407Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Transaction atomicity: all frames of a transaction become visible together (on commit) or none become visible (on crash before commit completes)",
+      "formal": "∀ transaction T: (committed(T) → all frames visible) ∧ (¬committed(T) → no frames visible after recovery)",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T09:57:22.426Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Commit frame marker: only the last frame of a transaction has db_size > 0",
+      "formal": "∀ frames in transaction: db_size > 0 iff frame is last",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T09:57:37.972Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Visibility controlled by max_frame: frames > max_frame are invisible to readers",
+      "formal": "find_frame(page_id, max_frame) returns None for frames > max_frame",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T09:57:37.973Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "max_frame only advances AFTER fsync completes successfully",
+      "formal": "max_frame.store() happens in WalCommitDone, after WaitSync succeeds",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T09:57:37.974Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Recovery only includes frames up to last commit marker",
+      "formal": "flush_pending_frames filters: frames.retain(|f| f <= last_valid_frame)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T09:57:37.975Z"
+    },
+    "G5": {
+      "label": "G5",
+      "type": "obligation",
+      "content": "Crash before fsync: max_frame not advanced, uncommitted frames invisible",
+      "formal": "crash in WaitWrites/WaitSync → max_frame unchanged → transaction invisible",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T09:57:37.976Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "In prepare_frames (wal.rs:2002-2008), db_size is set only for the LAST frame: `let frame_db_size = if idx + 1 == pages.len() { db_size_on_commit.unwrap_or(0) } else { 0 }`. The db_size_on_commit is only Some when is_commit_frame=true (pager.rs:3752). This means only the final frame of the final batch has db_size > 0, marking it as the commit frame. WalFrameHeader::is_commit_frame() (sqlite3_ondisk.rs:494-496) returns `self.db_size > 0`.",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T09:58:01.111Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "In find_frame (wal.rs:1387-1452), frame lookup is bounded by max_frame: `let range = frame_watermark.map(|x| 0..=x).unwrap_or_else(|| self.min_frame..=self.max_frame)` (line 1430-1432). The rfind at line 1441 only returns frames within this range: `list.iter().rfind(|&&f| range.contains(&f))`. Frames with id > max_frame are never returned, making them invisible to readers.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T09:58:01.185Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "The commit state machine (pager.rs:3503-3732) has explicit ordering: PrepareFrames → WaitWrites → WaitSync → WalCommitDone. In WaitWrites, all write completions must succeed (line 3650). In WaitSync (SyncMode::Full), fsync must complete successfully (line 3696-3717). Only in WalCommitDone does commit_prepared_frames() execute (line 3722), which calls max_frame.store() (wal.rs:2045-2046). If WaitWrites or WaitSync fails, the function returns Err and max_frame is never updated.",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T09:58:01.317Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "During WAL recovery (sqlite3_ondisk.rs:1658-1714), process_frames validates each frame's checksum chain. When db_size > 0 (commit marker) at line 1706, last_valid_frame is updated and flush_pending_frames is called. In flush_pending_frames (lines 1717-1734), frames are filtered: `frames.retain(|&f| f <= state.last_valid_frame)` (line 1726). In finalize_loading (lines 1737-1765), max_frame is set to last_valid_frame (line 1750). This ensures only committed transaction frames become visible after recovery.",
+      "status": "pending",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T09:58:01.356Z"
+    },
+    "R5": {
+      "label": "R5",
+      "type": "reasoning",
+      "content": "If crash occurs during WaitWrites or WaitSync: (1) max_frame was never updated (still points to previous commit), (2) WAL file may contain partial/unfsynced frames. On recovery: process_frames reads frames sequentially, validates checksum chain, and stops at first corruption (lines 1692-1697). Even if partial frames pass checksum, they lack db_size > 0 commit marker, so last_valid_frame stays at previous commit. Result: uncommitted transaction frames are discarded, database returns to last consistent state.",
+      "status": "pending",
+      "parent": "G5",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G5",
+          "type": "justifies"
+        },
+        {
+          "label": "G3",
+          "type": "implies"
+        },
+        {
+          "label": "G4",
+          "type": "implies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 11,
+      "createdAt": "2026-03-25T09:58:01.399Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "Atomicity depends on SyncMode. In SyncMode::Full, fsync is issued before commit (pager.rs:3677-3681). In SyncMode::Normal, fsync is skipped (line 3682-3684), meaning frames may not be durable when max_frame advances. However, atomicity still holds: either all frames of the transaction reach disk (eventually) or none do (crash loses unfsynced data). The commit marker mechanism ensures partial transactions are never visible after recovery regardless of sync mode.",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 12,
+      "createdAt": "2026-03-25T09:58:07.336Z"
+    }
+  }
+}

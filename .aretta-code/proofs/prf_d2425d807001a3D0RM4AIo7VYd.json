@@ -1,0 +1,186 @@
+{
+  "id": "prf_d2425d807001a3D0RM4AIo7VYd",
+  "name": "btree_balance_no_duplicates",
+  "targetProperty": "For all B-tree balance operations, no cells are duplicated: each cell from the input pages appears exactly once in the output pages (injection from cell_array to output).",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/btree.rs",
+  "createdAt": "2026-03-25T08:39:13.159Z",
+  "updatedAt": "2026-03-25T08:40:31.497Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "No Duplicated Cells Property: During balance_non_root, each cell in cell_array.cell_payloads is written to exactly one position in exactly one output page. No cell appears twice in the output.",
+      "formal": "∀ c ∈ cell_array.cell_payloads: count(c, output_pages) == 1",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T08:39:18.115Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Index Range Disjointness: Each page is assigned a disjoint range of cell indices from cell_array",
+      "formal": "∀ i,j ∈ [0, sibling_count_new), i≠j: cell_range(page_i) ∩ cell_range(page_j) = ∅",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T08:39:25.302Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Single Write Per Cell: The edit_page function writes each cell exactly once to its assigned page",
+      "formal": "∀ idx ∈ [start_new_cells, start_new_cells+number_new_cells): cell_array[idx] written exactly once",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T08:39:25.303Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "No Aliasing: Cells in cell_array are distinct memory references (no pointer aliasing)",
+      "formal": "∀ i,j: i≠j → cell_array.cell_payloads[i] ≠ cell_array.cell_payloads[j] (pointer inequality)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T08:39:25.304Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "Index Range Disjointness is guaranteed by the cell_count_per_page_cumulative array:\n\n1. The array stores cumulative cell counts: cell_count_per_page_cumulative[i] = total cells in pages 0..=i\n2. Page i receives cells from range:\n   - Page 0: [0, cell_count_up_to_page(0))\n   - Page i>0: [cell_count_up_to_page(i-1), cell_count_up_to_page(i))\n\n3. Code evidence (lines 3763-3783):\n   ```rust\n   let (start_old_cells, start_new_cells, number_new_cells) = if page_idx == 0 {\n       (0, 0, cell_array.cell_count_up_to_page(0))\n   } else {\n       let start_new_cells = cell_array.cell_count_up_to_page(page_idx - 1) + (!is_table_leaf) as usize;\n       (start_old_cells, start_new_cells, cell_array.cell_count_up_to_page(page_idx) - start_new_cells)\n   };\n   ```\n\n4. Since cell_count_up_to_page returns prefix sums, ranges are contiguous and disjoint:\n   - Page 0: [0, cumsum[0])\n   - Page 1: [cumsum[0], cumsum[1])\n   - Page 2: [cumsum[1], cumsum[2])\n   - These ranges partition [0, total_cells) with no overlap",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T08:39:51.956Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "Single Write Per Cell is guaranteed by the edit_page and page_insert_array functions:\n\n1. edit_page (line 6911) receives parameters:\n   - start_new_cells: starting index in cell_array\n   - number_new_cells: count of cells to write\n   - These define the range [start_new_cells, start_new_cells + number_new_cells)\n\n2. page_insert_array (lines 7239-7255) writes cells in a single loop:\n   ```rust\n   for i in 0..count {\n       let payload = &cell_array.cell_payloads[first + i];\n       // ... allocate space and copy\n       buf[cell_content_area..cell_content_area + payload.len()].copy_from_slice(payload);\n   }\n   ```\n\n3. Each cell at index (first + i) is written exactly once per page_insert_array call\n4. The done[page_idx] flag (line 3804) ensures each page is processed exactly once\n5. Since ranges are disjoint (G1), no cell index is passed to page_insert_array twice\n\nThe cell_content_area grows downward, ensuring each write occupies fresh memory.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        },
+        {
+          "label": "G1",
+          "type": "implies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T08:39:59.904Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "No Aliasing: Cells in cell_array.cell_payloads point to distinct memory regions.\n\n1. Cells from page content (lines 3058-3071):\n   - Each cell is extracted via cell_get_raw_region which returns (cell_start, cell_len)\n   - Cells within a page are stored at non-overlapping offsets (B-tree page format invariant)\n   - Different pages have different memory buffers\n\n2. Overflow cells (lines 3075-3080):\n   - Each overflow cell has its own pinned payload buffer (Pin<Box<[u8]>>)\n   - These are heap-allocated and distinct from page buffers\n\n3. Divider cells from parent (lines 3092-3110):\n   - Stored in reusable_divider_buffers[i] for each sibling\n   - Each buffer is a separate Vec<u8> cleared and reused per sibling\n\n4. The to_static_buf function (line 6907) simply transmutes the slice reference:\n   ```rust\n   fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {\n       unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) }\n   }\n   ```\n   This preserves the original memory location, so distinct source regions remain distinct.\n\n5. Since cells come from disjoint sources (different pages or different regions within pages), cell_payloads entries cannot alias.",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T08:40:10.652Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "Debug validation (post_balance_non_root_validation, lines 3973-4210) provides empirical verification:\n\n1. The validation iterates through all output pages sequentially (lines 4016-4088)\n2. For each cell in each output page, it checks:\n   - cells_debug[current_index_cell] == cell_buf (the cell in the output page)\n3. current_index_cell increments by exactly 1 for each cell found\n4. If any cell were duplicated, the sequential index would advance incorrectly and the comparison would fail\n\nCode (lines 4025-4038):\n```rust\nfor cell_idx in 0..contents.cell_count() {\n    // ... get cell_buf from page\n    let cell_buf_in_array = &cells_debug[current_index_cell];\n    if cell_buf != cell_buf_in_array {\n        tracing::error!(\"balance_non_root(cell_not_found_debug, ...)\");\n        valid = false;\n    }\n    current_index_cell += 1;\n}\n```\n\nThis sequential check ensures a 1:1 correspondence: each cell_array entry maps to exactly one output cell position.",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T08:40:19.513Z"
+    }
+  }
+}

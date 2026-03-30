@@ -1,0 +1,6 @@
+feature: pending
+specifications:
+  - annotation:
+      type: requires
+      tag: pending
+      text: "Spec will be populated by the plan agent."

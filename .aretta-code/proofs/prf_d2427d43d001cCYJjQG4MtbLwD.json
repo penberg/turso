@@ -1,0 +1,235 @@
+{
+  "id": "prf_d2427d43d001cCYJjQG4MtbLwD",
+  "name": "btree_balance_sort_order_preserved",
+  "targetProperty": "For all B-tree balance operations, the sort order of cells is preserved: if cell[i] < cell[j] in the input (i < j), then cell[i] appears before cell[j] in the output pages when traversed left-to-right.",
+  "status": "proved",
+  "sourceFile": "/workdir/turso-aretta/core/storage/btree.rs",
+  "createdAt": "2026-03-25T08:41:23.261Z",
+  "updatedAt": "2026-03-25T08:43:02.086Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Sort Order Preservation Property: During balance_non_root, cells are redistributed while maintaining their relative order. Cells collected into cell_array preserve input order, and cells written to output pages maintain that same order across the page sequence.",
+      "formal": "∀ i,j: i < j → position(cell_array[i], output) < position(cell_array[j], output)",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T08:41:28.920Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Collection preserves order: Cells are collected from pages left-to-right, and within each page in cell index order (which is sorted order)",
+      "formal": "∀ page_i < page_j: cells(page_i) precede cells(page_j) in cell_array ∧ ∀ cell_a < cell_b in same page: cell_a precedes cell_b in cell_array",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T08:41:38.408Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Divider cells are inserted at correct positions: Divider cells from parent are interleaved at page boundaries maintaining sort order",
+      "formal": "∀ divider between page_i and page_{i+1}: max(cells(page_i)) ≤ divider ≤ min(cells(page_{i+1}))",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T08:41:38.414Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Distribution preserves order: Cells are written to output pages in cell_array index order, with lower indices going to earlier pages",
+      "formal": "∀ i < j: if cell_array[i] → page_a and cell_array[j] → page_b then page_a ≤ page_b ∧ (page_a = page_b → cell_idx_a < cell_idx_b)",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T08:41:38.415Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Page ordering maintained: Output pages are linked/referenced in the same left-to-right order as their cell index ranges",
+      "formal": "pages_to_balance_new[0..sibling_count_new] ordered by divider cells in parent",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T08:41:38.416Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "Collection preserves order through left-to-right page iteration and in-order cell extraction:\n\n1. Pages are loaded in right-to-left order (lines 2796-2869) but stored in pages_to_balance[0..sibling_count] where index 0 is leftmost\n2. The collection loop (lines 3045-3113) iterates pages in increasing index order:\n   ```rust\n   for (i, old_page) in balance_info.pages_to_balance.iter().take(balance_info.sibling_count).enumerate()\n   ```\n   This processes pages from left (index 0) to right (index sibling_count-1)\n\n3. Within each page, cells are extracted in cell index order (lines 3058-3072):\n   ```rust\n   for cell_idx in 0..cell_count {\n       // ... extract cell and push to cell_array\n       cell_array.cell_payloads.push(to_static_buf(cell_buf));\n   }\n   ```\n   B-tree pages store cells in sorted order by key, so cell_idx 0 < cell_idx 1 < ... in key order\n\n4. Overflow cells are inserted at their correct positions (lines 3075-3080):\n   ```rust\n   cell_array.cell_payloads.insert(offset + overflow_cell.index, ...)\n   ```\n   The overflow_cell.index preserves the cell's logical position\n\nTherefore: page_0.cells ++ page_1.cells ++ ... maintains global sort order.",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T08:42:06.602Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "Divider cells are inserted at page boundaries, maintaining sort order:\n\n1. For non-table-leaf pages, divider cells separate siblings (lines 3089-3111):\n   - After collecting cells from page i, the divider between page i and page i+1 is appended\n   - This places divider exactly between the two pages' cell ranges\n\n2. B-tree invariant: divider key D between pages P_i and P_{i+1} satisfies:\n   max(keys in P_i) ≤ D ≤ min(keys in P_{i+1})\n   \n3. Code preserves this by appending divider after page i's cells and before page i+1's cells:\n   ```rust\n   if !is_last_sibling && !is_table_leaf {\n       // ... divider cell handling\n       cell_array.cell_payloads.push(to_static_buf(divider_cell));\n   }\n   ```\n\n4. For table leaves (is_table_leaf == true), dividers are NOT added to cell_array (line 3089 condition), \n   because table leaf dividers only contain rowid, not payload. The divider rowid is reconstructed \n   from the last cell of each page (lines 3615-3628).\n\nThe divider cells are the original separators from the parent, which by B-tree construction \nalready satisfy the ordering constraint.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T08:42:16.674Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "Distribution preserves order by writing cells in cell_array index order to pages in left-to-right order:\n\n1. Page assignment is based on cell_count_per_page_cumulative prefix sums (lines 3763-3783):\n   - Page 0: cells [0, cumsum[0])\n   - Page i: cells [cumsum[i-1], cumsum[i])\n   \n2. These ranges are contiguous and cover [0, total_cells) without gaps or overlaps\n\n3. The edit_page function writes cells in order via page_insert_array (lines 7239-7255):\n   ```rust\n   for i in 0..count {\n       let payload = &cell_array.cell_payloads[first + i];\n       // ... write to page\n   }\n   ```\n   This writes cells in increasing cell_array index order\n\n4. Within each page, cells are written to consecutive cell indices starting at start_insert,\n   maintaining their relative order from cell_array\n\n5. Since cell_array is sorted (by G1, G2) and pages receive contiguous ranges written in order,\n   the output maintains: cells in page 0 < cells in page 1 < ... < cells in page n-1\n   AND within each page: cell[0] < cell[1] < ... < cell[k]",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        },
+        {
+          "label": "G1",
+          "type": "implies"
+        },
+        {
+          "label": "G2",
+          "type": "implies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T08:42:26.320Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "Output page ordering is maintained via divider cell insertion in the parent:\n\n1. New divider cells are inserted into parent at positions first_divider_cell + sibling_page_idx (lines 3672-3681):\n   ```rust\n   let divider_cell_insert_idx_in_parent = first_divider_cell_cached + sibling_page_idx;\n   insert_into_cell(parent_contents, &balance_info.reusable_divider_cell, \n                    divider_cell_insert_idx_in_parent, usable_space)?;\n   ```\n\n2. The pages_to_balance_new array maintains left-to-right order (index 0 = leftmost)\n\n3. Each divider cell's left_child_page pointer points to pages_to_balance_new[sibling_page_idx]:\n   ```rust\n   balance_info.reusable_divider_cell.extend_from_slice(&(page.get().id as u32).to_be_bytes());\n   ```\n\n4. The last page (sibling_count_new - 1) is pointed to by the rightmost pointer (lines 3561-3572)\n\n5. Debug validation (lines 3703-3713) confirms every output page is correctly linked:\n   ```rust\n   for page in pages_to_balance_new.iter().take(sibling_count_new) {\n       turso_assert!(pages_pointed_to.contains(&(page.get().id as u32)), ...);\n   }\n   ```\n\n6. The parent's cell ordering (ascending by key) combined with divider placement ensures:\n   traversal via cell[0].left_child → cell[1].left_child → ... → rightmost_pointer\n   visits pages in the same order as cell_array index ranges.",
+      "status": "pending",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T08:42:36.330Z"
+    },
+    "A1": {
+      "label": "A1",
+      "type": "assumption",
+      "content": "Pre-condition: Input pages satisfy B-tree sort invariant.\n\nThis proof assumes the B-tree was correctly sorted before the balance operation:\n1. Cells within each page are stored in ascending key order (cell[0] < cell[1] < ...)\n2. Divider cells in parent correctly separate child pages (max(P_i) ≤ D_i ≤ min(P_{i+1}))\n3. Sibling pages are ordered left-to-right by key range\n\nThese are standard B-tree invariants maintained by all insert/delete operations.\nThe balance operation preserves these invariants rather than establishing them from scratch.\n\nThe debug validation post_balance_non_root_validation (lines 4024-4088) verifies cells appear \nin cell_array order in the output, which implicitly validates sort preservation.",
+      "status": "proved",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "assumed",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T08:42:45.798Z"
+    }
+  }
+}

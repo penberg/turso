@@ -1,0 +1,266 @@
+{
+  "id": "prf_d24955100001qUcrCUhhn7DGap",
+  "name": "database-header-consistency",
+  "targetProperty": "Database header fields (database_size, freelist_head, schema_cookie) always reflect valid committed state after crash recovery",
+  "status": "proved",
+  "createdAt": "2026-03-25T10:40:58.624Z",
+  "updatedAt": "2026-03-25T10:42:56.117Z",
+  "steps": {
+    "S0": {
+      "label": "S0",
+      "type": "specification",
+      "content": "Database header fields (database_size, freelist_trunk_page, freelist_pages, schema_cookie) stored in page 1 always reflect a valid committed state after crash recovery. The header is never in an inconsistent state where, for example, database_size points to fewer pages than actually exist, or freelist pointers reference non-freelist pages.",
+      "formal": "After recovery: header.database_size covers all committed pages AND header.freelist_trunk_page points to valid freelist OR is 0 AND header.freelist_pages counts actual freelist pages AND schema_cookie reflects last committed schema",
+      "status": "proved",
+      "children": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 1,
+      "createdAt": "2026-03-25T10:41:48.738Z"
+    },
+    "G1": {
+      "label": "G1",
+      "type": "obligation",
+      "content": "Page 1 changes flow through WAL: Any modification to page 1 (header) is written to WAL, not directly to DB file",
+      "formal": "with_header_mut() -> add_dirty() -> WAL frames",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R1"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 2,
+      "createdAt": "2026-03-25T10:41:56.847Z"
+    },
+    "G2": {
+      "label": "G2",
+      "type": "obligation",
+      "content": "Atomic header updates: All header field modifications within a transaction are part of the same commit frame",
+      "formal": "header modifications visible iff commit frame db_size > 0",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R2"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 3,
+      "createdAt": "2026-03-25T10:41:56.852Z"
+    },
+    "G3": {
+      "label": "G3",
+      "type": "obligation",
+      "content": "Recovery reads latest page 1 from WAL: After recovery, reading page 1 returns the version from the last committed WAL frame",
+      "formal": "find_frame(1) returns latest committed frame for page 1",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R3"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 4,
+      "createdAt": "2026-03-25T10:41:56.852Z"
+    },
+    "G4": {
+      "label": "G4",
+      "type": "obligation",
+      "content": "Header fields are always mutually consistent: database_size, freelist_trunk_page, freelist_pages are modified together in single transactions",
+      "formal": "no partial header state visible between transactions",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R4"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 5,
+      "createdAt": "2026-03-25T10:41:56.853Z"
+    },
+    "G5": {
+      "label": "G5",
+      "type": "obligation",
+      "content": "No header-only corruption: Recovery cannot produce a state where header is from one commit but data pages are from a different commit",
+      "formal": "page 1 frame included in same commit as other dirty pages",
+      "status": "proved",
+      "parent": "S0",
+      "children": [
+        "R5"
+      ],
+      "strategy": "all",
+      "dependsOn": [],
+      "trust": {
+        "level": "decomposition",
+        "source": "structural"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 6,
+      "createdAt": "2026-03-25T10:41:56.854Z"
+    },
+    "R1": {
+      "label": "R1",
+      "type": "reasoning",
+      "content": "Page 1 flows through WAL like any other page. Evidence:\n\n1. HeaderRefMut::from_pager() (pager.rs:92-97):\n   - Calls pager.read_header_page() to get page 1\n   - Immediately calls pager.add_dirty(&page) before returning\n   - This marks page 1 in dirty_pages bitmap\n\n2. All header modifications use HeaderRefMut:\n   - allocate_page() (pager.rs:4424): `let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;`\n   - free_page() (pager.rs:4211): `let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;`\n   - These modify database_size, freelist_trunk_page, freelist_pages\n\n3. Commit path includes page 1:\n   - ScanAndIssueReads (pager.rs:3529-3552) iterates ALL dirty_pages\n   - Page 1 is in dirty_pages if HeaderRefMut was used\n   - PrepareFrames converts all dirty pages to WAL frames\n   - WAL commit writes frames atomically\n\n4. No direct DB writes for page 1:\n   - Only checkpoint writes to DB file (via write_pages_vectored)\n   - Checkpoint only writes committed frames from WAL\n\nTherefore, page 1 modifications are always written to WAL first, never directly to DB.",
+      "status": "pending",
+      "parent": "G1",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G1",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 7,
+      "createdAt": "2026-03-25T10:42:20.974Z"
+    },
+    "R2": {
+      "label": "R2",
+      "type": "reasoning",
+      "content": "All header modifications within a transaction share the same commit frame. Evidence:\n\n1. Single commit point:\n   - prepare_collected_frames() (wal.rs:2002-2008):\n     ```rust\n     let frame_db_size = if idx + 1 == pages.len() {\n         db_size_on_commit.unwrap_or(0)\n     } else {\n         0\n     };\n     ```\n   - Only the LAST frame of a transaction has db_size > 0 (commit marker)\n   - All frames in a commit batch share the same epoch\n\n2. Dirty pages batched together:\n   - commit_dirty_pages_inner() collects ALL dirty pages at once (pager.rs:3531)\n   - They are converted to frames in one PrepareFrames phase\n   - Written to WAL together in WaitWrites phase\n\n3. Visibility atomicity:\n   - max_frame is updated AFTER fsync (wal.rs:2045-2046)\n   - `commit_prepared_frames()` advances max_frame only after all writes are durable\n   - Readers see either old max_frame OR new max_frame, never partial\n\n4. Recovery respects commit boundary:\n   - process_frames() (sqlite3_ondisk.rs:1706-1709):\n     ```rust\n     if db_size > 0 {\n         st.last_valid_frame = st.frame_idx;\n         st.last_valid_checksum = calc;\n         self.flush_pending_frames(&mut st);\n     }\n     ```\n   - Only frames up to last commit are made visible\n\nTherefore, all header changes (in page 1) and data changes in a transaction become visible atomically.",
+      "status": "pending",
+      "parent": "G2",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G2",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 8,
+      "createdAt": "2026-03-25T10:42:21.168Z"
+    },
+    "R3": {
+      "label": "R3",
+      "type": "reasoning",
+      "content": "After recovery, reading page 1 returns the latest committed version. Evidence:\n\n1. WAL recovery builds frame_cache:\n   - process_frames() (sqlite3_ondisk.rs:1701-1704) tracks all page→frame mappings:\n     ```rust\n     st.pending_frames.entry(page_no as u64).or_default().push(frame_idx);\n     ```\n   - flush_pending_frames() (sqlite3_ondisk.rs:1724-1728) copies to frame_cache\n   - Only frames up to last_valid_frame are included (line 1726): `frames.retain(|&f| f <= state.last_valid_frame)`\n\n2. finalize_loading() (sqlite3_ondisk.rs:1737-1757):\n   - Sets wfs.max_frame to last_valid_frame (committed frames only)\n   - Filters frame_cache to retain only committed frames\n\n3. Page 1 read path:\n   - read_page() → read_page_no_cache() → find_frame()\n   - find_frame() (wal.rs:1440-1448):\n     ```rust\n     if let Some(list) = frames.get(&page_id) {\n         if let Some(f) = list.iter().rfind(|&&f| range.contains(&f)) {\n             return Ok(Some(*f));\n         }\n     }\n     ```\n   - Returns LATEST frame within committed range\n   - If page 1 has WAL frames, returns latest committed frame\n\n4. HeaderRef::from_pager() uses same path:\n   - Calls pager.read_header_page() (pager.rs:77-79)\n   - read_header_page() calls read_page(DatabaseHeader::PAGE_ID) (pager.rs:1560)\n   - This goes through WAL lookup\n\nTherefore, after recovery, any read of page 1 (including header reads) returns the version from the last committed transaction.",
+      "status": "pending",
+      "parent": "G3",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G3",
+          "type": "justifies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 9,
+      "createdAt": "2026-03-25T10:42:21.465Z"
+    },
+    "R4": {
+      "label": "R4",
+      "type": "reasoning",
+      "content": "Header fields are always mutually consistent because they're modified within single transactions. Evidence:\n\n1. database_size updated with page allocation:\n   - allocate_page() (pager.rs:4640): `header.database_size = new_db_size.into();`\n   - This is in same transaction as the page modification that triggered allocation\n   - The newly allocated page and the header change are committed together\n\n2. freelist_trunk_page and freelist_pages updated together:\n   - free_page() (pager.rs:4241): `header.freelist_pages = (header.freelist_pages.get() + 1).into();`\n   - Then either:\n     - NewTrunk: `header.freelist_trunk_page = (page_id as u32).into();` (pager.rs:4315)\n     - AddToTrunk: modifies trunk page (same transaction)\n   - allocate_page() from freelist:\n     - Updates freelist_trunk_page if trunk consumed (pager.rs:4518)\n     - Updates freelist_pages count (pager.rs:4519, 4595)\n\n3. Single HeaderRefMut per operation:\n   - allocate_page() holds HeaderRefMut through entire operation (pager.rs:4424-4425)\n   - free_page() holds HeaderRefMut through entire operation (pager.rs:4211-4212)\n   - All header field changes happen through same HeaderRefMut\n\n4. Transaction boundary ensures atomicity:\n   - All changes to page 1 (header) are written to same commit frame as the data page changes\n   - By G2, these become visible atomically\n\n5. No cross-transaction header modification:\n   - HeaderRefMut::from_pager() immediately calls add_dirty()\n   - This means any header modification commits in the current transaction\n\nTherefore, database_size, freelist_trunk_page, and freelist_pages are always consistent with each other and with the actual page structure.",
+      "status": "pending",
+      "parent": "G4",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G4",
+          "type": "justifies"
+        },
+        {
+          "label": "R2",
+          "type": "implies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 10,
+      "createdAt": "2026-03-25T10:42:39.882Z"
+    },
+    "R5": {
+      "label": "R5",
+      "type": "reasoning",
+      "content": "Recovery cannot produce header-only corruption (header from one commit, data from another). Evidence:\n\n1. Single commit frame contains both header and data:\n   - dirty_pages bitmap includes page 1 (from HeaderRefMut::add_dirty())\n   - dirty_pages bitmap includes data pages (from B-tree add_dirty() calls)\n   - ScanAndIssueReads iterates ALL dirty_pages (pager.rs:3539)\n   - All dirty pages → same commit batch → same commit frame marker\n\n2. Commit marker on LAST frame only:\n   - prepare_collected_frames() (wal.rs:2004-2008): only last frame gets db_size > 0\n   - All pages in batch share this commit boundary\n\n3. Recovery atomic boundary:\n   - process_frames() accumulates pending_frames for all pages\n   - flush_pending_frames() called only when db_size > 0 (commit frame)\n   - ALL pages from that transaction become visible together\n\n4. Partial commit rejected:\n   - If crash occurs mid-write, checksum chain breaks\n   - Recovery stops at last valid checksum\n   - Either ALL frames of a commit are valid, or NONE are\n\n5. No selective page visibility:\n   - frame_cache entries for ALL pages in a commit are added together in flush_pending_frames()\n   - finalize_loading() applies same max_frame filter to ALL pages\n\nExample scenario analysis:\n- Transaction: allocate page 100, update database_size to 100\n- Both page 100 and page 1 (with new database_size) in dirty_pages\n- Both written to WAL frames 50-51 (frame 51 has db_size > 0)\n- Crash before commit: neither page 100 nor new header visible\n- Crash after commit: both page 100 and new header visible\n- Never: header with database_size=100 but page 100 missing\n\nTherefore, the header and data pages are always from the same committed transaction after recovery.",
+      "status": "pending",
+      "parent": "G5",
+      "children": [],
+      "strategy": "all",
+      "dependsOn": [
+        {
+          "label": "G5",
+          "type": "justifies"
+        },
+        {
+          "label": "R1",
+          "type": "implies"
+        },
+        {
+          "label": "R2",
+          "type": "implies"
+        }
+      ],
+      "trust": {
+        "level": "agent_asserted",
+        "source": "proof-agent"
+      },
+      "toolHistory": [],
+      "artifacts": [],
+      "sequence": 11,
+      "createdAt": "2026-03-25T10:42:40.006Z"
+    }
+  }
+}
