@@ -216,10 +216,11 @@ pub fn prepare_select_plan(
                 None
             } else {
                 let mut key = Vec::with_capacity(select.order_by.len());
-                for o in &select.order_by {
+                for (i, o) in select.order_by.iter().enumerate() {
                     let col_idx = resolve_compound_order_by_expr(
                         &o.expr,
                         &all_plans,
+                        i + 1,
                     )?;
                     key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
                 }
@@ -1112,6 +1113,7 @@ fn replace_column_number_with_copy_of_column_expr(
 fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
     all_plans: &[&SelectPlan],
+    term_number: usize,
 ) -> Result<usize> {
     let num_result_columns = all_plans[0].result_columns.len();
     match expr {
@@ -1128,7 +1130,8 @@ fn resolve_compound_order_by_expr(
                 Ok(column_number - 1)
             } else {
                 crate::bail_parse_error!(
-                    "ORDER BY expression in compound SELECT must be a column number or name"
+                    "{} ORDER BY term does not match any column in the result set",
+                    ordinal(term_number)
                 );
             }
         }
@@ -1157,16 +1160,28 @@ fn resolve_compound_order_by_expr(
                 }
             }
             crate::bail_parse_error!(
-                "ORDER BY term \"{}\" does not match any result column",
-                name.as_str()
+                "{} ORDER BY term does not match any column in the result set",
+                ordinal(term_number)
             );
         }
         _ => {
             crate::bail_parse_error!(
-                "ORDER BY expression in compound SELECT must be a column number or name"
+                "{} ORDER BY term does not match any column in the result set",
+                ordinal(term_number)
             );
         }
     }
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{}{}", n, suffix)
 }
 
 /// Count required cursors for a Plan (either Select or CompoundSelect)

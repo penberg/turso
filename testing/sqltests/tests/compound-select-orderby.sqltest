@@ -887,3 +887,13 @@ expect {
     7
     8
 }
+
+# ===== Error: ORDER BY expression not matching any column =====
+
+@setup schema
+test union-order-by-expr-no-match {
+    SELECT a FROM t1 UNION SELECT c FROM t1 ORDER BY a+1;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}
