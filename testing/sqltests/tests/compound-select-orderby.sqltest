@@ -851,3 +851,39 @@ expect {
     3|cherry
     5|elderberry
 }
+
+# ===== ORDER BY referencing column name from non-leftmost SELECT =====
+
+@setup schema
+test union-order-by-non-leftmost-col-name {
+    SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY b;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    banana
+    date
+    fig
+    grape
+    honeydew
+}
+
+@setup schema
+test union-all-order-by-non-leftmost-col-name {
+    SELECT a FROM t1 UNION ALL SELECT a FROM t2 ORDER BY a;
+}
+expect {
+    1
+    2
+    2
+    3
+    4
+    4
+    5
+    6
+    7
+    8
+}
