@@ -1,0 +1,28 @@
+# SHOW TABLES [LIKE] conformance.
+#
+# Lists base table names; the front-end synthesizes the result from the schema.
+# MySQL's column header is `Tables_in_<db>`, which the front-end does not
+# reproduce, but the conformance runner compares row values (not headers), and
+# the table names and their order match. A LIKE pattern filters by name; FULL
+# adds a Table_type column. A unique name prefix keeps the result deterministic
+# despite the shared connection. Expected to pass on both targets.
+
+statement ok
+CREATE TABLE IF NOT EXISTS sttab_alpha (a INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS sttab_beta (a INT)
+
+# LIKE filters to the matching tables, ordered by name.
+query
+SHOW TABLES LIKE 'sttab%'
+----
+sttab_alpha
+sttab_beta
+
+# FULL adds a Table_type column (BASE TABLE for ordinary tables).
+query
+SHOW FULL TABLES LIKE 'sttab%'
+----
+sttab_alpha	BASE TABLE
+sttab_beta	BASE TABLE

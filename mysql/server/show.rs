@@ -38,13 +38,19 @@ pub enum ShowOutcome {
     NoSuchTable(String),
 }
 
-/// Tries to handle `sql` as `SHOW [FULL] {COLUMNS|FIELDS} {FROM|IN} tbl`.
+/// Tries to handle `sql` as `SHOW [FULL] {COLUMNS|FIELDS} {FROM|IN} tbl` or
+/// `SHOW [FULL] TABLES [LIKE 'pat']`.
 ///
-/// Returns `None` if `sql` is not that statement, so every other `SHOW` form
-/// falls through to the parser (which rejects it as unsupported).
+/// Returns `None` if `sql` is neither, so every other `SHOW` form falls through
+/// to the parser (which rejects it as unsupported).
 pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcome, LimboError>> {
-    let parsed = parse_show_columns(sql)?;
-    Some(build(conn, &parsed))
+    if let Some(parsed) = parse_show_columns(sql) {
+        return Some(build(conn, &parsed));
+    }
+    if let Some(parsed) = parse_show_tables(sql) {
+        return Some(build_tables(conn, &parsed).map(ShowOutcome::Columns));
+    }
+    None
 }
 
 /// The parsed form of a `SHOW [FULL] COLUMNS FROM tbl` statement.
@@ -107,6 +113,52 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
         .collect::<Vec<_>>();
 
     Ok(ShowOutcome::Columns(ColumnsResult { columns, rows }))
+}
+
+/// The parsed form of a `SHOW [FULL] TABLES [LIKE 'pat']` statement.
+struct ShowTables {
+    full: bool,
+    like: Option<String>,
+}
+
+/// Lists base table names from the schema, optionally filtered by a `LIKE`
+/// pattern, as a MySQL `SHOW [FULL] TABLES` result set.
+fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResult, LimboError> {
+    let mut query =
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            .to_string();
+    if let Some(pat) = &show.like {
+        query.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
+    }
+    query.push_str(" ORDER BY name");
+
+    let mut names: Vec<String> = Vec::new();
+    if let Some(mut stmt) = conn.query(&query)? {
+        stmt.run_with_row_callback(|row| {
+            names.push(value_to_string(row.get_value(0)).unwrap_or_default());
+            Ok(())
+        })?;
+    }
+
+    // MySQL's header is `Tables_in_<db>`; the front-end ignores schema selection,
+    // and clients read this column positionally, so a fixed header is used.
+    let columns = if show.full {
+        vec!["Tables_in_database", "Table_type"]
+    } else {
+        vec!["Tables_in_database"]
+    };
+    let rows = names
+        .into_iter()
+        .map(|name| {
+            if show.full {
+                vec![Some(name), Some("BASE TABLE".to_string())]
+            } else {
+                vec![Some(name)]
+            }
+        })
+        .collect();
+
+    Ok(ColumnsResult { columns, rows })
 }
 
 /// One column as read from `PRAGMA table_info`.
@@ -224,6 +276,57 @@ fn parse_show_columns(sql: &str) -> Option<ShowColumns> {
     Some(ShowColumns { full, table })
 }
 
+/// Parses `SHOW [FULL] TABLES [{FROM|IN} db] [LIKE 'pat']`. Returns `None` for
+/// any other statement, including `SHOW TABLES ... WHERE ...` (not handled).
+fn parse_show_tables(sql: &str) -> Option<ShowTables> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let mut k = 0;
+
+    let kw = |t: &str, kw: &str| t.eq_ignore_ascii_case(kw);
+
+    if !toks.get(k).is_some_and(|t| kw(t, "SHOW")) {
+        return None;
+    }
+    k += 1;
+    let full = toks.get(k).is_some_and(|t| kw(t, "FULL"));
+    if full {
+        k += 1;
+    }
+    if !toks.get(k).is_some_and(|t| kw(t, "TABLES")) {
+        return None;
+    }
+    k += 1;
+
+    // Optional `{FROM|IN} db` qualifier; consumed and ignored.
+    if toks.get(k).is_some_and(|t| kw(t, "FROM") || kw(t, "IN")) {
+        k += 1;
+        toks.get(k)?;
+        k += 1;
+    }
+
+    // Optional `LIKE 'pattern'`.
+    let like = if toks.get(k).is_some_and(|t| kw(t, "LIKE")) {
+        k += 1;
+        let pat = toks.get(k)?;
+        // The pattern is a quoted string token; strip its surrounding quotes.
+        let unquoted = pat
+            .strip_prefix('\'')
+            .and_then(|p| p.strip_suffix('\''))
+            .or_else(|| pat.strip_prefix('"').and_then(|p| p.strip_suffix('"')))?;
+        k += 1;
+        Some(unquoted.to_string())
+    } else {
+        None
+    };
+
+    // Any trailing tokens (e.g. WHERE) are not handled here.
+    if k != toks.len() {
+        return None;
+    }
+    Some(ShowTables { full, like })
+}
+
 /// Splits a statement into tokens, unquoting backtick identifiers and keeping
 /// `.` as its own token. Quoted strings are kept verbatim (quotes included).
 fn tokenize(s: &str) -> Vec<String> {
@@ -289,6 +392,24 @@ mod tests {
         let p = parse_show_columns("SHOW FULL COLUMNS FROM `wptests_options`").unwrap();
         assert!(p.full);
         assert_eq!(p.table, "wptests_options");
+    }
+
+    #[test]
+    fn parses_show_tables() {
+        let p = parse_show_tables("SHOW TABLES").unwrap();
+        assert!(!p.full);
+        assert_eq!(p.like, None);
+
+        let p = parse_show_tables("SHOW FULL TABLES LIKE 'wp_%'").unwrap();
+        assert!(p.full);
+        assert_eq!(p.like.as_deref(), Some("wp_%"));
+
+        // `FROM db` qualifier is accepted and ignored.
+        assert!(parse_show_tables("SHOW TABLES FROM mydb LIKE 'a%'").is_some());
+
+        // Not SHOW TABLES, or an unhandled WHERE form.
+        assert!(parse_show_tables("SHOW COLUMNS FROM t").is_none());
+        assert!(parse_show_tables("SHOW TABLES WHERE 1").is_none());
     }
 
     #[test]

@@ -493,7 +493,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | SHOW REPLICA / SLAVE STATUS| ❌     |         |
 | SHOW STATUS                | ❌     |         |
 | SHOW TABLE STATUS          | ❌     |         |
-| SHOW TABLES                | ❌     |         |
+| SHOW [FULL] TABLES [LIKE]  | ✅     | Base table names synthesized from the schema, optionally filtered by a `LIKE` pattern; `FULL` adds a `Table_type` column (`BASE TABLE`). The result column header is a fixed `Tables_in_database`, not MySQL's `Tables_in_<db>` (clients read it positionally). The `WHERE` filter form is rejected. |
 | SHOW TRIGGERS              | ❌     |         |
 | SHOW VARIABLES             | ❌     | Frequently probed by clients/ORMs; currently errors. |
 | SHOW WARNINGS              | ❌     |         |
