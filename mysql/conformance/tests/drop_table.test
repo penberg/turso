@@ -1,0 +1,21 @@
+# DROP TABLE conformance — the basic single-table form.
+#
+# Implemented by the Turso front-end, so this file is expected to pass against
+# both `turso-mysql-server` and a real mysqld. Only the plain
+# `DROP TABLE tbl_name` form is supported; IF EXISTS / TEMPORARY / multiple
+# tables / RESTRICT / CASCADE are not (see mysql/COMPAT.md).
+
+statement ok
+CREATE TABLE IF NOT EXISTS drop_me (id INT PRIMARY KEY, name VARCHAR(32))
+
+# Basic drop of an existing table succeeds.
+statement ok
+DROP TABLE drop_me
+
+# Dropping a table that no longer exists is an error (no IF EXISTS).
+statement error
+DROP TABLE drop_me
+
+# Unsupported sub-clauses are rejected by the front-end. On real MySQL these are
+# valid, so they are intentionally NOT exercised here to keep the file green on
+# both targets; their rejection is covered by the parser's unit tests.

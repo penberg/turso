@@ -57,15 +57,19 @@ impl Parser {
                 self.advance();
                 self.create()
             }
+            "DROP" => {
+                self.advance();
+                self.drop()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "DROP"
-            | "TRUNCATE" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN"
-            | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE"
-            | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE"
-            | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
-            | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(
-                format!("{keyword} is not supported yet (only CREATE TABLE is implemented)"),
-            )),
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "TRUNCATE"
+            | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "BEGIN"
+            | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL"
+            | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE"
+            | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH"
+            | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(format!(
+                "{keyword} is not supported yet"
+            ))),
             other => Err(ParseError::Unsupported(format!(
                 "unrecognized statement starting with `{other}`"
             ))),
@@ -433,6 +437,58 @@ impl Parser {
         Ok(columns)
     }
 
+    // === DROP TABLE ===
+
+    fn drop(&mut self) -> Result<ast::Stmt> {
+        // `DROP` has already been consumed.
+        if self.is_keyword("TEMPORARY") {
+            return Err(ParseError::Unsupported(
+                "DROP TEMPORARY TABLE is not supported yet".to_string(),
+            ));
+        }
+        if self.eat_keyword("TABLE") {
+            self.drop_table()
+        } else {
+            let what = match self.peek() {
+                Some(Token::Word(w)) => w.to_ascii_uppercase(),
+                _ => "?".to_string(),
+            };
+            Err(ParseError::Unsupported(format!(
+                "DROP {what} is not supported yet (only DROP TABLE is implemented)"
+            )))
+        }
+    }
+
+    /// Parses the basic `DROP TABLE tbl_name` form. The `IF EXISTS`,
+    /// `TEMPORARY`, multi-table, and `RESTRICT`/`CASCADE` variants are
+    /// explicitly rejected as unsupported.
+    fn drop_table(&mut self) -> Result<ast::Stmt> {
+        // `DROP TABLE` has already been consumed.
+        if self.is_keyword("IF") {
+            return Err(ParseError::Unsupported(
+                "DROP TABLE IF EXISTS is not supported yet".to_string(),
+            ));
+        }
+
+        let tbl_name = self.qualified_name()?;
+
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "DROP TABLE with multiple tables is not supported yet".to_string(),
+            ));
+        }
+        if self.is_keyword("RESTRICT") || self.is_keyword("CASCADE") {
+            return Err(ParseError::Unsupported(
+                "DROP TABLE RESTRICT / CASCADE is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Stmt::DropTable {
+            if_exists: false,
+            tbl_name,
+        })
+    }
+
     // === Identifiers and shared parse helpers ===
 
     fn qualified_name(&mut self) -> Result<ast::QualifiedName> {
@@ -713,6 +769,55 @@ mod tests {
     fn ignores_engine_and_charset_options() {
         let stmt = parse("CREATE TABLE t (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4").unwrap();
         assert!(matches!(stmt, ast::Stmt::CreateTable { .. }));
+    }
+
+    #[test]
+    fn drop_table_basic() {
+        let stmt = parse("DROP TABLE users").unwrap();
+        let ast::Stmt::DropTable {
+            if_exists,
+            tbl_name,
+        } = stmt
+        else {
+            panic!("expected DropTable");
+        };
+        assert!(!if_exists);
+        assert_eq!(tbl_name.name.as_str(), "users");
+    }
+
+    #[test]
+    fn drop_table_qualified_and_quoted() {
+        let stmt = parse("DROP TABLE `mydb`.`t`").unwrap();
+        let ast::Stmt::DropTable { tbl_name, .. } = stmt else {
+            panic!("expected DropTable");
+        };
+        assert_eq!(tbl_name.db_name.as_ref().unwrap().as_str(), "mydb");
+        assert_eq!(tbl_name.name.as_str(), "t");
+    }
+
+    #[test]
+    fn drop_table_renders_back_to_sql() {
+        let sql = parse("DROP TABLE t").unwrap().to_string();
+        assert!(sql.to_uppercase().contains("DROP TABLE"), "{sql}");
+        assert!(sql.contains('t'), "{sql}");
+    }
+
+    #[test]
+    fn drop_table_unsupported_variants() {
+        for sql in [
+            "DROP TABLE IF EXISTS t",
+            "DROP TEMPORARY TABLE t",
+            "DROP TABLE a, b",
+            "DROP TABLE t RESTRICT",
+            "DROP TABLE t CASCADE",
+            "DROP DATABASE d",
+            "DROP INDEX i ON t",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
     }
 
     #[test]

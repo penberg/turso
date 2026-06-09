@@ -5,20 +5,20 @@ This document tracks the current state of MySQL compatibility — both the wire
 [MySQL 8.0 SQL Statements reference](https://dev.mysql.com/doc/refman/8.0/en/sql-statements.html).
 
 > [!WARNING]
-> **Nothing here is implemented.** The MySQL front-end is an early proof of
-> concept. Every entry is marked ❌ on purpose: no feature is complete or
-> validated against MySQL's behavior, error codes, type system, and edge
-> cases. Where a code path already exists in the proof of concept, the comment
-> says so — but it still counts as not done until it is verified. The 🚧 and ✅
-> markers are intentionally not used anywhere yet; no feature has earned them.
+> **The MySQL front-end is an early proof of concept.** Almost everything here
+> is unimplemented (❌). A very small number of narrowly-scoped forms are
+> implemented and validated against real MySQL by the conformance suite (✅), and
+> a few are partially present (🚧). Treat anything not marked ✅ as not usable.
+> A ✅ applies only to the exact scoped form on that row, not to the full MySQL
+> statement and all its options.
 
 ## Legend
 
 | Marker | Meaning                                                                       |
 |--------|-------------------------------------------------------------------------------|
 | ❌     | **No** — not implemented (the state of everything today).                      |
-| 🚧     | Partial — implemented but incomplete or unverified. *(Not used yet.)*          |
-| ✅     | Yes — complete and validated against MySQL. *(Not used yet.)*                  |
+| 🚧     | Partial — implemented but incomplete or unverified.                            |
+| ✅     | Yes — complete and validated against MySQL.                                    |
 
 ## Table of contents
 
@@ -234,7 +234,11 @@ incomplete.
 | DROP PROCEDURE / DROP FUNCTION         | ❌     |         |
 | DROP SERVER                            | ❌     |         |
 | DROP SPATIAL REFERENCE SYSTEM          | ❌     |         |
-| DROP TABLE                             | ❌     |         |
+| DROP TABLE *tbl_name* (single table)   | ✅     |         |
+| DROP TABLE ... IF EXISTS               | ❌     | **Not supported** — rejected as unsupported. |
+| DROP TEMPORARY TABLE                   | ❌     | **Not supported** — rejected as unsupported. |
+| DROP TABLE *t1, t2, ...* (multiple)    | ❌     | **Not supported** — only a single table per statement. |
+| DROP TABLE ... RESTRICT / CASCADE      | ❌     | **Not supported** — rejected as unsupported (no-ops in MySQL). |
 | DROP TABLESPACE                        | ❌     |         |
 | DROP TRIGGER                           | ❌     |         |
 | DROP VIEW                              | ❌     |         |

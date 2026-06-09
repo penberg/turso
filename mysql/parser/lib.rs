@@ -16,8 +16,12 @@
 //! let stmt = parse("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(80))").unwrap();
 //! assert!(matches!(stmt, ast::Stmt::CreateTable { .. }));
 //!
-//! // Unsupported statements are reported, not silently forwarded.
+//! let stmt = parse("DROP TABLE t").unwrap();
+//! assert!(matches!(stmt, ast::Stmt::DropTable { .. }));
+//!
+//! // Unsupported statements (and sub-clauses) are reported, not forwarded.
 //! assert!(parse("SELECT 1").is_err());
+//! assert!(parse("DROP TABLE IF EXISTS t").is_err());
 //! ```
 
 pub mod error;
