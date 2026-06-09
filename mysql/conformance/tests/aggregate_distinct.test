@@ -1,0 +1,37 @@
+# Aggregate DISTINCT: COUNT/SUM/MIN/MAX(DISTINCT expr). MySQL and the engine
+# compute these identically, so they pass straight through. This rounds out the
+# aggregate set (which already covers the non-DISTINCT forms).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Integer
+# columns keep SUM's text output identical; every query is ORDER BY-deterministic.
+
+statement ok
+CREATE TABLE IF NOT EXISTS aggd (g INT, v INT)
+
+statement ok
+INSERT INTO aggd (g, v) VALUES (1, 10), (1, 10), (1, 20), (2, 5), (2, 5)
+
+# COUNT(DISTINCT) and SUM(DISTINCT) per group.
+query
+SELECT g, COUNT(DISTINCT v), SUM(DISTINCT v) FROM aggd GROUP BY g ORDER BY g
+----
+1	2	30
+2	1	5
+
+# COUNT(DISTINCT) over the whole table: distinct values are 10, 20, 5.
+query
+SELECT COUNT(DISTINCT v) FROM aggd
+----
+3
+
+# MIN/MAX accept DISTINCT (same result as without).
+query
+SELECT MIN(DISTINCT v), MAX(DISTINCT v) FROM aggd
+----
+5	20
+
+# A plain COUNT(*) still works alongside the DISTINCT forms.
+query
+SELECT COUNT(*), COUNT(DISTINCT g) FROM aggd
+----
+5	2

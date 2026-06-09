@@ -332,6 +332,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `TRIM`                                 | ✅     | `TRIM(str)` (leading/trailing spaces); the `TRIM(... FROM ...)` form is not parsed. |
 | `COUNT(*)` / `COUNT(expr)`             | ✅     | aggregate |
 | `SUM` / `MIN` / `MAX`                  | ✅     | aggregate |
+| `COUNT/SUM/MIN/MAX(DISTINCT expr)`     | ✅     | The `DISTINCT` quantifier on an aggregate; `ALL` is the default and ignored. `DISTINCT` on a scalar function or with `*` is rejected. |
 | `AVG`                                  | ❌     | **Excluded** — MySQL returns DECIMAL padded to 4 places; SQLite returns a plain float (text differs). |
 | `GROUP_CONCAT`                         | ❌     | **Excluded** — separator / `ORDER BY` syntax differs. |
 | `CONCAT`                               | ❌     | **Excluded** — MySQL returns NULL if any arg is NULL; SQLite ignores NULLs. |

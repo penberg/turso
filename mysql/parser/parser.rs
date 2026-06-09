@@ -1483,9 +1483,21 @@ impl Parser {
             )));
         }
 
-        // `COUNT(*)` is the only star form.
+        // `DISTINCT` / `ALL` quantifiers are only valid for aggregates and behave
+        // identically on both engines (`ALL` is the default and ignored).
+        let distinct = self.eat_keyword("DISTINCT");
+        if !distinct {
+            self.eat_keyword("ALL");
+        }
+        if distinct && !is_aggregate_function(&upper) {
+            return Err(ParseError::Unsupported(format!(
+                "DISTINCT is not valid in {upper}()"
+            )));
+        }
+
+        // `COUNT(*)` is the only star form (and `COUNT(DISTINCT *)` is invalid).
         if self.is(&Token::Star) {
-            if upper != "COUNT" {
+            if upper != "COUNT" || distinct {
                 return Err(ParseError::Unsupported(format!(
                     "{upper}(*) is not supported"
                 )));
@@ -1515,7 +1527,7 @@ impl Parser {
 
         Ok(ast::Expr::FunctionCall {
             name,
-            distinctness: None,
+            distinctness: distinct.then_some(ast::Distinctness::Distinct),
             args,
             order_by: Vec::new(),
             within_group: Vec::new(),
@@ -1781,6 +1793,12 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
+}
+
+/// The aggregate functions, which (unlike the scalar ones) accept a `DISTINCT`
+/// quantifier. `upper_name` must already be uppercased.
+fn is_aggregate_function(upper_name: &str) -> bool {
+    matches!(upper_name, "COUNT" | "SUM" | "MIN" | "MAX")
 }
 
 /// Keywords that begin a table-level constraint or index definition.
@@ -2513,6 +2531,50 @@ mod tests {
                 "expected `{input}` to parse as a function call"
             );
         }
+    }
+
+    #[test]
+    fn aggregate_distinct() {
+        let expr = parse_expr("COUNT(DISTINCT v)").unwrap();
+        let ast::Expr::FunctionCall {
+            distinctness, args, ..
+        } = expr
+        else {
+            panic!("expected FunctionCall");
+        };
+        assert!(matches!(distinctness, Some(ast::Distinctness::Distinct)));
+        assert_eq!(args.len(), 1);
+
+        // SUM/MIN/MAX also accept DISTINCT; ALL is the default and elided.
+        for input in ["SUM(DISTINCT v)", "MIN(DISTINCT v)", "MAX(DISTINCT v)"] {
+            assert!(matches!(
+                parse_expr(input).unwrap(),
+                ast::Expr::FunctionCall {
+                    distinctness: Some(ast::Distinctness::Distinct),
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            parse_expr("COUNT(ALL v)").unwrap(),
+            ast::Expr::FunctionCall {
+                distinctness: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn distinct_rejected_for_scalar_and_count_star() {
+        // DISTINCT is only valid in an aggregate, and not with `*`.
+        assert!(matches!(
+            parse_expr("ABS(DISTINCT v)").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse_expr("COUNT(DISTINCT *)").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]
