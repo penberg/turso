@@ -1,0 +1,36 @@
+# Backslash escapes in string literals follow MySQL's default rules
+# (NO_BACKSLASH_ESCAPES off): \%  and \_ keep the backslash (so WordPress's
+# esc_like() round-trips for LIKE), \b and \Z are control characters, the usual
+# C escapes apply, and an unknown \x drops the backslash.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# \% and \_ keep the backslash — two characters each.
+query
+SELECT CHAR_LENGTH('\%'), CHAR_LENGTH('\_')
+----
+2	2
+
+# ...and round-trip with the backslash intact.
+query
+SELECT '100\% off the \_total\_'
+----
+100\% off the \_total\_
+
+# \b and \Z are control characters (backspace, ctrl-Z), not the letters b/Z.
+query
+SELECT '\b' = 'b', '\Z' = 'Z'
+----
+0	0
+
+# The standard C escapes still apply (\t is a tab, so the value is 3 chars).
+query
+SELECT CHAR_LENGTH('a\tb')
+----
+3
+
+# An unknown escape drops the backslash.
+query
+SELECT 'a\xb'
+----
+axb

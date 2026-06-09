@@ -226,14 +226,22 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'\\') => {
                     self.pos += 1;
+                    // MySQL's default backslash escapes (NO_BACKSLASH_ESCAPES off).
                     match self.peek() {
-                        Some(b'n') => value.push(b'\n'),
-                        Some(b't') => value.push(b'\t'),
-                        Some(b'r') => value.push(b'\r'),
                         Some(b'0') => value.push(0),
+                        Some(b'b') => value.push(0x08), // backspace
+                        Some(b'n') => value.push(b'\n'),
+                        Some(b'r') => value.push(b'\r'),
+                        Some(b't') => value.push(b'\t'),
+                        Some(b'Z') => value.push(0x1A), // ctrl-Z
                         Some(b'\\') => value.push(b'\\'),
                         Some(b'\'') => value.push(b'\''),
                         Some(b'"') => value.push(b'"'),
+                        // `\%` and `\_` keep the backslash: MySQL preserves them
+                        // so they survive into a LIKE pattern as escaped wildcards.
+                        Some(b'%') => value.extend_from_slice(b"\\%"),
+                        Some(b'_') => value.extend_from_slice(b"\\_"),
+                        // Any other escaped character is itself (backslash dropped).
                         Some(other) => value.push(other),
                         None => {
                             return Err(ParseError::Unterminated {
@@ -295,5 +303,17 @@ mod tests {
         // Escapes and doubled quotes still work.
         assert_eq!(first_string(r"SELECT 'a\tb'"), "a\tb");
         assert_eq!(first_string("SELECT 'it''s'"), "it's");
+    }
+
+    #[test]
+    fn mysql_backslash_escapes() {
+        // `\%` and `\_` keep the backslash; other C escapes apply.
+        assert_eq!(first_string(r"SELECT '\%'"), r"\%");
+        assert_eq!(first_string(r"SELECT '\_'"), r"\_");
+        assert_eq!(first_string(r"SELECT '\b'"), "\u{0008}"); // backspace
+        assert_eq!(first_string(r"SELECT '\Z'"), "\u{001A}"); // ctrl-Z
+        assert_eq!(first_string(r"SELECT '\0'"), "\0");
+        // An unknown escape drops the backslash.
+        assert_eq!(first_string(r"SELECT 'a\xb'"), "axb");
     }
 }
