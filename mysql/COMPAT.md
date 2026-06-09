@@ -343,6 +343,9 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `LENGTH`                               | ❌     | **Excluded** — MySQL counts bytes; SQLite counts characters. |
 | `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |
 | `IF`                                   | ✅     | Renamed on emit to the engine's `IIF`; semantics are identical (a NULL/zero condition is false). |
+| `SUBSTRING` / `MID`                    | ✅     | Renamed on emit to `substr` (same behaviour). |
+| `LCASE` / `UCASE`                      | ✅     | Renamed on emit to `lower` / `upper`. |
+| `CHAR_LENGTH` / `CHARACTER_LENGTH`     | ✅     | Renamed on emit to `length` (a character count). Distinct from `LENGTH`, which counts bytes and stays excluded. |
 | `NOW`, `CURDATE`, date/time functions  | ❌     | **Excluded** — types and formats differ. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 

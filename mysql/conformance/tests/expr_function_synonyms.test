@@ -1,0 +1,37 @@
+# MySQL function synonyms that differ from the engine only in name, mapped on
+# emit: SUBSTRING / MID -> substr, LCASE -> lower, UCASE -> upper,
+# CHAR_LENGTH / CHARACTER_LENGTH -> length (a character count, like the engine's
+# length()). MySQL's LENGTH counts bytes and stays excluded.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+query
+SELECT SUBSTRING('hello world', 7)
+----
+world
+
+query
+SELECT SUBSTRING('hello world', 1, 5)
+----
+hello
+
+# MID is a SUBSTRING synonym.
+query
+SELECT MID('abcdef', 2, 3)
+----
+bcd
+
+# LCASE / UCASE are LOWER / UPPER.
+query
+SELECT LCASE('MixedCase'), UCASE('MixedCase')
+----
+mixedcase	MIXEDCASE
+
+# CHAR_LENGTH / CHARACTER_LENGTH map to the engine's length(), a character
+# count. (Multi-byte text is not exercised: like the other string functions, the
+# front-end currently operates on the wire bytes, so a character vs byte count
+# only coincides for ASCII — hence ASCII-only here.)
+query
+SELECT CHAR_LENGTH('hello'), CHARACTER_LENGTH('hello')
+----
+5	5

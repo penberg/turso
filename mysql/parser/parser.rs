@@ -1648,11 +1648,10 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
 
-        // MySQL `IF` is the engine's `IIF`; they differ only in name.
-        let name = if upper == "IF" {
-            ast::Name::from_string("iif")
-        } else {
-            name
+        // Some MySQL functions differ from the engine only in name; rename them.
+        let name = match engine_function_name(&upper) {
+            Some(engine) => ast::Name::from_string(engine),
+            None => name,
         };
 
         Ok(ast::Expr::FunctionCall {
@@ -1941,8 +1940,10 @@ fn is_supported_function(upper_name: &str) -> bool {
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
         | "REPLACE" | "SUBSTR" | "INSTR" | "TRIM"
-        // `IF` shares behaviour with the engine's `IIF` (it is renamed on emit).
+        // Functions sharing behaviour with the engine under a different name;
+        // renamed on emit (see `engine_function_name`).
         | "IF"
+        | "SUBSTRING" | "MID" | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -1952,6 +1953,21 @@ fn is_supported_function(upper_name: &str) -> bool {
 /// quantifier. `upper_name` must already be uppercased.
 fn is_aggregate_function(upper_name: &str) -> bool {
     matches!(upper_name, "COUNT" | "SUM" | "MIN" | "MAX")
+}
+
+/// The engine's name for a MySQL function that shares its behaviour but not its
+/// spelling, or `None` to keep the name as written. `CHAR_LENGTH` maps to
+/// `length` because the engine's `length()` counts characters (MySQL's `LENGTH`,
+/// which counts bytes, is excluded). `upper_name` must already be uppercased.
+fn engine_function_name(upper_name: &str) -> Option<&'static str> {
+    Some(match upper_name {
+        "IF" => "iif",
+        "SUBSTRING" | "MID" => "substr",
+        "LCASE" => "lower",
+        "UCASE" => "upper",
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
+        _ => return None,
+    })
 }
 
 /// Keywords that begin a table-level constraint or index definition.
@@ -2960,6 +2976,23 @@ mod tests {
         };
         assert_eq!(name.as_str().to_ascii_lowercase(), "iif");
         assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn function_synonyms_are_renamed() {
+        for (input, engine) in [
+            ("SUBSTRING('s', 1, 2)", "substr"),
+            ("MID('s', 1, 2)", "substr"),
+            ("LCASE('S')", "lower"),
+            ("UCASE('s')", "upper"),
+            ("CHAR_LENGTH('s')", "length"),
+            ("CHARACTER_LENGTH('s')", "length"),
+        ] {
+            let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
+                panic!("expected `{input}` to parse as a function call");
+            };
+            assert_eq!(name.as_str().to_ascii_lowercase(), engine, "{input}");
+        }
     }
 
     #[test]
