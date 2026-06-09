@@ -28,9 +28,7 @@ SELECT LCASE('MixedCase'), UCASE('MixedCase')
 mixedcase	MIXEDCASE
 
 # CHAR_LENGTH / CHARACTER_LENGTH map to the engine's length(), a character
-# count. (Multi-byte text is not exercised: like the other string functions, the
-# front-end currently operates on the wire bytes, so a character vs byte count
-# only coincides for ASCII — hence ASCII-only here.)
+# count. (Multi-byte text is exercised separately in string_utf8.test.)
 query
 SELECT CHAR_LENGTH('hello'), CHARACTER_LENGTH('hello')
 ----

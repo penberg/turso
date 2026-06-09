@@ -169,7 +169,10 @@ impl<'a> Lexer<'a> {
     fn read_delimited(&mut self, delim: u8, kind: &'static str) -> Result<Token> {
         let start = self.pos;
         self.pos += 1; // opening delimiter
-        let mut value = String::new();
+
+        // Accumulate raw bytes and decode as UTF-8 at the end, so multi-byte
+        // characters survive (pushing each byte `as char` would mangle them).
+        let mut value: Vec<u8> = Vec::new();
         loop {
             match self.peek() {
                 None => {
@@ -180,15 +183,15 @@ impl<'a> Lexer<'a> {
                 }
                 Some(c) if c == delim => {
                     if self.peek_at(1) == Some(delim) {
-                        value.push(delim as char);
+                        value.push(delim);
                         self.pos += 2;
                     } else {
                         self.pos += 1; // closing delimiter
-                        return Ok(Token::QuotedIdent(value));
+                        return Ok(Token::QuotedIdent(bytes_to_string(value)));
                     }
                 }
                 Some(c) => {
-                    value.push(c as char);
+                    value.push(c);
                     self.pos += 1;
                 }
             }
@@ -200,7 +203,10 @@ impl<'a> Lexer<'a> {
     fn read_string(&mut self) -> Result<Token> {
         let start = self.pos;
         self.pos += 1; // opening quote
-        let mut value = String::new();
+
+        // Accumulate raw bytes and decode as UTF-8 at the end, so multi-byte
+        // characters survive (pushing each byte `as char` would mangle them).
+        let mut value: Vec<u8> = Vec::new();
         loop {
             match self.peek() {
                 None => {
@@ -211,24 +217,24 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'\'') => {
                     if self.peek_at(1) == Some(b'\'') {
-                        value.push('\'');
+                        value.push(b'\'');
                         self.pos += 2;
                     } else {
                         self.pos += 1; // closing quote
-                        return Ok(Token::Str(value));
+                        return Ok(Token::Str(bytes_to_string(value)));
                     }
                 }
                 Some(b'\\') => {
                     self.pos += 1;
                     match self.peek() {
-                        Some(b'n') => value.push('\n'),
-                        Some(b't') => value.push('\t'),
-                        Some(b'r') => value.push('\r'),
-                        Some(b'0') => value.push('\0'),
-                        Some(b'\\') => value.push('\\'),
-                        Some(b'\'') => value.push('\''),
-                        Some(b'"') => value.push('"'),
-                        Some(other) => value.push(other as char),
+                        Some(b'n') => value.push(b'\n'),
+                        Some(b't') => value.push(b'\t'),
+                        Some(b'r') => value.push(b'\r'),
+                        Some(b'0') => value.push(0),
+                        Some(b'\\') => value.push(b'\\'),
+                        Some(b'\'') => value.push(b'\''),
+                        Some(b'"') => value.push(b'"'),
+                        Some(other) => value.push(other),
                         None => {
                             return Err(ParseError::Unterminated {
                                 offset: start,
@@ -239,11 +245,20 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 Some(c) => {
-                    value.push(c as char);
+                    value.push(c);
                     self.pos += 1;
                 }
             }
         }
+    }
+}
+
+/// Decodes accumulated string-literal bytes as UTF-8, replacing any invalid
+/// sequences (string tokens must be valid Rust `String`s).
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     }
 }
 
@@ -253,4 +268,32 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_cont(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_string(sql: &str) -> String {
+        let tokens = Lexer::new(sql.as_bytes()).tokenize().unwrap();
+        tokens
+            .into_iter()
+            .find_map(|(t, _)| match t {
+                Token::Str(s) | Token::QuotedIdent(s) => Some(s),
+                _ => None,
+            })
+            .expect("a string token")
+    }
+
+    #[test]
+    fn multibyte_string_literals_survive() {
+        // UTF-8 multi-byte characters are preserved, not split into bytes.
+        assert_eq!(first_string("SELECT 'café'"), "café");
+        assert_eq!(first_string("SELECT 'naïve résumé'"), "naïve résumé");
+        // Backtick-quoted identifiers too.
+        assert_eq!(first_string("SELECT `tëst`"), "tëst");
+        // Escapes and doubled quotes still work.
+        assert_eq!(first_string(r"SELECT 'a\tb'"), "a\tb");
+        assert_eq!(first_string("SELECT 'it''s'"), "it's");
+    }
 }

@@ -1,0 +1,35 @@
+# Multi-byte (UTF-8) string literals survive the lexer intact, so a string
+# round-trips unchanged and character functions count characters — not bytes —
+# matching MySQL over a utf8mb4 connection.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# A multi-byte literal round-trips unchanged.
+query
+SELECT 'héllo wörld'
+----
+héllo wörld
+
+# CHAR_LENGTH counts characters, not bytes (é, ï are one character each).
+query
+SELECT CHAR_LENGTH('café')
+----
+4
+
+query
+SELECT CHAR_LENGTH('naïve résumé')
+----
+12
+
+# SUBSTRING is character-indexed over multi-byte text: the 4th character of
+# 'café' is 'é'.
+query
+SELECT SUBSTRING('café', 4, 1)
+----
+é
+
+# UPPER on ASCII works alongside a multi-byte literal in the same row.
+query
+SELECT UPPER('abc'), 'ñ'
+----
+ABC	ñ
