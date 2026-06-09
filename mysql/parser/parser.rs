@@ -61,13 +61,17 @@ impl Parser {
                 self.advance();
                 self.drop()
             }
+            "INSERT" => {
+                self.advance();
+                self.insert()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "TRUNCATE"
-            | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "BEGIN"
-            | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL"
-            | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE"
-            | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH"
-            | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(format!(
+            "SELECT" | "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME"
+            | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "BEGIN" | "START"
+            | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH"
+            | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK"
+            | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD"
+            | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(format!(
                 "{keyword} is not supported yet"
             ))),
             other => Err(ParseError::Unsupported(format!(
@@ -489,6 +493,101 @@ impl Parser {
         })
     }
 
+    // === INSERT ===
+
+    /// Parses the basic `INSERT INTO tbl [(cols)] VALUES (...)[, (...)]` form.
+    /// `INSERT ... SELECT`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE`, and the
+    /// priority/`IGNORE` modifiers are rejected as unsupported.
+    fn insert(&mut self) -> Result<ast::Stmt> {
+        // `INSERT` has already been consumed.
+        for modifier in ["LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE"] {
+            if self.is_keyword(modifier) {
+                return Err(ParseError::Unsupported(format!(
+                    "INSERT {modifier} is not supported yet"
+                )));
+            }
+        }
+
+        self.eat_keyword("INTO"); // `INTO` is optional in MySQL
+        let tbl_name = self.qualified_name()?;
+
+        // Optional explicit column list.
+        let mut columns = Vec::new();
+        if self.eat(&Token::LParen) {
+            loop {
+                columns.push(self.name()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen, "`)`")?;
+        }
+
+        if self.is_keyword("SET") {
+            return Err(ParseError::Unsupported(
+                "INSERT ... SET is not supported yet".to_string(),
+            ));
+        }
+
+        // Only the VALUES / VALUE form is supported.
+        if !(self.eat_keyword("VALUES") || self.eat_keyword("VALUE")) {
+            if self.is_keyword("SELECT") || self.is(&Token::LParen) {
+                return Err(ParseError::Unsupported(
+                    "INSERT ... SELECT is not supported yet".to_string(),
+                ));
+            }
+            return Err(self.unexpected("`VALUES`"));
+        }
+
+        let mut rows = Vec::new();
+        loop {
+            self.expect(&Token::LParen, "`(`")?;
+            let mut row = Vec::new();
+            if !self.is(&Token::RParen) {
+                loop {
+                    row.push(Box::new(self.expr()?));
+                    if self.eat(&Token::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect(&Token::RParen, "`)`")?;
+            rows.push(row);
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+
+        if self.is_keyword("ON") {
+            return Err(ParseError::Unsupported(
+                "INSERT ... ON DUPLICATE KEY UPDATE is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Stmt::Insert {
+            with: None,
+            or_conflict: None,
+            tbl_name,
+            columns,
+            body: ast::InsertBody::Select(
+                ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: ast::OneSelect::Values(rows),
+                        compounds: Vec::new(),
+                    },
+                    order_by: Vec::new(),
+                    limit: None,
+                },
+                None,
+            ),
+            returning: Vec::new(),
+        })
+    }
+
     // === Expressions ===
     //
     // A small expression grammar for WHERE predicates, INSERT values, and
@@ -499,7 +598,7 @@ impl Parser {
     //
     // The divergent operators `/`, `%`, and `||` are intentionally not parsed.
 
-    #[allow(dead_code)]
+    /// Parses an expression at the lowest precedence level (`OR`).
     fn expr(&mut self) -> Result<ast::Expr> {
         let mut lhs = self.and_expr()?;
         while self.eat_keyword("OR") {
@@ -898,6 +997,72 @@ mod tests {
     }
 
     #[test]
+    fn insert_basic_with_columns() {
+        let stmt = parse("INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')").unwrap();
+        let ast::Stmt::Insert {
+            tbl_name,
+            columns,
+            body,
+            ..
+        } = stmt
+        else {
+            panic!("expected Insert");
+        };
+        assert_eq!(tbl_name.name.as_str(), "t");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].as_str(), "id");
+        let ast::InsertBody::Select(select, _) = body else {
+            panic!("expected VALUES body");
+        };
+        let ast::OneSelect::Values(rows) = select.body.select else {
+            panic!("expected Values");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 2);
+    }
+
+    #[test]
+    fn insert_without_column_list_and_into_optional() {
+        assert!(matches!(
+            parse("INSERT INTO t VALUES (1)").unwrap(),
+            ast::Stmt::Insert { .. }
+        ));
+        // `INTO` is optional in MySQL.
+        assert!(matches!(
+            parse("INSERT t VALUES (1)").unwrap(),
+            ast::Stmt::Insert { .. }
+        ));
+    }
+
+    #[test]
+    fn insert_renders_back_to_sql() {
+        let sql = parse("INSERT INTO t (a, b) VALUES (1, 'x')")
+            .unwrap()
+            .to_string();
+        let upper = sql.to_uppercase();
+        assert!(
+            upper.contains("INSERT") && upper.contains("VALUES"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn insert_unsupported_variants() {
+        for sql in [
+            "INSERT INTO t SET a = 1",
+            "INSERT INTO t SELECT * FROM u",
+            "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1",
+            "INSERT IGNORE INTO t VALUES (1)",
+            "INSERT DELAYED INTO t VALUES (1)",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
+    }
+
+    #[test]
     fn ignores_engine_and_charset_options() {
         let stmt = parse("CREATE TABLE t (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4").unwrap();
         assert!(matches!(stmt, ast::Stmt::CreateTable { .. }));
@@ -1080,13 +1245,5 @@ mod tests {
     fn select_is_unsupported() {
         let err = parse("SELECT * FROM foo").unwrap_err();
         assert!(matches!(err, ParseError::Unsupported(_)), "{err:?}");
-    }
-
-    #[test]
-    fn insert_is_unsupported() {
-        assert!(matches!(
-            parse("INSERT INTO t VALUES (1)").unwrap_err(),
-            ParseError::Unsupported(_)
-        ));
     }
 }

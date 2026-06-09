@@ -255,10 +255,11 @@ incomplete.
 | EXCEPT clause                          | ❌     |         |
 | HANDLER                                | ❌     |         |
 | IMPORT TABLE                           | ❌     |         |
-| INSERT                                 | ❌     |         |
-| INSERT ... SELECT                      | ❌     |         |
-| INSERT ... ON DUPLICATE KEY UPDATE     | ❌     | MySQL upsert syntax differs from SQLite's. |
-| INSERT DELAYED                         | ❌     |         |
+| INSERT ... VALUES (basic)              | ✅     |         |
+| INSERT ... SET                         | ❌     | **Not supported.** |
+| INSERT ... SELECT                      | ❌     | **Not supported.** |
+| INSERT ... ON DUPLICATE KEY UPDATE     | ❌     | **Not supported** (MySQL upsert syntax differs from SQLite's). |
+| INSERT IGNORE / DELAYED / priority     | ❌     | **Not supported.** |
 | INTERSECT clause                       | ❌     |         |
 | LOAD DATA                              | ❌     |         |
 | LOAD XML                               | ❌     |         |

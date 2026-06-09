@@ -1,0 +1,30 @@
+# INSERT ... VALUES conformance — the basic form.
+#
+# Implemented by the Turso front-end, so this file is expected to pass against
+# both `turso-mysql-server` and a real mysqld. SELECT does not exist in the
+# front-end yet, so inserts are verified here only as `statement ok`; the full
+# row round-trip is checked in select.test once SELECT lands.
+#
+# Only the basic `INSERT INTO t [(cols)] VALUES (...)` form is supported;
+# INSERT ... SELECT / SET / ON DUPLICATE KEY UPDATE / IGNORE / DELAYED are not
+# (see mysql/COMPAT.md). Uses its own table name to avoid colliding with other
+# test files in the shared database.
+
+statement ok
+CREATE TABLE IF NOT EXISTS insert_demo (id INT PRIMARY KEY, name VARCHAR(32), n INT)
+
+# Insert with an explicit column list, single row.
+statement ok
+INSERT INTO insert_demo (id, name, n) VALUES (1, 'alice', 10)
+
+# Multi-row insert.
+statement ok
+INSERT INTO insert_demo (id, name, n) VALUES (2, 'bob', 20), (3, 'carol', 30)
+
+# No column list (all columns, in order).
+statement ok
+INSERT INTO insert_demo VALUES (4, 'dave', 40)
+
+# NULL and negative literals as values.
+statement ok
+INSERT INTO insert_demo (id, name, n) VALUES (5, NULL, -7)
