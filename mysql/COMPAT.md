@@ -339,7 +339,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `CONCAT`                               | ❌     | **Excluded** — MySQL returns NULL if any arg is NULL; SQLite ignores NULLs. |
 | `LENGTH`                               | ❌     | **Excluded** — MySQL counts bytes; SQLite counts characters. |
 | `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |
-| `IF`                                   | ❌     | **Excluded** — SQLite spells it `IIF`. |
+| `IF`                                   | ✅     | Renamed on emit to the engine's `IIF`; semantics are identical (a NULL/zero condition is false). |
 | `NOW`, `CURDATE`, date/time functions  | ❌     | **Excluded** — types and formats differ. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 

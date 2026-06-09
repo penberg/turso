@@ -1566,6 +1566,13 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
 
+        // MySQL `IF` is the engine's `IIF`; they differ only in name.
+        let name = if upper == "IF" {
+            ast::Name::from_string("iif")
+        } else {
+            name
+        };
+
         Ok(ast::Expr::FunctionCall {
             name,
             distinctness: distinct.then_some(ast::Distinctness::Distinct),
@@ -1831,6 +1838,8 @@ fn is_supported_function(upper_name: &str) -> bool {
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
         | "REPLACE" | "SUBSTR" | "INSTR" | "TRIM"
+        // `IF` shares behaviour with the engine's `IIF` (it is renamed on emit).
+        | "IF"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -2661,7 +2670,6 @@ mod tests {
         for input in [
             "CONCAT('a', 'b')",
             "LENGTH(name)",
-            "IF(a, 1, 2)",
             "NOW()",
             "ROUND(2.7)",
             "totally_made_up(1)",
@@ -2672,6 +2680,17 @@ mod tests {
                 "expected `{input}` to be unsupported, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn if_is_renamed_to_iif() {
+        // MySQL `IF` maps to the engine's `IIF`.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("IF(a > 0, 'p', 'n')").unwrap()
+        else {
+            panic!("expected FunctionCall");
+        };
+        assert_eq!(name.as_str().to_ascii_lowercase(), "iif");
+        assert_eq!(args.len(), 3);
     }
 
     #[test]

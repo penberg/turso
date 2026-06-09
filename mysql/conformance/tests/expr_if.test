@@ -1,0 +1,41 @@
+# MySQL IF(cond, a, b) maps to the engine's IIF — identical semantics: a when
+# the condition is true, else b; a NULL or zero condition is false. (This is the
+# one MySQL function that differs from SQLite/turso only in name, so it maps
+# cleanly; CONCAT, LENGTH, etc. differ in behaviour and stay excluded.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+query
+SELECT IF(1 > 0, 'yes', 'no')
+----
+yes
+
+query
+SELECT IF(0, 'yes', 'no')
+----
+no
+
+# A NULL condition is treated as false on both.
+query
+SELECT IF(NULL, 'yes', 'no')
+----
+no
+
+query
+SELECT IF(5 = 5, 10, 20)
+----
+10
+
+# Composes with columns.
+statement ok
+CREATE TABLE IF NOT EXISTS iftab (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO iftab (id, n) VALUES (1, -5), (2, 0), (3, 7)
+
+query
+SELECT id, IF(n > 0, 'positive', 'non-positive') FROM iftab ORDER BY id
+----
+1	non-positive
+2	non-positive
+3	positive
