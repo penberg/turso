@@ -77,14 +77,26 @@ impl Parser {
                 self.advance();
                 self.delete()
             }
+            "BEGIN" | "START" => {
+                self.advance();
+                self.begin_transaction(&keyword)
+            }
+            "COMMIT" => {
+                self.advance();
+                self.commit_transaction()
+            }
+            "ROLLBACK" => {
+                self.advance();
+                self.rollback_transaction()
+            }
             // Recognized statement keywords that are simply not implemented yet.
             "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE"
-            | "DESC" | "EXPLAIN" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT"
-            | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE"
-            | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK"
-            | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(
-                ParseError::Unsupported(format!("{keyword} is not supported yet")),
-            ),
+            | "DESC" | "EXPLAIN" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH"
+            | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK"
+            | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD"
+            | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(format!(
+                "{keyword} is not supported yet"
+            ))),
             other => Err(ParseError::Unsupported(format!(
                 "unrecognized statement starting with `{other}`"
             ))),
@@ -1056,6 +1068,69 @@ impl Parser {
         }))
     }
 
+    // === TRANSACTIONS ===
+
+    /// Parses `START TRANSACTION` or `BEGIN [WORK]` into the engine's `BEGIN`.
+    /// MySQL `START TRANSACTION` and `BEGIN` both open an explicit transaction
+    /// that the engine's deferred `BEGIN` matches. MySQL-only modifiers
+    /// (`READ ONLY`/`READ WRITE`/`WITH CONSISTENT SNAPSHOT`) change isolation in
+    /// ways the engine does not model, so they are rejected. `BEGIN`/`START` has
+    /// already been consumed.
+    fn begin_transaction(&mut self, keyword: &str) -> Result<ast::Stmt> {
+        if keyword == "START" {
+            self.expect_keyword("TRANSACTION")?;
+        } else {
+            self.eat_keyword("WORK");
+        }
+        if self.has_trailing_tokens() {
+            return Err(ParseError::Unsupported(
+                "transaction characteristics (READ ONLY / READ WRITE / WITH CONSISTENT SNAPSHOT) are not supported yet".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Begin {
+            typ: None,
+            name: None,
+        })
+    }
+
+    /// Parses `COMMIT [WORK]`. `COMMIT` has already been consumed.
+    fn commit_transaction(&mut self) -> Result<ast::Stmt> {
+        self.eat_keyword("WORK");
+        if self.has_trailing_tokens() {
+            return Err(ParseError::Unsupported(
+                "COMMIT ... AND CHAIN / RELEASE is not supported yet".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Commit { name: None })
+    }
+
+    /// Parses `ROLLBACK [WORK]`. `ROLLBACK TO [SAVEPOINT]` and the
+    /// `AND CHAIN`/`RELEASE` modifiers are rejected. `ROLLBACK` has already been
+    /// consumed.
+    fn rollback_transaction(&mut self) -> Result<ast::Stmt> {
+        self.eat_keyword("WORK");
+        if self.is_keyword("TO") {
+            return Err(ParseError::Unsupported(
+                "ROLLBACK TO SAVEPOINT is not supported yet".to_string(),
+            ));
+        }
+        if self.has_trailing_tokens() {
+            return Err(ParseError::Unsupported(
+                "ROLLBACK ... AND CHAIN / RELEASE is not supported yet".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Rollback {
+            tx_name: None,
+            savepoint_name: None,
+        })
+    }
+
+    /// Whether any non-terminating token remains before the end of the
+    /// statement (a trailing `;` and end-of-input both count as the end).
+    fn has_trailing_tokens(&self) -> bool {
+        self.pos < self.tokens.len() && !self.is(&Token::Semicolon)
+    }
+
     // === DELETE ===
 
     /// Parses `DELETE FROM tbl [WHERE expr]`. Multi-table deletes,
@@ -2017,6 +2092,44 @@ mod tests {
             parse("INSERT INTO t (n) VALUES (1) ON DUPLICATE KEY UPDATE n = n + VALUES(n)")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transaction_control_statements() {
+        assert!(matches!(
+            parse("START TRANSACTION").unwrap(),
+            ast::Stmt::Begin { .. }
+        ));
+        assert!(matches!(parse("BEGIN").unwrap(), ast::Stmt::Begin { .. }));
+        assert!(matches!(
+            parse("BEGIN WORK").unwrap(),
+            ast::Stmt::Begin { .. }
+        ));
+        assert!(matches!(parse("COMMIT").unwrap(), ast::Stmt::Commit { .. }));
+        assert!(matches!(
+            parse("COMMIT WORK").unwrap(),
+            ast::Stmt::Commit { .. }
+        ));
+        assert!(matches!(
+            parse("ROLLBACK").unwrap(),
+            ast::Stmt::Rollback { .. }
+        ));
+    }
+
+    #[test]
+    fn transaction_unsupported_variants() {
+        for sql in [
+            "START TRANSACTION READ ONLY",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+            "ROLLBACK TO SAVEPOINT sp",
+            "ROLLBACK TO sp",
+            "SAVEPOINT sp",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
     }
 
     #[test]

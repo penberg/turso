@@ -1,0 +1,60 @@
+# Transaction control conformance: START TRANSACTION / BEGIN, COMMIT, ROLLBACK.
+#
+# MySQL's START TRANSACTION (and BEGIN) start an explicit transaction; COMMIT
+# persists it and ROLLBACK discards it — identical to the engine's
+# BEGIN/COMMIT/ROLLBACK. WordPress's db.php tests wrap each test in
+# START TRANSACTION ... ROLLBACK for isolation, so this is the gate to running
+# that suite.
+#
+# The conformance runner uses one connection per file, so a transaction spans
+# the statements below. Expected to pass against both turso-mysql-server and a
+# real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS tx (a INT PRIMARY KEY, label VARCHAR(16))
+
+# ROLLBACK discards everything done since START TRANSACTION.
+statement ok
+START TRANSACTION
+
+statement ok
+INSERT INTO tx (a, label) VALUES (1, 'rolled-back')
+
+statement ok
+ROLLBACK
+
+query
+SELECT COUNT(*) FROM tx
+----
+0
+
+# COMMIT persists the changes.
+statement ok
+START TRANSACTION
+
+statement ok
+INSERT INTO tx (a, label) VALUES (2, 'committed')
+
+statement ok
+COMMIT
+
+query
+SELECT a, label FROM tx ORDER BY a
+----
+2	committed
+
+# BEGIN is a synonym for START TRANSACTION.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx (a, label) VALUES (3, 'via-begin')
+
+statement ok
+COMMIT
+
+query
+SELECT a, label FROM tx ORDER BY a
+----
+2	committed
+3	via-begin

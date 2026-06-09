@@ -340,11 +340,11 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement                                       | Status | Comment |
 |-------------------------------------------------|--------|---------|
-| START TRANSACTION / BEGIN                       | ❌     |         |
-| COMMIT                                           | ❌     |         |
-| ROLLBACK                                         | ❌     |         |
+| START TRANSACTION / BEGIN [WORK]                | ✅     | Mapped to the engine's `BEGIN` (deferred). `READ ONLY`/`READ WRITE`/`WITH CONSISTENT SNAPSHOT` characteristics are rejected. |
+| COMMIT [WORK]                                    | ✅     | `AND CHAIN`/`RELEASE` rejected. |
+| ROLLBACK [WORK]                                  | ✅     | `AND CHAIN`/`RELEASE` rejected. |
 | SAVEPOINT                                        | ❌     |         |
-| ROLLBACK TO SAVEPOINT                            | ❌     |         |
+| ROLLBACK TO SAVEPOINT                            | ❌     | Rejected as unsupported. |
 | RELEASE SAVEPOINT                                | ❌     |         |
 | LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE       | ❌     |         |
 | LOCK TABLES / UNLOCK TABLES                      | ❌     |         |
