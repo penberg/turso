@@ -1,0 +1,58 @@
+# JOIN conformance: INNER JOIN and LEFT [OUTER] JOIN with ON conditions.
+#
+# WordPress queries lean heavily on INNER/LEFT joins (e.g. terms INNER JOIN
+# term_taxonomy). These map identically onto the engine, so the front-end lowers
+# them directly. RIGHT/FULL/CROSS/NATURAL joins, comma joins, USING, and ON-less
+# joins are rejected (see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic. Uses its own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS j_terms (term_id INT PRIMARY KEY, name VARCHAR(32))
+
+statement ok
+CREATE TABLE IF NOT EXISTS j_tax (tt_id INT PRIMARY KEY, term_id INT, taxonomy VARCHAR(32))
+
+statement ok
+INSERT INTO j_terms (term_id, name) VALUES (1, 'news'), (2, 'sports'), (3, 'orphan')
+
+statement ok
+INSERT INTO j_tax (tt_id, term_id, taxonomy) VALUES (10, 1, 'category'), (20, 2, 'category')
+
+# INNER JOIN with AS aliases — the WordPress terms/term_taxonomy shape. The
+# orphan term (3) has no taxonomy row and is dropped.
+query
+SELECT t.term_id, t.name, tt.taxonomy FROM j_terms AS t INNER JOIN j_tax AS tt ON t.term_id = tt.term_id ORDER BY t.term_id
+----
+1	news	category
+2	sports	category
+
+# Plain JOIN is an INNER JOIN.
+query
+SELECT t.name FROM j_terms t JOIN j_tax tt ON t.term_id = tt.term_id ORDER BY t.name
+----
+news
+sports
+
+# LEFT JOIN keeps unmatched left rows, with NULLs for the right side.
+query
+SELECT t.term_id, tt.taxonomy FROM j_terms AS t LEFT JOIN j_tax AS tt ON t.term_id = tt.term_id ORDER BY t.term_id
+----
+1	category
+2	category
+3	NULL
+
+# LEFT OUTER JOIN is a synonym for LEFT JOIN.
+query
+SELECT t.term_id, tt.tt_id FROM j_terms t LEFT OUTER JOIN j_tax tt ON t.term_id = tt.term_id ORDER BY t.term_id
+----
+1	10
+2	20
+3	NULL
+
+# A WHERE clause filters across the joined rows.
+query
+SELECT t.name, tt.tt_id FROM j_terms t INNER JOIN j_tax tt ON t.term_id = tt.term_id WHERE tt.tt_id = 20 ORDER BY t.name
+----
+sports	20

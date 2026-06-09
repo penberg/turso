@@ -773,8 +773,9 @@ impl Parser {
     ///        [ORDER BY <expr> [ASC|DESC], ...] [LIMIT <n> [OFFSET <m>]]
     /// ```
     ///
-    /// JOINs, multiple tables, subqueries, `GROUP BY`/`HAVING`, `DISTINCT`,
-    /// aggregates, set operations, and CTEs are rejected as unsupported.
+    /// Comma joins, subqueries, set operations, and CTEs are rejected as
+    /// unsupported; `INNER`/`LEFT` JOINs, `GROUP BY`/`HAVING`, `DISTINCT`, and
+    /// aggregates are supported.
     fn select(&mut self) -> Result<ast::Stmt> {
         // `SELECT` has already been consumed.
         if self.is_keyword("DISTINCTROW") {
@@ -793,7 +794,7 @@ impl Parser {
         let columns = self.select_list()?;
 
         let from = if self.eat_keyword("FROM") {
-            Some(self.from_single_table()?)
+            Some(self.from_clause()?)
         } else {
             None
         };
@@ -871,49 +872,104 @@ impl Parser {
         Ok(columns)
     }
 
-    /// Parses the `FROM` clause, restricted to a single table reference.
+    /// Parses the `FROM` clause: a table reference optionally followed by
+    /// `[INNER] JOIN` / `LEFT [OUTER] JOIN` joins, each with an `ON` condition.
+    /// These map identically onto the engine. Comma joins, `RIGHT`/`FULL`/
+    /// `CROSS`/`NATURAL`/`STRAIGHT_JOIN`, `USING`, ON-less joins, and subqueries
+    /// are rejected as unsupported.
     // Not a constructor: the `from_` prefix names the SQL `FROM` clause, so the
     // `wrong_self_convention` heuristic does not apply here.
     #[allow(clippy::wrong_self_convention)]
-    fn from_single_table(&mut self) -> Result<ast::FromClause> {
-        if self.is(&Token::LParen) {
-            return Err(ParseError::Unsupported(
-                "SELECT from a subquery / derived table is not supported yet".to_string(),
-            ));
-        }
-        let tbl_name = self.qualified_name()?;
-        let alias = if self.eat_keyword("AS") {
-            Some(ast::As::As(self.name()?))
-        } else {
-            None
-        };
+    fn from_clause(&mut self) -> Result<ast::FromClause> {
+        let select = Box::new(self.table_ref()?);
 
         if self.is(&Token::Comma) {
             return Err(ParseError::Unsupported(
                 "SELECT from multiple tables (comma join) is not supported yet".to_string(),
             ));
         }
-        for join_kw in [
-            "JOIN",
-            "INNER",
-            "LEFT",
-            "RIGHT",
-            "FULL",
-            "CROSS",
-            "NATURAL",
-            "STRAIGHT_JOIN",
-        ] {
-            if self.is_keyword(join_kw) {
+
+        let mut joins = Vec::new();
+        while let Some(operator) = self.join_operator()? {
+            let table = Box::new(self.table_ref()?);
+            let constraint = if self.eat_keyword("ON") {
+                Some(ast::JoinConstraint::On(Box::new(self.expr()?)))
+            } else if self.is_keyword("USING") {
                 return Err(ParseError::Unsupported(
-                    "SELECT with JOIN is not supported yet".to_string(),
+                    "JOIN ... USING is not supported yet".to_string(),
                 ));
-            }
+            } else {
+                return Err(ParseError::Unsupported(
+                    "JOIN without an ON condition is not supported yet".to_string(),
+                ));
+            };
+            joins.push(ast::JoinedSelectTable {
+                operator,
+                table,
+                constraint,
+            });
         }
 
-        Ok(ast::FromClause {
-            select: Box::new(ast::SelectTable::Table(tbl_name, alias, None)),
-            joins: Vec::new(),
-        })
+        Ok(ast::FromClause { select, joins })
+    }
+
+    /// Parses a single table reference: `tbl [[AS] alias]`. Subqueries and table
+    /// functions are not modeled.
+    fn table_ref(&mut self) -> Result<ast::SelectTable> {
+        if self.is(&Token::LParen) {
+            return Err(ParseError::Unsupported(
+                "SELECT from a subquery / derived table is not supported yet".to_string(),
+            ));
+        }
+        let tbl_name = self.qualified_name()?;
+        let alias = self.table_alias()?;
+        Ok(ast::SelectTable::Table(tbl_name, alias, None))
+    }
+
+    /// Parses an optional table alias: `AS name`, a backtick-quoted name, or a
+    /// bare identifier that is not a keyword which may follow a table reference.
+    fn table_alias(&mut self) -> Result<Option<ast::As>> {
+        if self.eat_keyword("AS") {
+            return Ok(Some(ast::As::As(self.name()?)));
+        }
+        match self.peek() {
+            Some(Token::QuotedIdent(_)) => Ok(Some(ast::As::Elided(self.name()?))),
+            Some(Token::Word(w)) if !is_reserved_after_table(w) => {
+                Ok(Some(ast::As::Elided(self.name()?)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Parses a join operator, or `None` if no join follows. Only `[INNER] JOIN`
+    /// and `LEFT [OUTER] JOIN` are modeled; the other join types are rejected.
+    fn join_operator(&mut self) -> Result<Option<ast::JoinOperator>> {
+        if self.eat_keyword("INNER") {
+            self.expect_keyword("JOIN")?;
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::INNER,
+            ))));
+        }
+        if self.eat_keyword("LEFT") {
+            self.eat_keyword("OUTER");
+            self.expect_keyword("JOIN")?;
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::LEFT | ast::JoinType::OUTER,
+            ))));
+        }
+        if self.eat_keyword("JOIN") {
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::INNER,
+            ))));
+        }
+        for kw in ["RIGHT", "FULL", "CROSS", "NATURAL", "STRAIGHT_JOIN"] {
+            if self.is_keyword(kw) {
+                return Err(ParseError::Unsupported(format!(
+                    "{kw} join is not supported yet"
+                )));
+            }
+        }
+        Ok(None)
     }
 
     /// Parses an optional `GROUP BY [HAVING]` clause.
@@ -1658,6 +1714,37 @@ fn is_column_constraint_keyword(word: &str) -> bool {
     )
 }
 
+/// Whether `word` is a keyword that may legitimately follow a table reference
+/// in a `FROM` clause, and therefore is **not** a bare table alias.
+fn is_reserved_after_table(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "NATURAL"
+            | "JOIN"
+            | "STRAIGHT_JOIN"
+            | "ON"
+            | "USING"
+            | "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "HAVING"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "INTO"
+            | "FOR"
+            | "LOCK"
+            | "WINDOW"
+            | "AS"
+    )
+}
+
 /// Extracts the column name from a `SortedColumn` whose expression is a plain
 /// column reference — the only form `sorted_column_list` produces.
 fn sorted_column_name(sc: &ast::SortedColumn) -> &str {
@@ -1918,11 +2005,80 @@ mod tests {
     }
 
     #[test]
+    fn select_inner_join_with_aliases() {
+        let stmt = parse(
+            "SELECT t.*, tt.* FROM terms AS t INNER JOIN term_taxonomy AS tt ON t.id = tt.term_id WHERE t.id = 1",
+        )
+        .unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { from, .. } = select.body.select else {
+            panic!("expected a plain select");
+        };
+        let from = from.expect("a FROM clause");
+        assert_eq!(from.joins.len(), 1);
+        let join = &from.joins[0];
+        assert!(matches!(
+            join.operator,
+            ast::JoinOperator::TypedJoin(Some(t)) if t == ast::JoinType::INNER
+        ));
+        assert!(matches!(join.constraint, Some(ast::JoinConstraint::On(_))));
+    }
+
+    #[test]
+    fn select_plain_and_left_join() {
+        // Plain JOIN is INNER; LEFT JOIN sets LEFT|OUTER.
+        let plain = parse("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
+        let ast::Stmt::Select(s) = plain else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { from, .. } = s.body.select else {
+            unreachable!()
+        };
+        assert!(matches!(
+            from.unwrap().joins[0].operator,
+            ast::JoinOperator::TypedJoin(Some(t)) if t == ast::JoinType::INNER
+        ));
+
+        let left = parse("SELECT * FROM a LEFT JOIN b ON a.id = b.id").unwrap();
+        let ast::Stmt::Select(s) = left else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { from, .. } = s.body.select else {
+            unreachable!()
+        };
+        assert!(matches!(
+            from.unwrap().joins[0].operator,
+            ast::JoinOperator::TypedJoin(Some(t)) if t == ast::JoinType::LEFT | ast::JoinType::OUTER
+        ));
+    }
+
+    #[test]
+    fn select_bare_table_alias() {
+        let stmt = parse("SELECT p.id FROM posts p WHERE p.id = 1").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { from, .. } = s.body.select else {
+            unreachable!()
+        };
+        let from = from.unwrap();
+        let ast::SelectTable::Table(_, Some(alias), _) = from.select.as_ref() else {
+            panic!("expected an aliased table");
+        };
+        assert!(matches!(alias, ast::As::Elided(n) if n.as_str() == "p"));
+    }
+
+    #[test]
     fn select_unsupported_variants() {
         for sql in [
             "SELECT DISTINCTROW a FROM t",
             "SELECT * FROM a, b",
-            "SELECT * FROM a JOIN b ON a.id = b.id",
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
+            "SELECT * FROM a CROSS JOIN b",
+            "SELECT * FROM a JOIN b USING (id)",
+            "SELECT * FROM a JOIN b",
             "SELECT * FROM (SELECT 1)",
             "SELECT a FROM t GROUP BY 1",
             "SELECT * FROM a UNION SELECT * FROM b",

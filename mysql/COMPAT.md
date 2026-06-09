@@ -281,7 +281,8 @@ incomplete.
 | SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
 | SELECT DISTINCT                        | ✅     | `DISTINCTROW` synonym not supported. |
 | SELECT ... INTO                        | ❌     | **Not supported.** |
-| JOIN clause                            | ❌     | **Not supported.** |
+| `[INNER] JOIN` / `LEFT [OUTER] JOIN` ... ON | ✅ | Table aliases (`t`, `t AS a`) and chained joins supported. Map identically onto the engine. |
+| `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, comma joins, `JOIN ... USING`, ON-less joins | ❌ | Rejected as unsupported (semantics differ or unmodeled). |
 | UNION                                  | ❌     |         |
 | INTERSECT / EXCEPT set operations      | ❌     |         |
 | Subqueries                             | ❌     |         |
