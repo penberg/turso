@@ -270,7 +270,7 @@ incomplete.
 | INSERT ... VALUES (basic)              | ✅     |         |
 | INSERT ... SET                         | ❌     | **Not supported.** |
 | INSERT ... SELECT                      | ❌     | **Not supported.** |
-| INSERT ... ON DUPLICATE KEY UPDATE     | ❌     | **Not supported** (MySQL upsert syntax differs from SQLite's). |
+| INSERT ... ON DUPLICATE KEY UPDATE     | ✅     | Lowered to the engine's target-less upsert (`ON CONFLICT DO UPDATE SET ...`), which fires on any unique/primary-key conflict like MySQL. `VALUES(col)` is mapped to `excluded.col`; `VALUES(...)` nested inside a larger expression is not modeled (parse error). |
 | INSERT IGNORE / DELAYED / priority     | ❌     | **Not supported.** |
 | INTERSECT clause                       | ❌     |         |
 | LOAD DATA                              | ❌     |         |

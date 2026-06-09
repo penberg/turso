@@ -671,11 +671,11 @@ impl Parser {
             break;
         }
 
-        if self.is_keyword("ON") {
-            return Err(ParseError::Unsupported(
-                "INSERT ... ON DUPLICATE KEY UPDATE is not supported yet".to_string(),
-            ));
-        }
+        let upsert = if self.eat_keyword("ON") {
+            Some(Box::new(self.on_duplicate_key_update()?))
+        } else {
+            None
+        };
 
         Ok(ast::Stmt::Insert {
             with: None,
@@ -692,10 +692,64 @@ impl Parser {
                     order_by: Vec::new(),
                     limit: None,
                 },
-                None,
+                upsert,
             ),
             returning: Vec::new(),
         })
+    }
+
+    /// Parses MySQL `ON DUPLICATE KEY UPDATE col = expr [, ...]` and lowers it to
+    /// the engine's target-less upsert (`ON CONFLICT DO UPDATE SET ...`), which —
+    /// like MySQL — fires on a conflict with any unique or primary key. The
+    /// `VALUES(col)` pseudo-function (the would-be-inserted value) is mapped to
+    /// the engine's `excluded.col`. `ON` has already been consumed.
+    fn on_duplicate_key_update(&mut self) -> Result<ast::Upsert> {
+        self.expect_keyword("DUPLICATE")?;
+        self.expect_keyword("KEY")?;
+        self.expect_keyword("UPDATE")?;
+
+        let mut sets = Vec::new();
+        loop {
+            let col = self.name()?;
+            self.expect(&Token::Eq, "`=`")?;
+            let expr = self.upsert_assignment_value()?;
+            sets.push(ast::Set {
+                col_names: vec![col],
+                expr: Box::new(expr),
+            });
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+
+        Ok(ast::Upsert {
+            index: None,
+            do_clause: ast::UpsertDo::Set {
+                sets,
+                where_clause: None,
+            },
+            next: None,
+        })
+    }
+
+    /// Parses the right-hand side of an `ON DUPLICATE KEY UPDATE` assignment. A
+    /// leading `VALUES(col)` is lowered to `excluded.col`; anything else is an
+    /// ordinary expression (a bare column refers to the existing row's value, as
+    /// in MySQL). `VALUES(...)` nested inside a larger expression is not modeled
+    /// and falls out as a parse error.
+    fn upsert_assignment_value(&mut self) -> Result<ast::Expr> {
+        if self.is_keyword("VALUES") {
+            self.advance();
+            self.expect(&Token::LParen, "`(`")?;
+            let col = self.name()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(ast::Expr::Qualified(
+                ast::Name::from_string("excluded"),
+                col,
+            ));
+        }
+        self.expr()
     }
 
     // === SELECT ===
@@ -1916,7 +1970,6 @@ mod tests {
         for sql in [
             "INSERT INTO t SET a = 1",
             "INSERT INTO t SELECT * FROM u",
-            "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = 1",
             "INSERT IGNORE INTO t VALUES (1)",
             "INSERT DELAYED INTO t VALUES (1)",
         ] {
@@ -1925,6 +1978,45 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn insert_on_duplicate_key_update_maps_to_upsert() {
+        let stmt = parse(
+            "INSERT INTO t (id, n) VALUES (1, 2) ON DUPLICATE KEY UPDATE n = VALUES(n), n = n + 1",
+        )
+        .unwrap();
+        let ast::Stmt::Insert { body, .. } = stmt else {
+            panic!("expected Insert");
+        };
+        let ast::InsertBody::Select(_, Some(upsert)) = body else {
+            panic!("expected an upsert");
+        };
+        // Target-less, matching MySQL's "any unique/primary key".
+        assert!(upsert.index.is_none());
+        let ast::UpsertDo::Set { sets, where_clause } = &upsert.do_clause else {
+            panic!("expected DO UPDATE SET");
+        };
+        assert!(where_clause.is_none());
+        assert_eq!(sets.len(), 2);
+        // `VALUES(n)` is lowered to `excluded.n`.
+        assert_eq!(sets[0].col_names[0].as_str(), "n");
+        assert!(matches!(
+            sets[0].expr.as_ref(),
+            ast::Expr::Qualified(tbl, col) if tbl.as_str() == "excluded" && col.as_str() == "n"
+        ));
+        // A bare column on the RHS stays a plain reference (the existing row).
+        assert!(matches!(sets[1].expr.as_ref(), ast::Expr::Binary(..)));
+    }
+
+    #[test]
+    fn insert_on_duplicate_values_inside_expression_is_rejected() {
+        // `VALUES(...)` is only modeled as a whole RHS; nested in an expression
+        // it hits the function allow-list and is rejected.
+        assert!(
+            parse("INSERT INTO t (n) VALUES (1) ON DUPLICATE KEY UPDATE n = n + VALUES(n)")
+                .is_err()
+        );
     }
 
     #[test]

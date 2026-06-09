@@ -1,0 +1,55 @@
+# INSERT ... ON DUPLICATE KEY UPDATE conformance.
+#
+# MySQL's ON DUPLICATE KEY UPDATE fires on a conflict with any unique or primary
+# key. The front-end lowers it to the engine's target-less upsert
+# (ON CONFLICT DO UPDATE SET ...), which behaves the same, and maps VALUES(col)
+# — the would-be-inserted value — to the engine's excluded.col.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS odku (id INT PRIMARY KEY, name VARCHAR(32) UNIQUE, n INT)
+
+statement ok
+INSERT INTO odku (id, name, n) VALUES (1, 'a', 10)
+
+# Conflict on the PRIMARY KEY updates the existing row via VALUES().
+statement ok
+INSERT INTO odku (id, name, n) VALUES (1, 'a', 99) ON DUPLICATE KEY UPDATE n = VALUES(n)
+
+query
+SELECT id, name, n FROM odku ORDER BY id
+----
+1	a	99
+
+# No conflict: a brand-new row is inserted.
+statement ok
+INSERT INTO odku (id, name, n) VALUES (2, 'b', 20) ON DUPLICATE KEY UPDATE n = VALUES(n)
+
+query
+SELECT id, name, n FROM odku ORDER BY id
+----
+1	a	99
+2	b	20
+
+# Conflict on the UNIQUE key (not the PK) updates the existing row; the new id is
+# not inserted.
+statement ok
+INSERT INTO odku (id, name, n) VALUES (3, 'b', 5) ON DUPLICATE KEY UPDATE n = VALUES(n)
+
+query
+SELECT id, name, n FROM odku ORDER BY id
+----
+1	a	99
+2	b	5
+
+# Multi-column update: a PK conflict updates several columns from VALUES().
+statement ok
+INSERT INTO odku (id, name, n) VALUES (1, 'z', 1) ON DUPLICATE KEY UPDATE n = VALUES(n), name = VALUES(name)
+
+query
+SELECT id, name, n FROM odku ORDER BY id
+----
+1	z	1
+2	b	5
