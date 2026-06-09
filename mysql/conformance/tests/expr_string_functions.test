@@ -1,0 +1,55 @@
+# Additional scalar string functions whose MySQL and SQLite/turso semantics are
+# identical: REPLACE, SUBSTR, INSTR, TRIM. They share both name and behaviour, so
+# they pass straight through to the engine.
+#
+# (CONCAT and LENGTH are intentionally excluded — they diverge: CONCAT returns
+# NULL if any argument is NULL, and LENGTH counts bytes in MySQL but characters
+# in SQLite. See mysql/COMPAT.md.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# REPLACE replaces every occurrence, case-sensitively, on both.
+query
+SELECT REPLACE('a-b-c-b', '-b', '+B')
+----
+a+B-c+B
+
+# SUBSTR is 1-indexed with an optional length, on both.
+query
+SELECT SUBSTR('hello world', 7)
+----
+world
+
+query
+SELECT SUBSTR('hello world', 1, 5)
+----
+hello
+
+# SUBSTR with a negative position counts from the end, on both.
+query
+SELECT SUBSTR('hello', -2)
+----
+lo
+
+# INSTR returns the 1-indexed position of the first match, or 0.
+query
+SELECT INSTR('hello', 'l')
+----
+3
+
+query
+SELECT INSTR('hello', 'z')
+----
+0
+
+# TRIM removes leading and trailing spaces.
+query
+SELECT TRIM('   padded   ')
+----
+padded
+
+# These functions compose with the existing ones and with WHERE.
+query
+SELECT UPPER(SUBSTR('hello', 1, 3))
+----
+HEL

@@ -1776,6 +1776,8 @@ fn is_supported_function(upper_name: &str) -> bool {
         upper_name,
         // Scalar functions.
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
+        // String functions sharing both name and behaviour with the engine.
+        | "REPLACE" | "SUBSTR" | "INSTR" | "TRIM"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -2498,6 +2500,19 @@ mod tests {
             parse_expr("IFNULL(a, b * 2)").unwrap(),
             ast::Expr::FunctionCall { .. }
         ));
+
+        // String functions sharing name and behaviour with the engine.
+        for input in [
+            "REPLACE(s, '-', '_')",
+            "SUBSTR(s, 2, 3)",
+            "INSTR(s, 'x')",
+            "TRIM(s)",
+        ] {
+            assert!(
+                matches!(parse_expr(input).unwrap(), ast::Expr::FunctionCall { .. }),
+                "expected `{input}` to parse as a function call"
+            );
+        }
     }
 
     #[test]

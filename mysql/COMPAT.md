@@ -326,6 +326,10 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `IFNULL`                               | ✅     |         |
 | `ABS`                                  | ✅     |         |
 | `LOWER` / `UPPER`                      | ✅     | ASCII case folding. |
+| `REPLACE`                              | ✅     | Replaces every occurrence, case-sensitively. |
+| `SUBSTR`                               | ✅     | 1-indexed, optional length, negative position from the end. |
+| `INSTR`                                | ✅     | 1-indexed position of the first match, or 0. |
+| `TRIM`                                 | ✅     | `TRIM(str)` (leading/trailing spaces); the `TRIM(... FROM ...)` form is not parsed. |
 | `COUNT(*)` / `COUNT(expr)`             | ✅     | aggregate |
 | `SUM` / `MIN` / `MAX`                  | ✅     | aggregate |
 | `AVG`                                  | ❌     | **Excluded** — MySQL returns DECIMAL padded to 4 places; SQLite returns a plain float (text differs). |
