@@ -1,0 +1,79 @@
+# AUTO_INCREMENT conformance.
+#
+# A column declared AUTO_INCREMENT that is the single-column PRIMARY KEY
+# auto-assigns sequential ids when omitted from an INSERT, exactly as MySQL
+# does. Both the table-level `PRIMARY KEY (col)` form (the WordPress schema
+# shape) and the inline `... PRIMARY KEY` form are covered. The counter does not
+# reuse ids after a delete, matching MySQL.
+#
+# Expected to pass against both `turso-mysql-server` and a real mysqld. Rows are
+# tab-separated; every row-returning query is ORDER BY-deterministic. Uses its
+# own table names to avoid colliding with other files in the shared database.
+
+# Table-level PRIMARY KEY (col) — the WordPress shape. An INSERT that omits the
+# auto-increment column gets sequential ids.
+statement ok
+CREATE TABLE IF NOT EXISTS ai_table_pk (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL DEFAULT '',
+  PRIMARY KEY (id)
+)
+
+statement ok
+INSERT INTO ai_table_pk (name) VALUES ('a'), ('b'), ('c')
+
+query
+SELECT id, name FROM ai_table_pk ORDER BY id
+----
+1	a
+2	b
+3	c
+
+# Inline PRIMARY KEY form auto-assigns the same way.
+statement ok
+CREATE TABLE IF NOT EXISTS ai_inline_pk (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50))
+
+statement ok
+INSERT INTO ai_inline_pk (name) VALUES ('x'), ('y')
+
+query
+SELECT id, name FROM ai_inline_pk ORDER BY id
+----
+1	x
+2	y
+
+# An explicit id is honored, and the next omitted id continues past it.
+statement ok
+INSERT INTO ai_inline_pk (id, name) VALUES (10, 'ten')
+
+statement ok
+INSERT INTO ai_inline_pk (name) VALUES ('eleven')
+
+query
+SELECT id, name FROM ai_inline_pk ORDER BY id
+----
+1	x
+2	y
+10	ten
+11	eleven
+
+# Ids are not reused after the highest row is deleted (AUTO_INCREMENT counter
+# only moves forward).
+statement ok
+CREATE TABLE IF NOT EXISTS ai_no_reuse (id BIGINT NOT NULL AUTO_INCREMENT, tag VARCHAR(8), PRIMARY KEY (id))
+
+statement ok
+INSERT INTO ai_no_reuse (tag) VALUES ('a'), ('b'), ('c')
+
+statement ok
+DELETE FROM ai_no_reuse WHERE id = 3
+
+statement ok
+INSERT INTO ai_no_reuse (tag) VALUES ('d')
+
+query
+SELECT id, tag FROM ai_no_reuse ORDER BY id
+----
+1	a
+2	b
+4	d

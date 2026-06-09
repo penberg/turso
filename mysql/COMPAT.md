@@ -245,6 +245,17 @@ incomplete.
 | RENAME TABLE                           | ❌     |         |
 | TRUNCATE TABLE                         | ❌     |         |
 
+#### CREATE TABLE column attributes
+
+| Attribute | Status | Comment |
+|-----------|--------|---------|
+| `NOT NULL` / `NULL`         | ✅ | |
+| `DEFAULT <literal>`         | ✅ | Literal defaults; function/expression defaults are dropped to NULL. |
+| `PRIMARY KEY` (inline / table-level, single column) | ✅ | |
+| `PRIMARY KEY` (composite)   | ✅ | Parsed and forwarded; not valid with `AUTO_INCREMENT` (below). |
+| `AUTO_INCREMENT`            | ✅ | Only on a single-column `PRIMARY KEY` (inline or table-level). The key column is retyped to `INTEGER` so the engine treats it as a rowid alias that auto-assigns sequential ids and never reuses them — identical to MySQL. MySQL's int width (`bigint(20)`, `int(11)`) is display-only and dropped. |
+| `AUTO_INCREMENT` elsewhere  | ❌ | On a non-key column, a composite key, or more than one column: rejected as unsupported (MySQL would map differently). |
+
 ### Data Manipulation Statements
 
 | Statement                              | Status | Comment |

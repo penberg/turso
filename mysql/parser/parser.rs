@@ -128,7 +128,9 @@ impl Parser {
         }
         self.expect(&Token::LParen, "`(`")?;
 
-        let mut columns = Vec::new();
+        // Columns carry an `auto_increment` flag alongside the definition; it is
+        // resolved into the engine's rowid-alias autoincrement after parsing.
+        let mut columns: Vec<(ast::ColumnDefinition, bool)> = Vec::new();
         let mut constraints = Vec::new();
         loop {
             if self.next_is_table_constraint() {
@@ -150,6 +152,9 @@ impl Parser {
             return Err(self.unexpected("at least one column definition"));
         }
 
+        Self::apply_auto_increment(&mut columns, &mut constraints)?;
+        let columns: Vec<ast::ColumnDefinition> = columns.into_iter().map(|(c, _)| c).collect();
+
         Ok(ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
@@ -162,15 +167,106 @@ impl Parser {
         })
     }
 
-    fn column_def(&mut self) -> Result<ast::ColumnDefinition> {
+    /// Resolves MySQL `AUTO_INCREMENT` onto the engine's rowid-alias
+    /// autoincrement, which only applies to a single-column `INTEGER PRIMARY
+    /// KEY`. MySQL's int width is display-only, so the auto-increment key column
+    /// is retyped to `INTEGER` (making it a rowid alias that auto-assigns
+    /// sequential ids), and the primary key — whether declared inline or as a
+    /// table-level `PRIMARY KEY (col)` — is marked autoincrement so ids are
+    /// never reused, matching MySQL.
+    ///
+    /// Only this clean shape is accepted: an `AUTO_INCREMENT` column that is the
+    /// table's sole, single-column primary key. Anything else (a non-key
+    /// `AUTO_INCREMENT` column, a composite primary key, or more than one
+    /// `AUTO_INCREMENT` column) is rejected as unsupported.
+    fn apply_auto_increment(
+        columns: &mut [(ast::ColumnDefinition, bool)],
+        constraints: &mut [ast::NamedTableConstraint],
+    ) -> Result<()> {
+        let auto_inc: Vec<&str> = columns
+            .iter()
+            .filter(|(_, ai)| *ai)
+            .map(|(c, _)| c.col_name.as_str())
+            .collect();
+        if auto_inc.is_empty() {
+            return Ok(());
+        }
+        if auto_inc.len() > 1 {
+            return Err(ParseError::Unsupported(
+                "more than one AUTO_INCREMENT column is not supported".to_string(),
+            ));
+        }
+        let ai_name = auto_inc[0].to_string();
+
+        // Find the single-column primary key, whether inline or table-level, and
+        // confirm it is exactly the AUTO_INCREMENT column.
+        let inline_pk: Vec<&str> = columns
+            .iter()
+            .filter(|(c, _)| {
+                c.constraints
+                    .iter()
+                    .any(|nc| matches!(nc.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
+            })
+            .map(|(c, _)| c.col_name.as_str())
+            .collect();
+        let table_pk: Option<&[ast::SortedColumn]> =
+            constraints.iter().find_map(|c| match &c.constraint {
+                ast::TableConstraint::PrimaryKey { columns, .. } => Some(columns.as_slice()),
+                _ => None,
+            });
+
+        let pk_is_ai = match (inline_pk.as_slice(), table_pk) {
+            ([only], None) => only.eq_ignore_ascii_case(&ai_name),
+            ([], Some(cols)) => {
+                cols.len() == 1 && sorted_column_name(&cols[0]).eq_ignore_ascii_case(&ai_name)
+            }
+            _ => false,
+        };
+        if !pk_is_ai {
+            return Err(ParseError::Unsupported(
+                "AUTO_INCREMENT is only supported on a single-column PRIMARY KEY".to_string(),
+            ));
+        }
+
+        // Retype the key column to INTEGER so the engine treats it as a rowid
+        // alias (the only form that auto-assigns).
+        for (col, _) in columns.iter_mut() {
+            if col.col_name.as_str().eq_ignore_ascii_case(&ai_name) {
+                col.col_type = Some(ast::Type {
+                    name: "INTEGER".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                });
+            }
+        }
+
+        // Mark the primary key autoincrement (no id reuse). The inline case is
+        // already handled by `column_constraints`; here we cover the table-level
+        // `PRIMARY KEY (col)` form.
+        for c in constraints.iter_mut() {
+            if let ast::TableConstraint::PrimaryKey { auto_increment, .. } = &mut c.constraint {
+                *auto_increment = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parses a column definition. Returns the definition together with whether
+    /// the column was declared `AUTO_INCREMENT`, which `create_table` needs to
+    /// map onto the engine's rowid-alias autoincrement.
+    fn column_def(&mut self) -> Result<(ast::ColumnDefinition, bool)> {
         let col_name = self.name()?;
         let col_type = self.column_type()?;
-        let constraints = self.column_constraints()?;
-        Ok(ast::ColumnDefinition {
-            col_name,
-            col_type,
-            constraints,
-        })
+        let (constraints, auto_increment) = self.column_constraints()?;
+        Ok((
+            ast::ColumnDefinition {
+                col_name,
+                col_type,
+                constraints,
+            },
+            auto_increment,
+        ))
     }
 
     /// Parses an optional column type: a name, an optional `(size[, scale])`,
@@ -235,8 +331,9 @@ impl Parser {
         }
     }
 
-    /// Parses zero or more inline column constraints.
-    fn column_constraints(&mut self) -> Result<Vec<ast::NamedColumnConstraint>> {
+    /// Parses zero or more inline column constraints. Returns the constraints
+    /// and whether `AUTO_INCREMENT` was declared on the column.
+    fn column_constraints(&mut self) -> Result<(Vec<ast::NamedColumnConstraint>, bool)> {
         let mut out: Vec<ast::NamedColumnConstraint> = Vec::new();
         let mut auto_increment = false;
         let mut primary_key_at = None;
@@ -311,7 +408,7 @@ impl Parser {
                 }
             }
         }
-        Ok(out)
+        Ok((out, auto_increment))
     }
 
     /// Parses a column `DEFAULT` value into a literal expression.
@@ -1432,6 +1529,15 @@ fn is_column_constraint_keyword(word: &str) -> bool {
     )
 }
 
+/// Extracts the column name from a `SortedColumn` whose expression is a plain
+/// column reference — the only form `sorted_column_list` produces.
+fn sorted_column_name(sc: &ast::SortedColumn) -> &str {
+    match sc.expr.as_ref() {
+        ast::Expr::Id(name) => name.as_str(),
+        _ => "",
+    }
+}
+
 /// Functions whose MySQL semantics are identical to SQLite/turso, and are
 /// therefore safe to pass straight through to the engine. `upper_name` must be
 /// already uppercased. Covers the clean scalar set and the clean aggregates
@@ -1515,6 +1621,55 @@ mod tests {
             )
         });
         assert!(has_autoinc);
+        // Retyped to INTEGER so the engine treats it as an auto-assigning rowid alias.
+        assert_eq!(columns[0].col_type.as_ref().unwrap().name, "INTEGER");
+    }
+
+    #[test]
+    fn auto_increment_table_level_pk_maps_to_rowid_alias() {
+        // The WordPress schema shape: AUTO_INCREMENT column, table-level PK.
+        let stmt = parse(
+            "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, name VARCHAR(50), PRIMARY KEY (id))",
+        )
+        .unwrap();
+        let ast::Stmt::CreateTable { body, .. } = stmt else {
+            unreachable!()
+        };
+        let ast::CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            ..
+        } = body
+        else {
+            unreachable!()
+        };
+        // The key column is retyped to INTEGER (a rowid alias on the engine).
+        assert_eq!(columns[0].col_name.as_str(), "id");
+        assert_eq!(columns[0].col_type.as_ref().unwrap().name, "INTEGER");
+        // The table-level primary key is marked autoincrement (no id reuse).
+        assert!(matches!(
+            constraints[0].constraint,
+            ast::TableConstraint::PrimaryKey {
+                auto_increment: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn auto_increment_on_non_key_column_rejected() {
+        assert!(matches!(
+            parse("CREATE TABLE t (id INT AUTO_INCREMENT, name VARCHAR(8))").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn auto_increment_on_composite_primary_key_rejected() {
+        assert!(matches!(
+            parse("CREATE TABLE t (a INT AUTO_INCREMENT, b INT, PRIMARY KEY (a, b))").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]
