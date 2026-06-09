@@ -314,7 +314,7 @@ diverge are deliberately excluded.
 | `/` (division)                         | ❌     | **Excluded** — MySQL float division (`5/2=2.5`) vs SQLite integer division (`5/2=2`). |
 | `%` / `MOD`                            | ❌     | **Excluded** — float modulo differs. |
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
-| `IN (SELECT ...)`                      | ❌     | **Not supported** — subqueries. |
+| `[NOT] IN (SELECT ...)`                | ✅     | Uncorrelated subquery in `IN`/`NOT IN`; evaluates identically. Subqueries elsewhere (FROM, scalar, `EXISTS`) are not yet parsed. |
 
 #### Scalar functions
 

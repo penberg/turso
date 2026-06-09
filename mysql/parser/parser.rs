@@ -791,6 +791,13 @@ impl Parser {
     /// aggregates are supported.
     fn select(&mut self) -> Result<ast::Stmt> {
         // `SELECT` has already been consumed.
+        Ok(ast::Stmt::Select(self.parse_select()?))
+    }
+
+    /// Parses a `SELECT` body (everything after the `SELECT` keyword) into an
+    /// `ast::Select`. Shared by the top-level statement and `IN (SELECT ...)`
+    /// subqueries.
+    fn parse_select(&mut self) -> Result<ast::Select> {
         if self.is_keyword("DISTINCTROW") {
             // MySQL synonym for DISTINCT; not modeled.
             return Err(ParseError::Unsupported(
@@ -834,7 +841,7 @@ impl Parser {
             ));
         }
 
-        Ok(ast::Stmt::Select(ast::Select {
+        Ok(ast::Select {
             with: None,
             body: ast::SelectBody {
                 select: ast::OneSelect::Select {
@@ -849,7 +856,7 @@ impl Parser {
             },
             order_by,
             limit,
-        }))
+        })
     }
 
     fn select_list(&mut self) -> Result<Vec<ast::ResultColumn>> {
@@ -1358,13 +1365,18 @@ impl Parser {
         Ok(ast::Expr::binary(lhs, op, rhs))
     }
 
-    /// `expr [NOT] IN (v1, v2, ...)` — value lists only (not subqueries).
+    /// `expr [NOT] IN (v1, v2, ...)` (a value list) or `expr [NOT] IN (SELECT ...)`
+    /// (an uncorrelated subquery — evaluated identically on both engines).
     fn in_list(&mut self, lhs: ast::Expr, not: bool) -> Result<ast::Expr> {
         self.expect(&Token::LParen, "`(`")?;
-        if self.is_keyword("SELECT") {
-            return Err(ParseError::Unsupported(
-                "IN (SELECT ...) is not supported yet".to_string(),
-            ));
+        if self.eat_keyword("SELECT") {
+            let rhs = self.parse_select()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(ast::Expr::InSelect {
+                lhs: Box::new(lhs),
+                not,
+                rhs,
+            });
         }
         let mut rhs = Vec::new();
         loop {
@@ -2219,6 +2231,51 @@ mod tests {
             unreachable!()
         };
         assert!(matches!(columns[0], ast::ResultColumn::Expr(_, None)));
+    }
+
+    #[test]
+    fn in_subquery() {
+        // `IN (SELECT ...)` parses as an InSelect with the subquery body.
+        let stmt = parse("SELECT id FROM a WHERE id IN (SELECT ref FROM b WHERE x = 1)").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { where_clause, .. } = s.body.select else {
+            unreachable!()
+        };
+        let where_clause = where_clause.unwrap();
+        let ast::Expr::InSelect { not, rhs, .. } = where_clause.as_ref() else {
+            panic!("expected an IN-subquery in WHERE");
+        };
+        assert!(!not);
+        // The subquery itself is a parsed SELECT with a FROM and WHERE.
+        let ast::OneSelect::Select {
+            from, where_clause, ..
+        } = &rhs.body.select
+        else {
+            unreachable!()
+        };
+        assert!(from.is_some());
+        assert!(where_clause.is_some());
+
+        // NOT IN (SELECT ...) carries the negation.
+        let stmt = parse("SELECT id FROM a WHERE id NOT IN (SELECT ref FROM b)").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { where_clause, .. } = s.body.select else {
+            unreachable!()
+        };
+        assert!(matches!(
+            where_clause.unwrap().as_ref(),
+            ast::Expr::InSelect { not: true, .. }
+        ));
+
+        // A plain value list still parses as InList.
+        assert!(matches!(
+            parse_expr("id IN (1, 2, 3)").unwrap(),
+            ast::Expr::InList { .. }
+        ));
     }
 
     #[test]

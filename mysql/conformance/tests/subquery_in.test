@@ -1,0 +1,46 @@
+# Subqueries in IN / NOT IN: `expr [NOT] IN (SELECT ...)`. Uncorrelated
+# subqueries evaluate identically in MySQL and the engine. WordPress's query
+# layer (taxonomy and meta queries) builds these.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic; the subqueries contain no NULLs
+# (the one case where NOT IN's semantics get subtle, though identical on both).
+
+statement ok
+CREATE TABLE IF NOT EXISTS sq_a (id INT PRIMARY KEY, n INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS sq_b (ref INT, tag VARCHAR(8))
+
+statement ok
+INSERT INTO sq_a (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+INSERT INTO sq_b (ref, tag) VALUES (1, 'x'), (3, 'y'), (3, 'z')
+
+# IN (SELECT ...): ids present in sq_b.
+query
+SELECT id FROM sq_a WHERE id IN (SELECT ref FROM sq_b) ORDER BY id
+----
+1
+3
+
+# NOT IN (SELECT ...): ids absent from sq_b.
+query
+SELECT id FROM sq_a WHERE id NOT IN (SELECT ref FROM sq_b) ORDER BY id
+----
+2
+4
+
+# The subquery can have its own WHERE filter.
+query
+SELECT id FROM sq_a WHERE id IN (SELECT ref FROM sq_b WHERE tag = 'y') ORDER BY id
+----
+3
+
+# IN-subquery combined with other predicates.
+query
+SELECT id FROM sq_a WHERE n > 5 AND id IN (SELECT ref FROM sq_b) ORDER BY id
+----
+1
+3
