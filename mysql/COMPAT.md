@@ -265,9 +265,11 @@ incomplete.
 | LOAD XML                               | ❌     |         |
 | Parenthesized Query Expressions        | ❌     |         |
 | REPLACE                                | ❌     |         |
-| SELECT                                 | ❌     | Basic SELECT round-trips via the engine; unverified for MySQL semantics. |
-| SELECT ... INTO                        | ❌     |         |
-| JOIN clause                            | ❌     |         |
+| SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
+| SELECT DISTINCT                        | ❌     | **Not supported.** |
+| SELECT ... INTO                        | ❌     | **Not supported.** |
+| Aggregates / GROUP BY / HAVING         | ❌     | **Not supported.** |
+| JOIN clause                            | ❌     | **Not supported.** |
 | UNION                                  | ❌     |         |
 | INTERSECT / EXCEPT set operations      | ❌     |         |
 | Subqueries                             | ❌     |         |

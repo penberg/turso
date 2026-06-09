@@ -65,13 +65,17 @@ impl Parser {
                 self.advance();
                 self.insert()
             }
+            "SELECT" => {
+                self.advance();
+                self.select()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "SELECT" | "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME"
-            | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "BEGIN" | "START"
-            | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH"
-            | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK"
-            | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD"
-            | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(format!(
+            "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME" | "SET" | "SHOW"
+            | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "BEGIN" | "START" | "COMMIT"
+            | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES"
+            | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE"
+            | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER"
+            | "IMPORT" => Err(ParseError::Unsupported(format!(
                 "{keyword} is not supported yet"
             ))),
             other => Err(ParseError::Unsupported(format!(
@@ -588,6 +592,215 @@ impl Parser {
         })
     }
 
+    // === SELECT ===
+
+    /// Parses a basic single-table `SELECT`:
+    ///
+    /// ```text
+    /// SELECT <list> [FROM <table>] [WHERE <expr>]
+    ///        [ORDER BY <expr> [ASC|DESC], ...] [LIMIT <n> [OFFSET <m>]]
+    /// ```
+    ///
+    /// JOINs, multiple tables, subqueries, `GROUP BY`/`HAVING`, `DISTINCT`,
+    /// aggregates, set operations, and CTEs are rejected as unsupported.
+    fn select(&mut self) -> Result<ast::Stmt> {
+        // `SELECT` has already been consumed.
+        if self.is_keyword("DISTINCT") || self.is_keyword("DISTINCTROW") {
+            return Err(ParseError::Unsupported(
+                "SELECT DISTINCT is not supported yet".to_string(),
+            ));
+        }
+        self.eat_keyword("ALL"); // the default quantifier; accepted and ignored
+
+        let columns = self.select_list()?;
+
+        let from = if self.eat_keyword("FROM") {
+            Some(self.from_single_table()?)
+        } else {
+            None
+        };
+
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+
+        if self.is_keyword("GROUP") {
+            return Err(ParseError::Unsupported(
+                "GROUP BY is not supported yet".to_string(),
+            ));
+        }
+        if self.is_keyword("HAVING") {
+            return Err(ParseError::Unsupported(
+                "HAVING is not supported yet".to_string(),
+            ));
+        }
+
+        let order_by = self.order_by()?;
+        let limit = self.limit()?;
+
+        if self.is_keyword("UNION") || self.is_keyword("INTERSECT") || self.is_keyword("EXCEPT") {
+            return Err(ParseError::Unsupported(
+                "set operations (UNION/INTERSECT/EXCEPT) are not supported yet".to_string(),
+            ));
+        }
+        if self.is_keyword("INTO") {
+            return Err(ParseError::Unsupported(
+                "SELECT ... INTO is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Stmt::Select(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns,
+                    from,
+                    where_clause,
+                    group_by: None,
+                    window_clause: Vec::new(),
+                },
+                compounds: Vec::new(),
+            },
+            order_by,
+            limit,
+        }))
+    }
+
+    fn select_list(&mut self) -> Result<Vec<ast::ResultColumn>> {
+        let mut columns = Vec::new();
+        loop {
+            if self.eat(&Token::Star) {
+                columns.push(ast::ResultColumn::Star);
+            } else if matches!(
+                self.peek(),
+                Some(Token::Word(_)) | Some(Token::QuotedIdent(_))
+            ) && self.peek_nth(1) == Some(&Token::Dot)
+                && self.peek_nth(2) == Some(&Token::Star)
+            {
+                // `tbl.*`
+                let name = self.name()?;
+                self.advance(); // `.`
+                self.advance(); // `*`
+                columns.push(ast::ResultColumn::TableStar(name));
+            } else {
+                let expr = self.expr()?;
+                let alias = if self.eat_keyword("AS") {
+                    Some(ast::As::As(self.name()?))
+                } else {
+                    None
+                };
+                columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
+            }
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(columns)
+    }
+
+    /// Parses the `FROM` clause, restricted to a single table reference.
+    fn from_single_table(&mut self) -> Result<ast::FromClause> {
+        if self.is(&Token::LParen) {
+            return Err(ParseError::Unsupported(
+                "SELECT from a subquery / derived table is not supported yet".to_string(),
+            ));
+        }
+        let tbl_name = self.qualified_name()?;
+        let alias = if self.eat_keyword("AS") {
+            Some(ast::As::As(self.name()?))
+        } else {
+            None
+        };
+
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "SELECT from multiple tables (comma join) is not supported yet".to_string(),
+            ));
+        }
+        for join_kw in [
+            "JOIN",
+            "INNER",
+            "LEFT",
+            "RIGHT",
+            "FULL",
+            "CROSS",
+            "NATURAL",
+            "STRAIGHT_JOIN",
+        ] {
+            if self.is_keyword(join_kw) {
+                return Err(ParseError::Unsupported(
+                    "SELECT with JOIN is not supported yet".to_string(),
+                ));
+            }
+        }
+
+        Ok(ast::FromClause {
+            select: Box::new(ast::SelectTable::Table(tbl_name, alias, None)),
+            joins: Vec::new(),
+        })
+    }
+
+
+    /// Parses an optional `ORDER BY` clause (shared by SELECT). Returns an empty
+    /// vec when absent.
+    fn order_by(&mut self) -> Result<Vec<ast::SortedColumn>> {
+        let mut order_by = Vec::new();
+        if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            loop {
+                let expr = self.expr()?;
+                let order = if self.eat_keyword("ASC") {
+                    Some(ast::SortOrder::Asc)
+                } else if self.eat_keyword("DESC") {
+                    Some(ast::SortOrder::Desc)
+                } else {
+                    None
+                };
+                order_by.push(ast::SortedColumn {
+                    expr: Box::new(expr),
+                    order,
+                    nulls: None,
+                });
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        Ok(order_by)
+    }
+
+    /// Parses an optional `LIMIT` clause, handling both MySQL spellings:
+    /// `LIMIT count`, `LIMIT offset, count`, and `LIMIT count OFFSET offset`.
+    fn limit(&mut self) -> Result<Option<ast::Limit>> {
+        if !self.eat_keyword("LIMIT") {
+            return Ok(None);
+        }
+        let first = self.expr()?;
+        if self.eat(&Token::Comma) {
+            let count = self.expr()?;
+            Ok(Some(ast::Limit {
+                expr: Box::new(count),
+                offset: Some(Box::new(first)),
+            }))
+        } else if self.eat_keyword("OFFSET") {
+            let offset = self.expr()?;
+            Ok(Some(ast::Limit {
+                expr: Box::new(first),
+                offset: Some(Box::new(offset)),
+            }))
+        } else {
+            Ok(Some(ast::Limit {
+                expr: Box::new(first),
+                offset: None,
+            }))
+        }
+    }
+
     // === Expressions ===
     //
     // A small expression grammar for WHERE predicates, INSERT values, and
@@ -806,6 +1019,9 @@ impl Parser {
         self.tokens.get(self.pos).map(|(t, _)| t)
     }
 
+    fn peek_nth(&self, n: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + n).map(|(t, _)| t)
+    }
 
     fn offset(&self) -> usize {
         self.tokens.get(self.pos).map_or(self.eof, |(_, o)| *o)
@@ -994,6 +1210,101 @@ mod tests {
         };
         assert_eq!(columns.len(), 2);
         assert_eq!(constraints.len(), 1);
+    }
+
+    #[test]
+    fn select_star_from_table() {
+        let stmt = parse("SELECT * FROM users").unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { columns, from, .. } = select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert_eq!(columns.len(), 1);
+        assert!(matches!(columns[0], ast::ResultColumn::Star));
+        assert!(from.is_some());
+    }
+
+    #[test]
+    fn select_constant_without_from() {
+        let stmt = parse("SELECT 1").unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { from, .. } = select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert!(from.is_none());
+    }
+
+    #[test]
+    fn select_columns_where_order_limit() {
+        let stmt =
+            parse("SELECT id, name AS who FROM users WHERE age >= 18 ORDER BY id DESC LIMIT 5")
+                .unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].order, Some(ast::SortOrder::Desc));
+        assert!(select.limit.is_some());
+        let ast::OneSelect::Select {
+            columns,
+            where_clause,
+            ..
+        } = select.body.select
+        else {
+            panic!("expected OneSelect::Select");
+        };
+        assert_eq!(columns.len(), 2);
+        assert!(where_clause.is_some());
+    }
+
+    #[test]
+    fn select_limit_offset_forms() {
+        // `LIMIT count OFFSET offset`
+        let a = parse("SELECT * FROM t LIMIT 10 OFFSET 5").unwrap();
+        // `LIMIT offset, count`
+        let b = parse("SELECT * FROM t LIMIT 5, 10").unwrap();
+        for stmt in [a, b] {
+            let ast::Stmt::Select(select) = stmt else {
+                unreachable!()
+            };
+            let limit = select.limit.unwrap();
+            assert!(limit.offset.is_some());
+        }
+    }
+
+    #[test]
+    fn select_renders_back_to_sql() {
+        let sql = parse("SELECT id, name FROM users WHERE id = 1 ORDER BY id LIMIT 2")
+            .unwrap()
+            .to_string();
+        let upper = sql.to_uppercase();
+        assert!(upper.contains("SELECT") && upper.contains("FROM"), "{sql}");
+        assert!(
+            upper.contains("WHERE") && upper.contains("ORDER BY"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn select_unsupported_variants() {
+        for sql in [
+            "SELECT DISTINCT a FROM t",
+            "SELECT * FROM a, b",
+            "SELECT * FROM a JOIN b ON a.id = b.id",
+            "SELECT * FROM (SELECT 1)",
+            "SELECT a FROM t GROUP BY a",
+            "SELECT a FROM t HAVING a > 1",
+            "SELECT * FROM a UNION SELECT * FROM b",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
     }
 
     #[test]
@@ -1239,11 +1550,5 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
-    }
-
-    #[test]
-    fn select_is_unsupported() {
-        let err = parse("SELECT * FROM foo").unwrap_err();
-        assert!(matches!(err, ParseError::Unsupported(_)), "{err:?}");
     }
 }

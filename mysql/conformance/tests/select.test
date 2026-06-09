@@ -1,0 +1,84 @@
+# SELECT conformance — basic single-table form.
+#
+# Implemented by the Turso front-end, so this file is expected to pass against
+# both `turso-mysql-server` and a real mysqld. This is where the suite gains
+# teeth: `query` blocks compare returned rows exactly, which also retroactively
+# verifies INSERT. Only the basic form is supported (single table, WHERE,
+# ORDER BY, LIMIT); JOINs, subqueries, GROUP BY/HAVING, DISTINCT, aggregates,
+# and set operations are not (see mysql/COMPAT.md).
+#
+# Rows are tab-separated; NULL renders as the literal NULL. Every table query
+# uses ORDER BY for deterministic comparison. Uses its own table name to avoid
+# colliding with other files in the shared database.
+
+# Constant selects need no table and verify the literal/expression path.
+query
+SELECT 1
+----
+1
+
+query
+SELECT 'hello'
+----
+hello
+
+# Set up data, then read it back.
+statement ok
+CREATE TABLE IF NOT EXISTS select_demo (id INT PRIMARY KEY, name VARCHAR(32), age INT)
+
+statement ok
+INSERT INTO select_demo (id, name, age) VALUES (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 35), (4, 'dave', 25)
+
+# SELECT * returns all columns in declaration order.
+query
+SELECT * FROM select_demo ORDER BY id
+----
+1	alice	30
+2	bob	25
+3	carol	35
+4	dave	25
+
+# Projection with an explicit column list.
+query
+SELECT name, age FROM select_demo ORDER BY id
+----
+alice	30
+bob	25
+carol	35
+dave	25
+
+# WHERE with a comparison.
+query
+SELECT name FROM select_demo WHERE age >= 30 ORDER BY name
+----
+alice
+carol
+
+# WHERE with AND.
+query
+SELECT id FROM select_demo WHERE age = 25 AND id > 2 ORDER BY id
+----
+4
+
+# ORDER BY DESC.
+query
+SELECT id FROM select_demo ORDER BY id DESC
+----
+4
+3
+2
+1
+
+# LIMIT.
+query
+SELECT id FROM select_demo ORDER BY id LIMIT 2
+----
+1
+2
+
+# LIMIT with OFFSET.
+query
+SELECT id FROM select_demo ORDER BY id LIMIT 2 OFFSET 1
+----
+2
+3

@@ -19,8 +19,11 @@
 //! let stmt = parse("DROP TABLE t").unwrap();
 //! assert!(matches!(stmt, ast::Stmt::DropTable { .. }));
 //!
+//! let stmt = parse("SELECT id FROM users WHERE id = 1").unwrap();
+//! assert!(matches!(stmt, ast::Stmt::Select(_)));
+//!
 //! // Unsupported statements (and sub-clauses) are reported, not forwarded.
-//! assert!(parse("SELECT 1").is_err());
+//! assert!(parse("SELECT DISTINCT a FROM t").is_err());
 //! assert!(parse("DROP TABLE IF EXISTS t").is_err());
 //! ```
 
