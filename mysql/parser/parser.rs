@@ -966,7 +966,9 @@ impl Parser {
     }
 
     fn comparison_expr(&mut self) -> Result<ast::Expr> {
-        let lhs = self.primary_expr()?;
+        let lhs = self.additive_expr()?;
+
+        // `IS [NOT] NULL`
         if self.eat_keyword("IS") {
             let not = self.eat_keyword("NOT");
             self.expect_keyword("NULL")?;
@@ -976,6 +978,30 @@ impl Parser {
                 ast::Expr::is_null(lhs)
             });
         }
+
+        // Infix `[NOT] IN / BETWEEN / LIKE`. At this point any prefix `NOT` has
+        // already been consumed by `not_expr`, so a `NOT` here is infix.
+        let not = self.eat_keyword("NOT");
+        if self.eat_keyword("IN") {
+            return self.in_list(lhs, not);
+        }
+        if self.eat_keyword("BETWEEN") {
+            return self.between(lhs, not);
+        }
+        if self.eat_keyword("LIKE") {
+            let rhs = self.additive_expr()?;
+            return Ok(ast::Expr::like(
+                lhs,
+                not,
+                ast::LikeOperator::Like,
+                rhs,
+                None,
+            ));
+        }
+        if not {
+            return Err(self.unexpected("`IN`, `BETWEEN`, or `LIKE` after `NOT`"));
+        }
+
         let op = match self.peek() {
             Some(Token::Eq) => ast::Operator::Equals,
             Some(Token::Ne) => ast::Operator::NotEquals,
@@ -986,13 +1012,76 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.advance();
-        let rhs = self.primary_expr()?;
+        let rhs = self.additive_expr()?;
         Ok(ast::Expr::binary(lhs, op, rhs))
     }
 
+    /// `expr [NOT] IN (v1, v2, ...)` — value lists only (not subqueries).
+    fn in_list(&mut self, lhs: ast::Expr, not: bool) -> Result<ast::Expr> {
+        self.expect(&Token::LParen, "`(`")?;
+        if self.is_keyword("SELECT") {
+            return Err(ParseError::Unsupported(
+                "IN (SELECT ...) is not supported yet".to_string(),
+            ));
+        }
+        let mut rhs = Vec::new();
+        loop {
+            rhs.push(Box::new(self.expr()?));
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::InList {
+            lhs: Box::new(lhs),
+            not,
+            rhs,
+        })
+    }
 
+    /// `expr [NOT] BETWEEN a AND b`. The bounds are additive expressions so the
+    /// `AND` separator is not swallowed by the logical-AND layer.
+    fn between(&mut self, lhs: ast::Expr, not: bool) -> Result<ast::Expr> {
+        let start = self.additive_expr()?;
+        self.expect_keyword("AND")?;
+        let end = self.additive_expr()?;
+        Ok(ast::Expr::Between {
+            lhs: Box::new(lhs),
+            not,
+            start: Box::new(start),
+            end: Box::new(end),
+        })
+    }
 
+    /// Additive tier: `+` and `-`, left-associative.
+    fn additive_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.multiplicative_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Plus) => ast::Operator::Add,
+                Some(Token::Minus) => ast::Operator::Subtract,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.multiplicative_expr()?;
+            lhs = ast::Expr::binary(lhs, op, rhs);
+        }
+        Ok(lhs)
+    }
 
+    /// Multiplicative tier: `*` only. `/` and `%` are intentionally not parsed —
+    /// their MySQL semantics differ from SQLite (float division, float modulo),
+    /// so they produce a clean parse error rather than a wrong answer.
+    fn multiplicative_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.primary_expr()?;
+        while self.is(&Token::Star) {
+            self.advance();
+            let rhs = self.primary_expr()?;
+            lhs = ast::Expr::binary(lhs, ast::Operator::Multiply, rhs);
+        }
+        Ok(lhs)
+    }
 
     fn primary_expr(&mut self) -> Result<ast::Expr> {
         match self.peek() {
@@ -1651,14 +1740,83 @@ mod tests {
 
     #[test]
     fn expr_unsupported_forms_are_not_fully_parsed() {
-        // Function calls, IN, LIKE, BETWEEN are not part of the grammar yet:
-        // they either fail outright or leave unconsumed input (which statement
-        // parsers turn into a syntax error).
-        for input in ["f(x)", "a IN (1, 2)", "a LIKE 'x%'", "a BETWEEN 1 AND 2"] {
+        // Function calls are not part of the grammar yet (Step 2), and the
+        // divergent operators `/`, `%`, `||` are intentionally not parsed.
+        for input in ["f(x)", "a / b", "a % b", "a || b"] {
             let mut p = Parser::new(input.as_bytes()).unwrap();
             let fully_parsed = p.expr().is_ok() && p.peek().is_none();
             assert!(!fully_parsed, "expected `{input}` to be rejected");
         }
+    }
+
+    #[test]
+    fn expr_arithmetic_precedence() {
+        // `*` binds tighter than `+`, both tighter than comparison.
+        let expr = parse_expr("a + b * 2 = 10").unwrap();
+        let expected = ast::Expr::binary(
+            ast::Expr::binary(
+                col("a"),
+                ast::Operator::Add,
+                ast::Expr::binary(col("b"), ast::Operator::Multiply, num("2")),
+            ),
+            ast::Operator::Equals,
+            num("10"),
+        );
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn expr_in_list() {
+        let expr = parse_expr("id IN (1, 2, 3)").unwrap();
+        let ast::Expr::InList { lhs, not, rhs } = expr else {
+            panic!("expected InList");
+        };
+        assert_eq!(*lhs, col("id"));
+        assert!(!not);
+        assert_eq!(rhs.len(), 3);
+
+        // `NOT IN`
+        let ast::Expr::InList { not, .. } = parse_expr("id NOT IN (1)").unwrap() else {
+            panic!("expected InList");
+        };
+        assert!(not);
+    }
+
+    #[test]
+    fn expr_between() {
+        let expr = parse_expr("age BETWEEN 18 AND 65").unwrap();
+        let ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } = expr
+        else {
+            panic!("expected Between");
+        };
+        assert_eq!(*lhs, col("age"));
+        assert!(!not);
+        assert_eq!(*start, num("18"));
+        assert_eq!(*end, num("65"));
+
+        // BETWEEN's AND is not swallowed by the logical AND.
+        let outer = parse_expr("age BETWEEN 1 AND 10 AND id = 2").unwrap();
+        assert!(matches!(outer, ast::Expr::Binary(_, ast::Operator::And, _)));
+    }
+
+    #[test]
+    fn expr_like() {
+        let expr = parse_expr("name LIKE 'a%'").unwrap();
+        let ast::Expr::Like { lhs, not, .. } = expr else {
+            panic!("expected Like");
+        };
+        assert_eq!(*lhs, col("name"));
+        assert!(!not);
+
+        let ast::Expr::Like { not, .. } = parse_expr("name NOT LIKE 'a%'").unwrap() else {
+            panic!("expected Like");
+        };
+        assert!(not);
     }
 
     #[test]

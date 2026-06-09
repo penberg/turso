@@ -281,6 +281,27 @@ incomplete.
 | VALUES statement                       | ❌     |         |
 | WITH (Common Table Expressions)        | ❌     |         |
 
+### Expressions and operators
+
+Only constructs whose MySQL semantics are identical to SQLite/turso are
+implemented — each is proven by the dual-target conformance suite (it passes
+against both real MySQL and the engine). Constructs that look similar but
+diverge are deliberately excluded.
+
+| Construct                              | Status | Comment |
+|----------------------------------------|--------|---------|
+| Comparisons `= <> != < <= > >=`        | ✅     |         |
+| `AND` / `OR` / `NOT`, parentheses      | ✅     |         |
+| `IS [NOT] NULL`                        | ✅     |         |
+| Arithmetic `+` `-` `*`                 | ✅     |         |
+| `[NOT] IN (value list)`                | ✅     |         |
+| `[NOT] BETWEEN a AND b`                | ✅     |         |
+| `[NOT] LIKE` (ASCII patterns)          | ✅     |         |
+| `/` (division)                         | ❌     | **Excluded** — MySQL float division (`5/2=2.5`) vs SQLite integer division (`5/2=2`). |
+| `%` / `MOD`                            | ❌     | **Excluded** — float modulo differs. |
+| `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
+| `IN (SELECT ...)`                      | ❌     | **Not supported** — subqueries. |
+
 ### Transactional and Locking Statements
 
 | Statement                                       | Status | Comment |
