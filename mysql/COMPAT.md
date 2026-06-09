@@ -309,6 +309,7 @@ diverge are deliberately excluded.
 | `[NOT] IN (value list)`                | ✅     |         |
 | `[NOT] BETWEEN a AND b`                | ✅     |         |
 | `[NOT] LIKE` (ASCII patterns)          | ✅     |         |
+| `CASE` (searched and simple forms)     | ✅     | `CASE WHEN ... THEN ... [ELSE ...] END` and `CASE expr WHEN ... END`; standard SQL, identical. |
 | `/` (division)                         | ❌     | **Excluded** — MySQL float division (`5/2=2.5`) vs SQLite integer division (`5/2=2`). |
 | `%` / `MOD`                            | ❌     | **Excluded** — float modulo differs. |
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |

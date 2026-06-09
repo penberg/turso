@@ -1458,6 +1458,10 @@ impl Parser {
                         self.advance();
                         Ok(ast::Expr::Literal(ast::Literal::False))
                     }
+                    "CASE" => {
+                        self.advance();
+                        self.case_expr()
+                    }
                     // A bare identifier followed by `(` is a function call;
                     // otherwise it is a column reference.
                     _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
@@ -1467,6 +1471,43 @@ impl Parser {
             Some(Token::QuotedIdent(_)) => self.column_ref(),
             _ => Err(self.unexpected("an expression")),
         }
+    }
+
+    /// Parses a `CASE` expression — both the searched form
+    /// (`CASE WHEN cond THEN result ... [ELSE result] END`) and the simple form
+    /// (`CASE operand WHEN value THEN result ... [ELSE result] END`). Standard
+    /// SQL, evaluated identically by the engine. `CASE` has already been consumed.
+    fn case_expr(&mut self) -> Result<ast::Expr> {
+        // A simple `CASE operand WHEN ...` has an operand before the first WHEN.
+        let base = if self.is_keyword("WHEN") {
+            None
+        } else {
+            Some(Box::new(self.expr()?))
+        };
+
+        let mut when_then_pairs = Vec::new();
+        while self.eat_keyword("WHEN") {
+            let when = self.expr()?;
+            self.expect_keyword("THEN")?;
+            let then = self.expr()?;
+            when_then_pairs.push((Box::new(when), Box::new(then)));
+        }
+        if when_then_pairs.is_empty() {
+            return Err(self.unexpected("`WHEN ... THEN ...`"));
+        }
+
+        let else_expr = if self.eat_keyword("ELSE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword("END")?;
+
+        Ok(ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        })
     }
 
     /// Parses a function call `name(arg, ...)`. The name must be in the clean
@@ -2575,6 +2616,38 @@ mod tests {
             parse_expr("COUNT(DISTINCT *)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn case_expression_forms() {
+        // Searched CASE: no base operand, two WHEN/THEN, an ELSE.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("CASE WHEN a = 1 THEN 'x' WHEN a = 2 THEN 'y' ELSE 'z' END").unwrap()
+        else {
+            panic!("expected Case");
+        };
+        assert!(base.is_none());
+        assert_eq!(when_then_pairs.len(), 2);
+        assert!(else_expr.is_some());
+
+        // Simple CASE: a base operand, one WHEN/THEN, no ELSE.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("CASE status WHEN 'publish' THEN 1 END").unwrap()
+        else {
+            panic!("expected Case");
+        };
+        assert!(base.is_some());
+        assert_eq!(when_then_pairs.len(), 1);
+        assert!(else_expr.is_none());
+
+        // A CASE with no WHEN is an error.
+        assert!(parse_expr("CASE END").is_err());
     }
 
     #[test]

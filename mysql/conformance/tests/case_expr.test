@@ -1,0 +1,57 @@
+# CASE expressions — searched (`CASE WHEN ... THEN ...`) and simple
+# (`CASE expr WHEN value THEN ...`) forms. Standard SQL, evaluated identically by
+# MySQL and the engine.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Result
+# values are kept type-homogeneous so the text output matches; every query is
+# ORDER BY-deterministic.
+
+statement ok
+CREATE TABLE IF NOT EXISTS casetab (id INT PRIMARY KEY, status VARCHAR(16), n INT)
+
+statement ok
+INSERT INTO casetab (id, status, n) VALUES (1, 'draft', 5), (2, 'publish', 10), (3, 'trash', 0), (4, 'publish', 20)
+
+# Searched CASE with WHEN/ELSE in the select list.
+query
+SELECT id, CASE WHEN status = 'publish' THEN 'live' WHEN status = 'draft' THEN 'pending' ELSE 'other' END FROM casetab ORDER BY id
+----
+1	pending
+2	live
+3	other
+4	live
+
+# Simple CASE (CASE <expr> WHEN value ...).
+query
+SELECT id, CASE status WHEN 'publish' THEN 1 ELSE 0 END FROM casetab ORDER BY id
+----
+1	0
+2	1
+3	0
+4	1
+
+# CASE with no ELSE yields NULL when nothing matches.
+query
+SELECT id, CASE WHEN n > 10 THEN 'big' END FROM casetab ORDER BY id
+----
+1	NULL
+2	NULL
+3	NULL
+4	big
+
+# CASE in ORDER BY (custom ordering: publish first).
+query
+SELECT status FROM casetab ORDER BY CASE status WHEN 'publish' THEN 0 ELSE 1 END, id
+----
+publish
+publish
+draft
+trash
+
+# CASE in WHERE.
+query
+SELECT id FROM casetab WHERE CASE WHEN n = 0 THEN 0 ELSE 1 END = 1 ORDER BY id
+----
+1
+2
+4
