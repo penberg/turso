@@ -235,7 +235,7 @@ incomplete.
 | DROP SERVER                            | ❌     |         |
 | DROP SPATIAL REFERENCE SYSTEM          | ❌     |         |
 | DROP TABLE *tbl_name* (single table)   | ✅     |         |
-| DROP TABLE ... IF EXISTS               | ❌     | **Not supported** — rejected as unsupported. |
+| DROP TABLE ... IF EXISTS               | ✅     | Dropping a non-existent table is a no-op success, as in MySQL. |
 | DROP TEMPORARY TABLE                   | ❌     | **Not supported** — rejected as unsupported. |
 | DROP TABLE *t1, t2, ...* (multiple)    | ❌     | **Not supported** — only a single table per statement. |
 | DROP TABLE ... RESTRICT / CASCADE      | ❌     | **Not supported** — rejected as unsupported (no-ops in MySQL). |

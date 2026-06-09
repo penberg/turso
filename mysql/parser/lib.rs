@@ -16,15 +16,14 @@
 //! let stmt = parse("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(80))").unwrap();
 //! assert!(matches!(stmt, ast::Stmt::CreateTable { .. }));
 //!
-//! let stmt = parse("DROP TABLE t").unwrap();
-//! assert!(matches!(stmt, ast::Stmt::DropTable { .. }));
+//! let stmt = parse("DROP TABLE IF EXISTS t").unwrap();
+//! assert!(matches!(stmt, ast::Stmt::DropTable { if_exists: true, .. }));
 //!
 //! let stmt = parse("SELECT id FROM users WHERE id = 1").unwrap();
 //! assert!(matches!(stmt, ast::Stmt::Select(_)));
 //!
 //! // Unsupported statements (and sub-clauses) are reported, not forwarded.
 //! assert!(parse("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id").is_err());
-//! assert!(parse("DROP TABLE IF EXISTS t").is_err());
 //! ```
 
 pub mod error;

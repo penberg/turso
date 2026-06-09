@@ -474,16 +474,18 @@ impl Parser {
         }
     }
 
-    /// Parses the basic `DROP TABLE tbl_name` form. The `IF EXISTS`,
-    /// `TEMPORARY`, multi-table, and `RESTRICT`/`CASCADE` variants are
+    /// Parses the `DROP TABLE [IF EXISTS] tbl_name` form. With `IF EXISTS`,
+    /// dropping a non-existent table is a no-op success, matching MySQL. The
+    /// `TEMPORARY`, multi-table, and `RESTRICT`/`CASCADE` variants are still
     /// explicitly rejected as unsupported.
     fn drop_table(&mut self) -> Result<ast::Stmt> {
         // `DROP TABLE` has already been consumed.
-        if self.is_keyword("IF") {
-            return Err(ParseError::Unsupported(
-                "DROP TABLE IF EXISTS is not supported yet".to_string(),
-            ));
-        }
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
 
         let tbl_name = self.qualified_name()?;
 
@@ -499,7 +501,7 @@ impl Parser {
         }
 
         Ok(ast::Stmt::DropTable {
-            if_exists: false,
+            if_exists,
             tbl_name,
         })
     }
@@ -707,6 +709,9 @@ impl Parser {
     }
 
     /// Parses the `FROM` clause, restricted to a single table reference.
+    // Not a constructor: the `from_` prefix names the SQL `FROM` clause, so the
+    // `wrong_self_convention` heuristic does not apply here.
+    #[allow(clippy::wrong_self_convention)]
     fn from_single_table(&mut self) -> Result<ast::FromClause> {
         if self.is(&Token::LParen) {
             return Err(ParseError::Unsupported(
@@ -1788,6 +1793,26 @@ mod tests {
     }
 
     #[test]
+    fn drop_table_if_exists() {
+        let stmt = parse("DROP TABLE IF EXISTS users").unwrap();
+        let ast::Stmt::DropTable {
+            if_exists,
+            tbl_name,
+        } = stmt
+        else {
+            panic!("expected DropTable");
+        };
+        assert!(if_exists);
+        assert_eq!(tbl_name.name.as_str(), "users");
+    }
+
+    #[test]
+    fn drop_table_if_without_exists_is_error() {
+        // `IF` not followed by `EXISTS` is a syntax error, not a silent accept.
+        assert!(parse("DROP TABLE IF users").is_err());
+    }
+
+    #[test]
     fn drop_table_qualified_and_quoted() {
         let stmt = parse("DROP TABLE `mydb`.`t`").unwrap();
         let ast::Stmt::DropTable { tbl_name, .. } = stmt else {
@@ -2121,7 +2146,6 @@ mod tests {
     #[test]
     fn drop_table_unsupported_variants() {
         for sql in [
-            "DROP TABLE IF EXISTS t",
             "DROP TEMPORARY TABLE t",
             "DROP TABLE a, b",
             "DROP TABLE t RESTRICT",
