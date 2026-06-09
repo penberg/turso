@@ -267,9 +267,9 @@ incomplete.
 | Parenthesized Query Expressions        | ❌     |         |
 | REPLACE                                | ❌     |         |
 | SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
+| SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
 | SELECT DISTINCT                        | ❌     | **Not supported.** |
 | SELECT ... INTO                        | ❌     | **Not supported.** |
-| Aggregates / GROUP BY / HAVING         | ❌     | **Not supported.** |
 | JOIN clause                            | ❌     | **Not supported.** |
 | UNION                                  | ❌     |         |
 | INTERSECT / EXCEPT set operations      | ❌     |         |
@@ -314,6 +314,10 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `IFNULL`                               | ✅     |         |
 | `ABS`                                  | ✅     |         |
 | `LOWER` / `UPPER`                      | ✅     | ASCII case folding. |
+| `COUNT(*)` / `COUNT(expr)`             | ✅     | aggregate |
+| `SUM` / `MIN` / `MAX`                  | ✅     | aggregate |
+| `AVG`                                  | ❌     | **Excluded** — MySQL returns DECIMAL padded to 4 places; SQLite returns a plain float (text differs). |
+| `GROUP_CONCAT`                         | ❌     | **Excluded** — separator / `ORDER BY` syntax differs. |
 | `CONCAT`                               | ❌     | **Excluded** — MySQL returns NULL if any arg is NULL; SQLite ignores NULLs. |
 | `LENGTH`                               | ❌     | **Excluded** — MySQL counts bytes; SQLite counts characters. |
 | `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |

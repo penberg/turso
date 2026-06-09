@@ -633,16 +633,7 @@ impl Parser {
             None
         };
 
-        if self.is_keyword("GROUP") {
-            return Err(ParseError::Unsupported(
-                "GROUP BY is not supported yet".to_string(),
-            ));
-        }
-        if self.is_keyword("HAVING") {
-            return Err(ParseError::Unsupported(
-                "HAVING is not supported yet".to_string(),
-            ));
-        }
+        let group_by = self.group_by()?;
 
         let order_by = self.order_by()?;
         let limit = self.limit()?;
@@ -666,7 +657,7 @@ impl Parser {
                     columns,
                     from,
                     where_clause,
-                    group_by: None,
+                    group_by,
                     window_clause: Vec::new(),
                 },
                 compounds: Vec::new(),
@@ -751,6 +742,39 @@ impl Parser {
         })
     }
 
+    /// Parses an optional `GROUP BY [HAVING]` clause.
+    ///
+    /// GROUP BY terms must be column expressions, not integer ordinals: MySQL
+    /// treats `GROUP BY 1` as "the first output column", but SQLite treats it as
+    /// the constant `1` (one group) — a divergence, so ordinals are rejected.
+    /// `HAVING` is only accepted together with `GROUP BY`.
+    fn group_by(&mut self) -> Result<Option<ast::GroupBy>> {
+        if !self.eat_keyword("GROUP") {
+            return Ok(None);
+        }
+        self.expect_keyword("BY")?;
+        let mut exprs = Vec::new();
+        loop {
+            let expr = self.expr()?;
+            if matches!(expr, ast::Expr::Literal(ast::Literal::Numeric(_))) {
+                return Err(ParseError::Unsupported(
+                    "GROUP BY with a column ordinal is not supported (use a column name)"
+                        .to_string(),
+                ));
+            }
+            exprs.push(Box::new(expr));
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        let having = if self.eat_keyword("HAVING") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        Ok(Some(ast::GroupBy { exprs, having }))
+    }
 
     /// Parses an optional `ORDER BY` clause (shared by SELECT). Returns an empty
     /// vec when absent.
@@ -1153,6 +1177,24 @@ impl Parser {
             )));
         }
 
+        // `COUNT(*)` is the only star form.
+        if self.is(&Token::Star) {
+            if upper != "COUNT" {
+                return Err(ParseError::Unsupported(format!(
+                    "{upper}(*) is not supported"
+                )));
+            }
+            self.advance();
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(ast::Expr::FunctionCallStar {
+                name,
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        }
+
         let mut args = Vec::new();
         if !self.is(&Token::RParen) {
             loop {
@@ -1381,11 +1423,15 @@ fn is_column_constraint_keyword(word: &str) -> bool {
 
 /// Functions whose MySQL semantics are identical to SQLite/turso, and are
 /// therefore safe to pass straight through to the engine. `upper_name` must be
-/// already uppercased. (Aggregate functions are added in a later step.)
+/// already uppercased. Covers the clean scalar set and the clean aggregates
+/// (`AVG` is excluded — its DECIMAL formatting diverges).
 fn is_supported_function(upper_name: &str) -> bool {
     matches!(
         upper_name,
+        // Scalar functions.
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
+        // Aggregate functions.
+        | "COUNT" | "SUM" | "MIN" | "MAX"
     )
 }
 
@@ -1562,8 +1608,7 @@ mod tests {
             "SELECT * FROM a, b",
             "SELECT * FROM a JOIN b ON a.id = b.id",
             "SELECT * FROM (SELECT 1)",
-            "SELECT a FROM t GROUP BY a",
-            "SELECT a FROM t HAVING a > 1",
+            "SELECT a FROM t GROUP BY 1",
             "SELECT * FROM a UNION SELECT * FROM b",
         ] {
             assert!(
@@ -1571,6 +1616,62 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn aggregate_count_star() {
+        let stmt = parse("SELECT COUNT(*) FROM t").unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { columns, .. } = select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected an expression column");
+        };
+        assert!(matches!(**expr, ast::Expr::FunctionCallStar { .. }));
+    }
+
+    #[test]
+    fn aggregates_with_group_by_and_having() {
+        let stmt = parse(
+            "SELECT cat, COUNT(*), SUM(n) FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat",
+        )
+        .unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { group_by, .. } = select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        let group_by = group_by.expect("expected GROUP BY");
+        assert_eq!(group_by.exprs.len(), 1);
+        assert!(group_by.having.is_some());
+    }
+
+    #[test]
+    fn aggregate_min_max_sum_parse() {
+        for sql in [
+            "SELECT MIN(a) FROM t",
+            "SELECT MAX(a) FROM t",
+            "SELECT SUM(a) FROM t",
+        ] {
+            assert!(matches!(parse(sql).unwrap(), ast::Stmt::Select(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn avg_and_group_by_ordinal_are_unsupported() {
+        // AVG diverges (DECIMAL formatting); GROUP BY ordinal diverges.
+        assert!(matches!(
+            parse("SELECT AVG(a) FROM t").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("SELECT a FROM t GROUP BY 1").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]

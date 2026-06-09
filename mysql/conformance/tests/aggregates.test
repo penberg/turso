@@ -1,0 +1,57 @@
+# Aggregate + GROUP BY / HAVING conformance.
+#
+# COUNT / SUM / MIN / MAX over integers, plus GROUP BY and HAVING, have
+# identical MySQL and SQLite/turso semantics, so this file must pass against
+# both `turso-mysql-server` and a real mysqld. AVG is excluded (its DECIMAL
+# formatting diverges). Integer columns are used so SUM renders identically;
+# every grouped query uses ORDER BY for determinism.
+
+statement ok
+CREATE TABLE IF NOT EXISTS agg_demo (id INT PRIMARY KEY, cat VARCHAR(8), n INT)
+
+statement ok
+INSERT INTO agg_demo (id, cat, n) VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'b', 5), (5, 'c', 7)
+
+# Whole-table aggregates (no GROUP BY).
+query
+SELECT COUNT(*) FROM agg_demo
+----
+5
+
+query
+SELECT SUM(n) FROM agg_demo
+----
+47
+
+query
+SELECT MIN(n), MAX(n) FROM agg_demo
+----
+5	20
+
+# Grouped aggregates.
+query
+SELECT cat, COUNT(*), SUM(n) FROM agg_demo GROUP BY cat ORDER BY cat
+----
+a	2	30
+b	2	10
+c	1	7
+
+query
+SELECT cat, MIN(n), MAX(n) FROM agg_demo GROUP BY cat ORDER BY cat
+----
+a	10	20
+b	5	5
+c	7	7
+
+# GROUP BY with a HAVING filter on an aggregate.
+query
+SELECT cat, COUNT(*) FROM agg_demo GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat
+----
+a	2
+b	2
+
+# COUNT of a column (counts non-NULL values).
+query
+SELECT COUNT(n) FROM agg_demo
+----
+5
