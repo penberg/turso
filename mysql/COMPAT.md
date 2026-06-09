@@ -302,6 +302,25 @@ diverge are deliberately excluded.
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
 | `IN (SELECT ...)`                      | ❌     | **Not supported** — subqueries. |
 
+#### Scalar functions
+
+Accepted via a strict allow-list of functions whose MySQL semantics match
+SQLite/turso exactly. Any other function is rejected as unsupported.
+
+| Function                               | Status | Comment |
+|----------------------------------------|--------|---------|
+| `COALESCE`                             | ✅     |         |
+| `NULLIF`                               | ✅     |         |
+| `IFNULL`                               | ✅     |         |
+| `ABS`                                  | ✅     |         |
+| `LOWER` / `UPPER`                      | ✅     | ASCII case folding. |
+| `CONCAT`                               | ❌     | **Excluded** — MySQL returns NULL if any arg is NULL; SQLite ignores NULLs. |
+| `LENGTH`                               | ❌     | **Excluded** — MySQL counts bytes; SQLite counts characters. |
+| `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |
+| `IF`                                   | ❌     | **Excluded** — SQLite spells it `IIF`. |
+| `NOW`, `CURDATE`, date/time functions  | ❌     | **Excluded** — types and formats differ. |
+| any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
+
 ### Transactional and Locking Statements
 
 | Statement                                       | Status | Comment |

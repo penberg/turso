@@ -1128,7 +1128,9 @@ impl Parser {
                         self.advance();
                         Ok(ast::Expr::Literal(ast::Literal::False))
                     }
-                    // Anything else is a column reference.
+                    // A bare identifier followed by `(` is a function call;
+                    // otherwise it is a column reference.
+                    _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
                     _ => self.column_ref(),
                 }
             }
@@ -1137,6 +1139,44 @@ impl Parser {
         }
     }
 
+    /// Parses a function call `name(arg, ...)`. The name must be in the clean
+    /// allow-list (functions whose MySQL semantics match SQLite/turso exactly);
+    /// any other function is rejected as unsupported.
+    fn function_call(&mut self) -> Result<ast::Expr> {
+        let name = self.name()?;
+        let upper = name.as_str().to_ascii_uppercase();
+        self.expect(&Token::LParen, "`(`")?;
+
+        if !is_supported_function(&upper) {
+            return Err(ParseError::Unsupported(format!(
+                "function {upper} is not supported yet"
+            )));
+        }
+
+        let mut args = Vec::new();
+        if !self.is(&Token::RParen) {
+            loop {
+                args.push(Box::new(self.expr()?));
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+
+        Ok(ast::Expr::FunctionCall {
+            name,
+            distinctness: None,
+            args,
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
 
     /// Parses a column reference: `col` or `tbl.col`.
     fn column_ref(&mut self) -> Result<ast::Expr> {
@@ -1336,6 +1376,16 @@ fn is_column_constraint_keyword(word: &str) -> bool {
             | "GENERATED"
             | "AS"
             | "ON"
+    )
+}
+
+/// Functions whose MySQL semantics are identical to SQLite/turso, and are
+/// therefore safe to pass straight through to the engine. `upper_name` must be
+/// already uppercased. (Aggregate functions are added in a later step.)
+fn is_supported_function(upper_name: &str) -> bool {
+    matches!(
+        upper_name,
+        "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
     )
 }
 
@@ -1740,12 +1790,55 @@ mod tests {
 
     #[test]
     fn expr_unsupported_forms_are_not_fully_parsed() {
-        // Function calls are not part of the grammar yet (Step 2), and the
-        // divergent operators `/`, `%`, `||` are intentionally not parsed.
-        for input in ["f(x)", "a / b", "a % b", "a || b"] {
+        // The divergent operators `/`, `%`, `||` are intentionally not parsed.
+        for input in ["a / b", "a % b", "a || b"] {
             let mut p = Parser::new(input.as_bytes()).unwrap();
             let fully_parsed = p.expr().is_ok() && p.peek().is_none();
             assert!(!fully_parsed, "expected `{input}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn function_call_allowed() {
+        let expr = parse_expr("COALESCE(a, 1)").unwrap();
+        let ast::Expr::FunctionCall { name, args, .. } = expr else {
+            panic!("expected FunctionCall");
+        };
+        assert_eq!(name.as_str().to_ascii_uppercase(), "COALESCE");
+        assert_eq!(args.len(), 2);
+
+        // Case-insensitive, nested, and zero-arg-ish forms parse.
+        assert!(matches!(
+            parse_expr("abs(-3)").unwrap(),
+            ast::Expr::FunctionCall { .. }
+        ));
+        assert!(matches!(
+            parse_expr("IFNULL(a, b * 2)").unwrap(),
+            ast::Expr::FunctionCall { .. }
+        ));
+    }
+
+    #[test]
+    fn function_call_renders_back_to_sql() {
+        let sql = parse("SELECT UPPER(name) FROM t").unwrap().to_string();
+        assert!(sql.to_uppercase().contains("UPPER"), "{sql}");
+    }
+
+    #[test]
+    fn function_call_not_in_allow_list_is_unsupported() {
+        for input in [
+            "CONCAT('a', 'b')",
+            "LENGTH(name)",
+            "IF(a, 1, 2)",
+            "NOW()",
+            "ROUND(2.7)",
+            "totally_made_up(1)",
+        ] {
+            let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
+            assert!(
+                matches!(err, ParseError::Unsupported(_)),
+                "expected `{input}` to be unsupported, got {err:?}"
+            );
         }
     }
 

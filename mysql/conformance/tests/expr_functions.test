@@ -1,0 +1,78 @@
+# Scalar function conformance — the clean allow-list.
+#
+# Only functions whose MySQL semantics are identical to SQLite/turso are
+# implemented, so this file must pass against both `turso-mysql-server` and a
+# real mysqld. Values are chosen so both render identical text. Excluded
+# (divergent) functions like CONCAT/LENGTH/ROUND/NOW are covered by parser unit
+# tests, not here. Uses its own table name; ORDER BY for determinism.
+
+# COALESCE — first non-NULL argument.
+query
+SELECT COALESCE(NULL, 1)
+----
+1
+
+query
+SELECT COALESCE(NULL, NULL, 5)
+----
+5
+
+# NULLIF — NULL when the two arguments are equal, else the first.
+query
+SELECT NULLIF(5, 5)
+----
+NULL
+
+query
+SELECT NULLIF(5, 3)
+----
+5
+
+# IFNULL — second argument when the first is NULL.
+query
+SELECT IFNULL(NULL, 7)
+----
+7
+
+query
+SELECT IFNULL(3, 7)
+----
+3
+
+# ABS — absolute value (integer stays integer).
+query
+SELECT ABS(-4)
+----
+4
+
+# UPPER / LOWER — ASCII case folding.
+query
+SELECT UPPER('abc')
+----
+ABC
+
+query
+SELECT LOWER('XYZ')
+----
+xyz
+
+# Functions over table columns.
+statement ok
+CREATE TABLE IF NOT EXISTS fn_demo (id INT PRIMARY KEY, name VARCHAR(16), val INT)
+
+statement ok
+INSERT INTO fn_demo (id, name, val) VALUES (1, 'apple', -3), (2, 'Banana', 5), (3, 'CHERRY', -8)
+
+query
+SELECT id, UPPER(name), ABS(val) FROM fn_demo ORDER BY id
+----
+1	APPLE	3
+2	BANANA	5
+3	CHERRY	8
+
+# Function nested in a WHERE predicate.
+query
+SELECT id FROM fn_demo WHERE ABS(val) > 4 ORDER BY id
+----
+2
+3
