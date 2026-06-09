@@ -53,6 +53,20 @@ impl<'a> Lexer<'a> {
             b'.' => self.single(Token::Dot),
             b';' => self.single(Token::Semicolon),
             b'=' => self.single(Token::Eq),
+            b'*' => self.single(Token::Star),
+            b'<' => match self.peek_at(1) {
+                Some(b'=') => self.double(Token::Le),
+                Some(b'>') => self.double(Token::Ne),
+                _ => self.single(Token::Lt),
+            },
+            b'>' => match self.peek_at(1) {
+                Some(b'=') => self.double(Token::Ge),
+                _ => self.single(Token::Gt),
+            },
+            b'!' => match self.peek_at(1) {
+                Some(b'=') => self.double(Token::Ne),
+                _ => self.single(Token::Other('!')),
+            },
             b'-' => self.single(Token::Minus),
             b'+' => self.single(Token::Plus),
             b'`' => self.read_delimited(b'`', "identifier")?,
@@ -67,6 +81,11 @@ impl<'a> Lexer<'a> {
 
     fn single(&mut self, token: Token) -> Token {
         self.pos += 1;
+        token
+    }
+
+    fn double(&mut self, token: Token) -> Token {
+        self.pos += 2;
         token
     }
 

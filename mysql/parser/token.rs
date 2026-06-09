@@ -27,6 +27,18 @@ pub enum Token {
     Semicolon,
     /// `=`
     Eq,
+    /// `<>` or `!=`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `*`
+    Star,
     /// `-`
     Minus,
     /// `+`
@@ -51,6 +63,12 @@ impl Token {
             Token::Dot => "`.`".to_string(),
             Token::Semicolon => "`;`".to_string(),
             Token::Eq => "`=`".to_string(),
+            Token::Ne => "`<>`".to_string(),
+            Token::Lt => "`<`".to_string(),
+            Token::Le => "`<=`".to_string(),
+            Token::Gt => "`>`".to_string(),
+            Token::Ge => "`>=`".to_string(),
+            Token::Star => "`*`".to_string(),
             Token::Minus => "`-`".to_string(),
             Token::Plus => "`+`".to_string(),
             Token::Other(c) => format!("`{c}`"),

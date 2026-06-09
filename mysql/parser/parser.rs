@@ -489,6 +489,138 @@ impl Parser {
         })
     }
 
+    // === Expressions ===
+    //
+    // A small expression grammar for WHERE predicates, INSERT values, and
+    // SET assignments. Precedence, lowest to highest:
+    //
+    //     OR  <  AND  <  NOT  <  comparison (= <> < <= > >=, IS NULL, IN,
+    //     BETWEEN, LIKE)  <  additive (+ -)  <  multiplicative (*)  <  primary
+    //
+    // The divergent operators `/`, `%`, and `||` are intentionally not parsed.
+
+    #[allow(dead_code)]
+    fn expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.and_expr()?;
+        while self.eat_keyword("OR") {
+            let rhs = self.and_expr()?;
+            lhs = ast::Expr::binary(lhs, ast::Operator::Or, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn and_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.not_expr()?;
+        while self.eat_keyword("AND") {
+            let rhs = self.not_expr()?;
+            lhs = ast::Expr::binary(lhs, ast::Operator::And, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn not_expr(&mut self) -> Result<ast::Expr> {
+        if self.eat_keyword("NOT") {
+            let inner = self.not_expr()?;
+            return Ok(ast::Expr::unary(ast::UnaryOperator::Not, inner));
+        }
+        self.comparison_expr()
+    }
+
+    fn comparison_expr(&mut self) -> Result<ast::Expr> {
+        let lhs = self.primary_expr()?;
+        if self.eat_keyword("IS") {
+            let not = self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            return Ok(if not {
+                ast::Expr::not_null(lhs)
+            } else {
+                ast::Expr::is_null(lhs)
+            });
+        }
+        let op = match self.peek() {
+            Some(Token::Eq) => ast::Operator::Equals,
+            Some(Token::Ne) => ast::Operator::NotEquals,
+            Some(Token::Lt) => ast::Operator::Less,
+            Some(Token::Le) => ast::Operator::LessEquals,
+            Some(Token::Gt) => ast::Operator::Greater,
+            Some(Token::Ge) => ast::Operator::GreaterEquals,
+            _ => return Ok(lhs),
+        };
+        self.advance();
+        let rhs = self.primary_expr()?;
+        Ok(ast::Expr::binary(lhs, op, rhs))
+    }
+
+
+
+
+
+    fn primary_expr(&mut self) -> Result<ast::Expr> {
+        match self.peek() {
+            // Parenthesized sub-expression. The wrapper node is kept so the
+            // rendered SQL preserves the original grouping.
+            Some(Token::LParen) => {
+                self.advance();
+                let inner = self.expr()?;
+                self.expect(&Token::RParen, "`)`")?;
+                Ok(ast::Expr::Parenthesized(vec![Box::new(inner)]))
+            }
+            Some(Token::Num(n)) => {
+                let n = n.clone();
+                self.advance();
+                Ok(ast::Expr::Literal(ast::Literal::Numeric(n)))
+            }
+            Some(Token::Str(s)) => {
+                let lit = requote(s);
+                self.advance();
+                Ok(ast::Expr::Literal(ast::Literal::String(lit)))
+            }
+            // A signed numeric literal; the sign is folded into the literal.
+            Some(Token::Minus) | Some(Token::Plus) => {
+                let negative = self.is(&Token::Minus);
+                self.advance();
+                let Some(Token::Num(n)) = self.peek() else {
+                    return Err(self.unexpected("a number"));
+                };
+                let n = if negative { format!("-{n}") } else { n.clone() };
+                self.advance();
+                Ok(ast::Expr::Literal(ast::Literal::Numeric(n)))
+            }
+            Some(Token::Word(w)) => {
+                match w.to_ascii_uppercase().as_str() {
+                    "NULL" => {
+                        self.advance();
+                        Ok(ast::Expr::Literal(ast::Literal::Null))
+                    }
+                    "TRUE" => {
+                        self.advance();
+                        Ok(ast::Expr::Literal(ast::Literal::True))
+                    }
+                    "FALSE" => {
+                        self.advance();
+                        Ok(ast::Expr::Literal(ast::Literal::False))
+                    }
+                    // Anything else is a column reference.
+                    _ => self.column_ref(),
+                }
+            }
+            Some(Token::QuotedIdent(_)) => self.column_ref(),
+            _ => Err(self.unexpected("an expression")),
+        }
+    }
+
+
+    /// Parses a column reference: `col` or `tbl.col`.
+    fn column_ref(&mut self) -> Result<ast::Expr> {
+        let first = self.name()?;
+        if self.eat(&Token::Dot) {
+            let second = self.name()?;
+            Ok(ast::Expr::Qualified(first, second))
+        } else {
+            Ok(ast::Expr::Id(first))
+        }
+    }
+
     // === Identifiers and shared parse helpers ===
 
     fn qualified_name(&mut self) -> Result<ast::QualifiedName> {
@@ -800,6 +932,130 @@ mod tests {
         let sql = parse("DROP TABLE t").unwrap().to_string();
         assert!(sql.to_uppercase().contains("DROP TABLE"), "{sql}");
         assert!(sql.contains('t'), "{sql}");
+    }
+
+    /// Parses `input` as a single complete expression.
+    fn parse_expr(input: &str) -> Result<ast::Expr> {
+        let mut p = Parser::new(input.as_bytes())?;
+        let expr = p.expr()?;
+        assert!(
+            p.peek().is_none(),
+            "expression `{input}` was not fully consumed"
+        );
+        Ok(expr)
+    }
+
+    fn num(s: &str) -> ast::Expr {
+        ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))
+    }
+
+    fn col(s: &str) -> ast::Expr {
+        ast::Expr::Id(ast::Name::from_string(s))
+    }
+
+    #[test]
+    fn expr_literals() {
+        assert_eq!(parse_expr("42").unwrap(), num("42"));
+        assert_eq!(parse_expr("-7").unwrap(), num("-7"));
+        assert_eq!(parse_expr("3.5").unwrap(), num("3.5"));
+        assert_eq!(
+            parse_expr("'it''s'").unwrap(),
+            ast::Expr::Literal(ast::Literal::String("'it''s'".to_string()))
+        );
+        assert_eq!(
+            parse_expr("NULL").unwrap(),
+            ast::Expr::Literal(ast::Literal::Null)
+        );
+        assert_eq!(
+            parse_expr("TRUE").unwrap(),
+            ast::Expr::Literal(ast::Literal::True)
+        );
+    }
+
+    #[test]
+    fn expr_column_refs() {
+        assert_eq!(parse_expr("age").unwrap(), col("age"));
+        assert_eq!(
+            parse_expr("t.age").unwrap(),
+            ast::Expr::Qualified(ast::Name::from_string("t"), ast::Name::from_string("age"))
+        );
+        assert_eq!(parse_expr("`select`").unwrap(), col("select"));
+    }
+
+    #[test]
+    fn expr_comparisons() {
+        assert_eq!(
+            parse_expr("age = 30").unwrap(),
+            ast::Expr::binary(col("age"), ast::Operator::Equals, num("30"))
+        );
+        // `<>` and `!=` are the same operator.
+        assert_eq!(parse_expr("a <> 1").unwrap(), parse_expr("a != 1").unwrap());
+        assert_eq!(
+            parse_expr("a <= 1").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::LessEquals, num("1"))
+        );
+        assert_eq!(
+            parse_expr("a >= 1").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::GreaterEquals, num("1"))
+        );
+    }
+
+    #[test]
+    fn expr_is_null() {
+        assert_eq!(
+            parse_expr("a IS NULL").unwrap(),
+            ast::Expr::is_null(col("a"))
+        );
+        assert_eq!(
+            parse_expr("a IS NOT NULL").unwrap(),
+            ast::Expr::not_null(col("a"))
+        );
+    }
+
+    #[test]
+    fn expr_precedence_and_binds_tighter_than_or() {
+        // a = 1 OR b = 2 AND c = 3  ==>  a = 1 OR (b = 2 AND c = 3)
+        let expr = parse_expr("a = 1 OR b = 2 AND c = 3").unwrap();
+        let expected = ast::Expr::binary(
+            ast::Expr::binary(col("a"), ast::Operator::Equals, num("1")),
+            ast::Operator::Or,
+            ast::Expr::binary(
+                ast::Expr::binary(col("b"), ast::Operator::Equals, num("2")),
+                ast::Operator::And,
+                ast::Expr::binary(col("c"), ast::Operator::Equals, num("3")),
+            ),
+        );
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn expr_not_and_parentheses() {
+        let expr = parse_expr("NOT (a = 1 OR b = 2)").unwrap();
+        let inner = ast::Expr::binary(
+            ast::Expr::binary(col("a"), ast::Operator::Equals, num("1")),
+            ast::Operator::Or,
+            ast::Expr::binary(col("b"), ast::Operator::Equals, num("2")),
+        );
+        let expected = ast::Expr::unary(
+            ast::UnaryOperator::Not,
+            ast::Expr::Parenthesized(vec![Box::new(inner)]),
+        );
+        assert_eq!(expr, expected);
+        // Parentheses survive the round trip back to SQL, preserving grouping.
+        let sql = expr.to_string();
+        assert!(sql.contains('('), "{sql}");
+    }
+
+    #[test]
+    fn expr_unsupported_forms_are_not_fully_parsed() {
+        // Function calls, IN, LIKE, BETWEEN are not part of the grammar yet:
+        // they either fail outright or leave unconsumed input (which statement
+        // parsers turn into a syntax error).
+        for input in ["f(x)", "a IN (1, 2)", "a LIKE 'x%'", "a BETWEEN 1 AND 2"] {
+            let mut p = Parser::new(input.as_bytes()).unwrap();
+            let fully_parsed = p.expr().is_ok() && p.peek().is_none();
+            assert!(!fully_parsed, "expected `{input}` to be rejected");
+        }
     }
 
     #[test]
