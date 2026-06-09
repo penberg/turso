@@ -1,0 +1,56 @@
+# CREATE / DROP TEMPORARY TABLE conformance.
+#
+# MySQL temporary tables are session-private and dropped at disconnect; the
+# engine's TEMP tables behave the same. DROP TEMPORARY TABLE targets ONLY the
+# temporary table — never a base table of the same name — which the front-end
+# preserves by qualifying the drop with the temp schema.
+#
+# The conformance runner uses one connection per file, so the temp table created
+# below lives for the whole file. Expected to pass on both turso-mysql-server
+# and a real mysqld.
+
+statement ok
+CREATE TEMPORARY TABLE tmp_demo (a INT PRIMARY KEY, label VARCHAR(16))
+
+statement ok
+INSERT INTO tmp_demo (a, label) VALUES (1, 'x'), (2, 'y')
+
+query
+SELECT a, label FROM tmp_demo ORDER BY a
+----
+1	x
+2	y
+
+# DROP TEMPORARY TABLE removes it.
+statement ok
+DROP TEMPORARY TABLE tmp_demo
+
+# After the drop it is gone: selecting from it errors on both targets.
+statement error
+SELECT a FROM tmp_demo
+
+# DROP TEMPORARY TABLE IF EXISTS on an absent table is a no-op success.
+statement ok
+DROP TEMPORARY TABLE IF EXISTS tmp_demo
+
+# DROP TEMPORARY TABLE drops only the temporary table, leaving a base table of
+# the same name intact.
+statement ok
+CREATE TABLE tt_base (a INT)
+
+statement ok
+INSERT INTO tt_base (a) VALUES (100)
+
+statement ok
+CREATE TEMPORARY TABLE tt_base (a INT)
+
+statement ok
+INSERT INTO tt_base (a) VALUES (7)
+
+statement ok
+DROP TEMPORARY TABLE tt_base
+
+query
+SELECT a FROM tt_base ORDER BY a
+----
+100

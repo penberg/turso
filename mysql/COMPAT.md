@@ -220,7 +220,7 @@ incomplete.
 | CREATE SERVER                          | ❌     |         |
 | CREATE SPATIAL REFERENCE SYSTEM        | ❌     |         |
 | CREATE TABLE                           | ❌     | MySQL types, storage engines, and table options not translated. |
-| CREATE TEMPORARY TABLE                 | ❌     |         |
+| CREATE TEMPORARY TABLE                 | ✅     | Session-private and dropped at disconnect, like the engine's TEMP tables. |
 | CREATE TABLE ... LIKE                  | ❌     |         |
 | CREATE TABLE ... SELECT                | ❌     |         |
 | CREATE TABLESPACE                      | ❌     |         |
@@ -236,7 +236,7 @@ incomplete.
 | DROP SPATIAL REFERENCE SYSTEM          | ❌     |         |
 | DROP TABLE *tbl_name* (single table)   | ✅     |         |
 | DROP TABLE ... IF EXISTS               | ✅     | Dropping a non-existent table is a no-op success, as in MySQL. |
-| DROP TEMPORARY TABLE                   | ❌     | **Not supported** — rejected as unsupported. |
+| DROP TEMPORARY TABLE [IF EXISTS]       | ✅     | Qualified onto the engine's temp schema so it drops only the temporary table, never a base table of the same name. A schema-qualified name (`db.t`) is rejected. |
 | DROP TABLE *t1, t2, ...* (multiple)    | ❌     | **Not supported** — only a single table per statement. |
 | DROP TABLE ... RESTRICT / CASCADE      | ❌     | **Not supported** — rejected as unsupported (no-ops in MySQL). |
 | DROP TABLESPACE                        | ❌     |         |

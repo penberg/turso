@@ -565,13 +565,13 @@ impl Parser {
 
     fn drop(&mut self) -> Result<ast::Stmt> {
         // `DROP` has already been consumed.
-        if self.is_keyword("TEMPORARY") {
-            return Err(ParseError::Unsupported(
-                "DROP TEMPORARY TABLE is not supported yet".to_string(),
-            ));
-        }
+        let temporary = self.eat_keyword("TEMPORARY");
         if self.eat_keyword("TABLE") {
-            self.drop_table()
+            self.drop_table(temporary)
+        } else if temporary {
+            Err(ParseError::Unsupported(
+                "DROP TEMPORARY only applies to tables".to_string(),
+            ))
         } else {
             let what = match self.peek() {
                 Some(Token::Word(w)) => w.to_ascii_uppercase(),
@@ -583,12 +583,14 @@ impl Parser {
         }
     }
 
-    /// Parses the `DROP TABLE [IF EXISTS] tbl_name` form. With `IF EXISTS`,
-    /// dropping a non-existent table is a no-op success, matching MySQL. The
-    /// `TEMPORARY`, multi-table, and `RESTRICT`/`CASCADE` variants are still
-    /// explicitly rejected as unsupported.
-    fn drop_table(&mut self) -> Result<ast::Stmt> {
-        // `DROP TABLE` has already been consumed.
+    /// Parses the `DROP [TEMPORARY] TABLE [IF EXISTS] tbl_name` form. With
+    /// `IF EXISTS`, dropping a non-existent table is a no-op success, matching
+    /// MySQL. `DROP TEMPORARY TABLE` is qualified onto the engine's temp schema
+    /// so it drops only the temporary table, never a base table of the same name
+    /// — exactly MySQL's semantics. The multi-table and `RESTRICT`/`CASCADE`
+    /// variants are still rejected as unsupported.
+    fn drop_table(&mut self, temporary: bool) -> Result<ast::Stmt> {
+        // `DROP [TEMPORARY] TABLE` has already been consumed.
         let if_exists = if self.eat_keyword("IF") {
             self.expect_keyword("EXISTS")?;
             true
@@ -596,7 +598,7 @@ impl Parser {
             false
         };
 
-        let tbl_name = self.qualified_name()?;
+        let mut tbl_name = self.qualified_name()?;
 
         if self.is(&Token::Comma) {
             return Err(ParseError::Unsupported(
@@ -607,6 +609,17 @@ impl Parser {
             return Err(ParseError::Unsupported(
                 "DROP TABLE RESTRICT / CASCADE is not supported yet".to_string(),
             ));
+        }
+
+        if temporary {
+            if tbl_name.db_name.is_some() {
+                return Err(ParseError::Unsupported(
+                    "DROP TEMPORARY TABLE with a schema qualifier is not supported yet".to_string(),
+                ));
+            }
+            // Resolve against the temp schema only, so a base table of the same
+            // name is never dropped.
+            tbl_name = ast::QualifiedName::fullname(ast::Name::from_string("temp"), tbl_name.name);
         }
 
         Ok(ast::Stmt::DropTable {
@@ -2662,17 +2675,41 @@ mod tests {
     #[test]
     fn drop_table_unsupported_variants() {
         for sql in [
-            "DROP TEMPORARY TABLE t",
             "DROP TABLE a, b",
             "DROP TABLE t RESTRICT",
             "DROP TABLE t CASCADE",
             "DROP DATABASE d",
             "DROP INDEX i ON t",
+            "DROP TEMPORARY TABLE mydb.t", // schema-qualified temp drop
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn drop_temporary_table_targets_temp_schema() {
+        // `DROP TEMPORARY TABLE t` is qualified onto the temp schema so only the
+        // temporary table is dropped.
+        let ast::Stmt::DropTable {
+            if_exists,
+            tbl_name,
+        } = parse("DROP TEMPORARY TABLE t").unwrap()
+        else {
+            panic!("expected DropTable");
+        };
+        assert!(!if_exists);
+        assert_eq!(tbl_name.db_name.as_ref().unwrap().as_str(), "temp");
+        assert_eq!(tbl_name.name.as_str(), "t");
+
+        // `IF EXISTS` carries through.
+        let ast::Stmt::DropTable { if_exists, .. } =
+            parse("DROP TEMPORARY TABLE IF EXISTS t").unwrap()
+        else {
+            panic!("expected DropTable");
+        };
+        assert!(if_exists);
     }
 }
