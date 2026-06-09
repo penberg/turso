@@ -978,10 +978,24 @@ impl Parser {
     /// Parses a single table reference: `tbl [[AS] alias]`. Subqueries and table
     /// functions are not modeled.
     fn table_ref(&mut self) -> Result<ast::SelectTable> {
-        if self.is(&Token::LParen) {
-            return Err(ParseError::Unsupported(
-                "SELECT from a subquery / derived table is not supported yet".to_string(),
-            ));
+        // A derived table: `(SELECT ...) alias`. MySQL requires the alias, which
+        // is enforced here; parenthesized joins are not modeled.
+        if self.eat(&Token::LParen) {
+            if !self.eat_keyword("SELECT") {
+                return Err(ParseError::Unsupported(
+                    "only a derived table — `(SELECT ...)` — is supported in parentheses"
+                        .to_string(),
+                ));
+            }
+            let select = self.parse_select()?;
+            self.expect(&Token::RParen, "`)`")?;
+            let alias = self.table_alias()?;
+            if alias.is_none() {
+                return Err(ParseError::Unsupported(
+                    "a derived table requires an alias".to_string(),
+                ));
+            }
+            return Ok(ast::SelectTable::Select(select, alias));
         }
         let tbl_name = self.qualified_name()?;
         let alias = self.table_alias()?;
@@ -2359,6 +2373,29 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn derived_table_in_from() {
+        let stmt =
+            parse("SELECT s.id FROM (SELECT id FROM t WHERE n > 1) s WHERE s.id > 0").unwrap();
+        let ast::Stmt::Select(sel) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { from, .. } = sel.body.select else {
+            unreachable!()
+        };
+        let from = from.unwrap();
+        let ast::SelectTable::Select(_, Some(alias)) = from.select.as_ref() else {
+            panic!("expected a derived table with an alias");
+        };
+        assert!(matches!(alias, ast::As::Elided(n) if n.as_str() == "s"));
+
+        // A derived table without an alias is rejected (MySQL requires one).
+        assert!(matches!(
+            parse("SELECT * FROM (SELECT 1) WHERE 1 = 1").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]

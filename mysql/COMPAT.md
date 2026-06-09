@@ -315,7 +315,8 @@ diverge are deliberately excluded.
 | `%` / `MOD`                            | ❌     | **Excluded** — float modulo differs. |
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
 | `[NOT] IN (SELECT ...)`                | ✅     | Uncorrelated subquery in `IN`/`NOT IN`; evaluates identically. |
-| `[NOT] EXISTS (SELECT ...)`            | ✅     | Correlated subqueries supported; identical semantics. Scalar subqueries and subqueries in `FROM` are not yet parsed. |
+| `[NOT] EXISTS (SELECT ...)`            | ✅     | Correlated subqueries supported; identical semantics. |
+| Derived table `FROM (SELECT ...) alias` | ✅    | Subquery in `FROM`; the alias is required (as in MySQL). Scalar subqueries (in the select list) are not yet parsed. |
 
 #### Scalar functions
 
