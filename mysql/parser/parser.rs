@@ -69,15 +69,22 @@ impl Parser {
                 self.advance();
                 self.select()
             }
+            "UPDATE" => {
+                self.advance();
+                self.update()
+            }
+            "DELETE" => {
+                self.advance();
+                self.delete()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "UPDATE" | "DELETE" | "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME" | "SET" | "SHOW"
-            | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "BEGIN" | "START" | "COMMIT"
-            | "ROLLBACK" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES"
-            | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE"
-            | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER"
-            | "IMPORT" => Err(ParseError::Unsupported(format!(
-                "{keyword} is not supported yet"
-            ))),
+            "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE"
+            | "DESC" | "EXPLAIN" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT"
+            | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE"
+            | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK"
+            | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(
+                ParseError::Unsupported(format!("{keyword} is not supported yet")),
+            ),
             other => Err(ParseError::Unsupported(format!(
                 "unrecognized statement starting with `{other}`"
             ))),
@@ -799,6 +806,126 @@ impl Parser {
                 offset: None,
             }))
         }
+    }
+
+    // === UPDATE ===
+
+    /// Parses `UPDATE tbl SET col = expr [, ...] [WHERE expr]`. Multi-table
+    /// updates, `ORDER BY`/`LIMIT`, and the `LOW_PRIORITY`/`IGNORE` modifiers are
+    /// rejected as unsupported.
+    fn update(&mut self) -> Result<ast::Stmt> {
+        // `UPDATE` has already been consumed.
+        if self.is_keyword("LOW_PRIORITY") || self.is_keyword("IGNORE") {
+            return Err(ParseError::Unsupported(
+                "UPDATE LOW_PRIORITY / IGNORE is not supported yet".to_string(),
+            ));
+        }
+
+        let tbl_name = self.qualified_name()?;
+        if self.is(&Token::Comma) || self.is_keyword("JOIN") {
+            return Err(ParseError::Unsupported(
+                "multi-table UPDATE is not supported yet".to_string(),
+            ));
+        }
+
+        self.expect_keyword("SET")?;
+        let mut sets = Vec::new();
+        loop {
+            let col = self.name()?;
+            self.expect(&Token::Eq, "`=`")?;
+            let expr = self.expr()?;
+            sets.push(ast::Set {
+                col_names: vec![col],
+                expr: Box::new(expr),
+            });
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+
+        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+            return Err(ParseError::Unsupported(
+                "ORDER BY / LIMIT on UPDATE is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Stmt::Update(ast::Update {
+            with: None,
+            or_conflict: None,
+            tbl_name,
+            indexed: None,
+            sets,
+            from: None,
+            where_clause,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        }))
+    }
+
+    // === DELETE ===
+
+    /// Parses `DELETE FROM tbl [WHERE expr]`. Multi-table deletes,
+    /// `DELETE ... USING`, `ORDER BY`/`LIMIT`, and the
+    /// `LOW_PRIORITY`/`QUICK`/`IGNORE` modifiers are rejected as unsupported.
+    fn delete(&mut self) -> Result<ast::Stmt> {
+        // `DELETE` has already been consumed.
+        if self.is_keyword("LOW_PRIORITY") || self.is_keyword("QUICK") || self.is_keyword("IGNORE")
+        {
+            return Err(ParseError::Unsupported(
+                "DELETE LOW_PRIORITY / QUICK / IGNORE is not supported yet".to_string(),
+            ));
+        }
+
+        // The multi-table form is `DELETE t1 FROM ...` — i.e. a table list
+        // before `FROM`.
+        if !self.is_keyword("FROM") {
+            return Err(ParseError::Unsupported(
+                "multi-table DELETE is not supported yet".to_string(),
+            ));
+        }
+        self.expect_keyword("FROM")?;
+
+        let tbl_name = self.qualified_name()?;
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "multi-table DELETE is not supported yet".to_string(),
+            ));
+        }
+        if self.is_keyword("USING") {
+            return Err(ParseError::Unsupported(
+                "DELETE ... USING is not supported yet".to_string(),
+            ));
+        }
+
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+
+        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+            return Err(ParseError::Unsupported(
+                "ORDER BY / LIMIT on DELETE is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Stmt::Delete {
+            with: None,
+            tbl_name,
+            indexed: None,
+            where_clause,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        })
     }
 
     // === Expressions ===
@@ -1531,6 +1658,84 @@ mod tests {
             let mut p = Parser::new(input.as_bytes()).unwrap();
             let fully_parsed = p.expr().is_ok() && p.peek().is_none();
             assert!(!fully_parsed, "expected `{input}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn update_basic() {
+        let stmt = parse("UPDATE users SET name = 'x', age = 30 WHERE id = 2").unwrap();
+        let ast::Stmt::Update(update) = stmt else {
+            panic!("expected Update");
+        };
+        assert_eq!(update.tbl_name.name.as_str(), "users");
+        assert_eq!(update.sets.len(), 2);
+        assert_eq!(update.sets[0].col_names[0].as_str(), "name");
+        assert!(update.where_clause.is_some());
+    }
+
+    #[test]
+    fn update_renders_back_to_sql() {
+        let sql = parse("UPDATE t SET a = 1 WHERE b = 2").unwrap().to_string();
+        let upper = sql.to_uppercase();
+        assert!(upper.contains("UPDATE") && upper.contains("SET"), "{sql}");
+    }
+
+    #[test]
+    fn update_unsupported_variants() {
+        for sql in [
+            "UPDATE a, b SET a.x = 1",
+            "UPDATE t SET a = 1 ORDER BY a",
+            "UPDATE t SET a = 1 LIMIT 1",
+            "UPDATE IGNORE t SET a = 1",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_basic_and_all() {
+        let stmt = parse("DELETE FROM users WHERE id = 1").unwrap();
+        let ast::Stmt::Delete {
+            tbl_name,
+            where_clause,
+            ..
+        } = stmt
+        else {
+            panic!("expected Delete");
+        };
+        assert_eq!(tbl_name.name.as_str(), "users");
+        assert!(where_clause.is_some());
+
+        // No WHERE deletes all rows.
+        let ast::Stmt::Delete { where_clause, .. } = parse("DELETE FROM users").unwrap() else {
+            panic!("expected Delete");
+        };
+        assert!(where_clause.is_none());
+    }
+
+    #[test]
+    fn delete_renders_back_to_sql() {
+        let sql = parse("DELETE FROM t WHERE a = 1").unwrap().to_string();
+        assert!(sql.to_uppercase().contains("DELETE"), "{sql}");
+    }
+
+    #[test]
+    fn delete_unsupported_variants() {
+        for sql in [
+            "DELETE t1 FROM t1, t2 WHERE t1.id = t2.id",
+            "DELETE FROM a, b",
+            "DELETE FROM t USING u",
+            "DELETE FROM t ORDER BY a",
+            "DELETE FROM t LIMIT 1",
+            "DELETE QUICK FROM t",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
         }
     }
 

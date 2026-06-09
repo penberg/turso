@@ -250,7 +250,8 @@ incomplete.
 | Statement                              | Status | Comment |
 |----------------------------------------|--------|---------|
 | CALL                                   | ❌     |         |
-| DELETE                                 | ❌     |         |
+| DELETE FROM tbl [WHERE] (single table) | ✅     |         |
+| DELETE (multi-table / USING / ORDER BY / LIMIT) | ❌ | **Not supported.** |
 | DO                                     | ❌     |         |
 | EXCEPT clause                          | ❌     |         |
 | HANDLER                                | ❌     |         |
@@ -275,7 +276,8 @@ incomplete.
 | Subqueries                             | ❌     |         |
 | Derived / lateral derived tables       | ❌     |         |
 | TABLE statement                        | ❌     |         |
-| UPDATE                                 | ❌     |         |
+| UPDATE tbl SET ... [WHERE] (single table) | ✅  |         |
+| UPDATE (multi-table / ORDER BY / LIMIT) | ❌    | **Not supported.** |
 | VALUES statement                       | ❌     |         |
 | WITH (Common Table Expressions)        | ❌     |         |
 

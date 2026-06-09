@@ -1,0 +1,65 @@
+# UPDATE and DELETE conformance — the basic single-table forms.
+#
+# Implemented by the Turso front-end, so this file is expected to pass against
+# both `turso-mysql-server` and a real mysqld. Mutations are verified by reading
+# the table back with SELECT ... ORDER BY. Only the basic forms are supported;
+# multi-table UPDATE/DELETE, DELETE ... USING, and ORDER BY/LIMIT on mutations
+# are not (see mysql/COMPAT.md). Uses its own table name to avoid colliding with
+# other files in the shared database.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ud_demo (id INT PRIMARY KEY, name VARCHAR(32), age INT)
+
+statement ok
+INSERT INTO ud_demo (id, name, age) VALUES (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 35), (4, 'dave', 25)
+
+# UPDATE a single row, then read it back.
+statement ok
+UPDATE ud_demo SET age = 26 WHERE id = 2
+
+query
+SELECT id, age FROM ud_demo WHERE id = 2
+----
+2	26
+
+# UPDATE multiple columns across multiple rows via a predicate.
+# (Arithmetic like `age + 1` is not in the expression grammar yet, so a literal
+# is used to keep this in-scope; bob is already 26 from the previous update.)
+statement ok
+UPDATE ud_demo SET name = 'X', age = 26 WHERE age = 25
+
+query
+SELECT id, name, age FROM ud_demo ORDER BY id
+----
+1	alice	30
+2	bob	26
+3	carol	35
+4	X	26
+
+# DELETE a single row.
+statement ok
+DELETE FROM ud_demo WHERE id = 1
+
+query
+SELECT id FROM ud_demo ORDER BY id
+----
+2
+3
+4
+
+# DELETE with a predicate matching several rows.
+statement ok
+DELETE FROM ud_demo WHERE age = 26
+
+query
+SELECT id FROM ud_demo ORDER BY id
+----
+3
+
+# DELETE with no WHERE removes everything.
+statement ok
+DELETE FROM ud_demo
+
+query
+SELECT id FROM ud_demo ORDER BY id
+----
