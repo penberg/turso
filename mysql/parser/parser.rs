@@ -794,10 +794,62 @@ impl Parser {
         Ok(ast::Stmt::Select(self.parse_select()?))
     }
 
-    /// Parses a `SELECT` body (everything after the `SELECT` keyword) into an
-    /// `ast::Select`. Shared by the top-level statement and `IN (SELECT ...)`
+    /// Parses a `SELECT` body (everything after the `SELECT` keyword), including
+    /// any `UNION [ALL]` / `INTERSECT` / `EXCEPT` compounds and a trailing
+    /// `ORDER BY` / `LIMIT` that applies to the whole result, into an
+    /// `ast::Select`. Shared by the top-level statement and `IN`/`EXISTS`
     /// subqueries.
     fn parse_select(&mut self) -> Result<ast::Select> {
+        let first = self.parse_one_select()?;
+
+        // Set-operation compounds. Each branch starts a fresh `SELECT`; the
+        // operators map straight onto the engine's identical semantics (`UNION`
+        // and `INTERSECT`/`EXCEPT` deduplicate; `UNION ALL` does not).
+        let mut compounds = Vec::new();
+        loop {
+            let operator = if self.eat_keyword("UNION") {
+                if self.eat_keyword("ALL") {
+                    ast::CompoundOperator::UnionAll
+                } else {
+                    ast::CompoundOperator::Union
+                }
+            } else if self.eat_keyword("INTERSECT") {
+                ast::CompoundOperator::Intersect
+            } else if self.eat_keyword("EXCEPT") {
+                ast::CompoundOperator::Except
+            } else {
+                break;
+            };
+            self.expect_keyword("SELECT")?;
+            let select = self.parse_one_select()?;
+            compounds.push(ast::CompoundSelect { operator, select });
+        }
+
+        let order_by = self.order_by()?;
+        let limit = self.limit()?;
+
+        if self.is_keyword("INTO") {
+            return Err(ParseError::Unsupported(
+                "SELECT ... INTO is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: first,
+                compounds,
+            },
+            order_by,
+            limit,
+        })
+    }
+
+    /// Parses a single `SELECT` branch — distinctness, the column list, and the
+    /// optional `FROM` / `WHERE` / `GROUP BY` clauses — without the trailing
+    /// `ORDER BY` / `LIMIT` or any set-operation compound, which belong to the
+    /// surrounding compound select.
+    fn parse_one_select(&mut self) -> Result<ast::OneSelect> {
         if self.is_keyword("DISTINCTROW") {
             // MySQL synonym for DISTINCT; not modeled.
             return Err(ParseError::Unsupported(
@@ -827,35 +879,13 @@ impl Parser {
 
         let group_by = self.group_by()?;
 
-        let order_by = self.order_by()?;
-        let limit = self.limit()?;
-
-        if self.is_keyword("UNION") || self.is_keyword("INTERSECT") || self.is_keyword("EXCEPT") {
-            return Err(ParseError::Unsupported(
-                "set operations (UNION/INTERSECT/EXCEPT) are not supported yet".to_string(),
-            ));
-        }
-        if self.is_keyword("INTO") {
-            return Err(ParseError::Unsupported(
-                "SELECT ... INTO is not supported yet".to_string(),
-            ));
-        }
-
-        Ok(ast::Select {
-            with: None,
-            body: ast::SelectBody {
-                select: ast::OneSelect::Select {
-                    distinctness,
-                    columns,
-                    from,
-                    where_clause,
-                    group_by,
-                    window_clause: Vec::new(),
-                },
-                compounds: Vec::new(),
-            },
-            order_by,
-            limit,
+        Ok(ast::OneSelect::Select {
+            distinctness,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause: Vec::new(),
         })
     }
 
@@ -2323,13 +2353,56 @@ mod tests {
             "SELECT * FROM a JOIN b",
             "SELECT * FROM (SELECT 1)",
             "SELECT a FROM t GROUP BY 1",
-            "SELECT * FROM a UNION SELECT * FROM b",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn select_union_compounds() {
+        // UNION / UNION ALL / INTERSECT / EXCEPT, with a trailing ORDER BY that
+        // applies to the whole result.
+        let stmt = parse("SELECT a FROM t UNION SELECT b FROM u ORDER BY a").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        assert_eq!(s.body.compounds.len(), 1);
+        assert!(matches!(
+            s.body.compounds[0].operator,
+            ast::CompoundOperator::Union
+        ));
+        assert_eq!(s.order_by.len(), 1);
+
+        for (sql, op) in [
+            (
+                "SELECT a FROM t UNION ALL SELECT b FROM u",
+                ast::CompoundOperator::UnionAll,
+            ),
+            (
+                "SELECT a FROM t INTERSECT SELECT b FROM u",
+                ast::CompoundOperator::Intersect,
+            ),
+            (
+                "SELECT a FROM t EXCEPT SELECT b FROM u",
+                ast::CompoundOperator::Except,
+            ),
+        ] {
+            let ast::Stmt::Select(s) = parse(sql).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(s.body.compounds[0].operator, op, "{sql}");
+        }
+
+        // A chain of UNIONs accumulates into the compounds list.
+        let ast::Stmt::Select(s) =
+            parse("SELECT a FROM t UNION SELECT b FROM u UNION ALL SELECT c FROM v").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(s.body.compounds.len(), 2);
     }
 
     #[test]

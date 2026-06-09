@@ -284,8 +284,8 @@ incomplete.
 | SELECT ... INTO                        | ❌     | **Not supported.** |
 | `[INNER] JOIN` / `LEFT [OUTER] JOIN` ... ON | ✅ | Table aliases (`t`, `t AS a`) and chained joins supported. Map identically onto the engine. |
 | `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, comma joins, `JOIN ... USING`, ON-less joins | ❌ | Rejected as unsupported (semantics differ or unmodeled). |
-| UNION                                  | ❌     |         |
-| INTERSECT / EXCEPT set operations      | ❌     |         |
+| UNION / UNION ALL                      | ✅     | `UNION` deduplicates, `UNION ALL` does not; a trailing `ORDER BY`/`LIMIT` applies to the whole result. Identical to MySQL 8.x. |
+| INTERSECT / EXCEPT set operations      | ✅     | Deduplicating set operations, identical to MySQL 8.x. Mixed-operator precedence is not exercised. |
 | Subqueries                             | ❌     |         |
 | Derived / lateral derived tables       | ❌     |         |
 | TABLE statement                        | ❌     |         |

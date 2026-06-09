@@ -1,0 +1,59 @@
+# Set operations: UNION, UNION ALL, INTERSECT, EXCEPT. These deduplicate (all
+# but UNION ALL) identically in MySQL 8.x and the engine. A trailing ORDER BY
+# applies to the whole result, making the comparison deterministic.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Single
+# operator per query (no mixing) so cross-operator precedence is not exercised.
+
+statement ok
+CREATE TABLE IF NOT EXISTS un_a (x INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS un_b (y INT)
+
+statement ok
+INSERT INTO un_a (x) VALUES (1), (2), (2), (3)
+
+statement ok
+INSERT INTO un_b (y) VALUES (2), (3), (4)
+
+# UNION deduplicates across both branches.
+query
+SELECT x FROM un_a UNION SELECT y FROM un_b ORDER BY x
+----
+1
+2
+3
+4
+
+# UNION ALL keeps every row.
+query
+SELECT x FROM un_a UNION ALL SELECT y FROM un_b ORDER BY x
+----
+1
+2
+2
+2
+3
+3
+4
+
+# INTERSECT keeps values present in both (deduplicated).
+query
+SELECT x FROM un_a INTERSECT SELECT y FROM un_b ORDER BY x
+----
+2
+3
+
+# EXCEPT keeps values in the first branch but not the second (deduplicated).
+query
+SELECT x FROM un_a EXCEPT SELECT y FROM un_b ORDER BY x
+----
+1
+
+# A UNION branch can carry its own WHERE; ORDER BY/LIMIT apply to the whole.
+query
+SELECT x FROM un_a WHERE x < 3 UNION SELECT y FROM un_b WHERE y > 3 ORDER BY x LIMIT 2
+----
+1
+2
