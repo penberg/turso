@@ -870,11 +870,7 @@ impl Parser {
                 columns.push(ast::ResultColumn::TableStar(name));
             } else {
                 let expr = self.expr()?;
-                let alias = if self.eat_keyword("AS") {
-                    Some(ast::As::As(self.name()?))
-                } else {
-                    None
-                };
+                let alias = self.column_alias()?;
                 columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
             }
             if self.eat(&Token::Comma) {
@@ -883,6 +879,22 @@ impl Parser {
             break;
         }
         Ok(columns)
+    }
+
+    /// Parses an optional select-list column alias: `AS name`, a backtick-quoted
+    /// name, or a bare identifier that is not a clause keyword that ends the
+    /// select list (e.g. `FROM`).
+    fn column_alias(&mut self) -> Result<Option<ast::As>> {
+        if self.eat_keyword("AS") {
+            return Ok(Some(ast::As::As(self.name()?)));
+        }
+        match self.peek() {
+            Some(Token::QuotedIdent(_)) => Ok(Some(ast::As::Elided(self.name()?))),
+            Some(Token::Word(w)) if !is_reserved_select_alias(w) => {
+                Ok(Some(ast::As::Elided(self.name()?)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Parses the `FROM` clause: a table reference optionally followed by
@@ -1818,6 +1830,27 @@ fn is_reserved_after_table(word: &str) -> bool {
     )
 }
 
+/// Whether `word` is a keyword that ends or continues the select list, and so
+/// is **not** a bare column alias.
+fn is_reserved_select_alias(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "FROM"
+            | "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "HAVING"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "INTO"
+            | "FOR"
+            | "WINDOW"
+            | "AS"
+    )
+}
+
 /// Extracts the column name from a `SortedColumn` whose expression is a plain
 /// column reference — the only form `sorted_column_list` produces.
 fn sorted_column_name(sc: &ast::SortedColumn) -> &str {
@@ -2151,6 +2184,41 @@ mod tests {
             panic!("expected an aliased table");
         };
         assert!(matches!(alias, ast::As::Elided(n) if n.as_str() == "p"));
+    }
+
+    #[test]
+    fn select_bare_column_alias() {
+        let stmt = parse("SELECT id user_id, n AS amount FROM t").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { columns, from, .. } = s.body.select else {
+            unreachable!()
+        };
+        // Two columns; FROM was recognised, not swallowed as an alias.
+        assert_eq!(columns.len(), 2);
+        assert!(from.is_some());
+        let ast::ResultColumn::Expr(_, Some(ast::As::Elided(n))) = &columns[0] else {
+            panic!("expected a bare (elided) alias on the first column");
+        };
+        assert_eq!(n.as_str(), "user_id");
+        assert!(matches!(
+            &columns[1],
+            ast::ResultColumn::Expr(_, Some(ast::As::As(_)))
+        ));
+    }
+
+    #[test]
+    fn select_no_alias_when_clause_keyword_follows() {
+        // `FROM`/`WHERE`/`ORDER` after an expression are clauses, not aliases.
+        let stmt = parse("SELECT a FROM t WHERE a = 1 ORDER BY a").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { columns, .. } = s.body.select else {
+            unreachable!()
+        };
+        assert!(matches!(columns[0], ast::ResultColumn::Expr(_, None)));
     }
 
     #[test]

@@ -1,0 +1,37 @@
+# Bare (no-AS) column aliases in the select list: `SELECT expr alias`. MySQL and
+# the engine both accept this and both resolve the alias in ORDER BY, so the
+# alias is exercised functionally here (the conformance runner compares row
+# values, not column headers).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS bat (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO bat (id, n) VALUES (1, 30), (2, 10), (3, 20)
+
+# A bare column alias, referenced in ORDER BY.
+query
+SELECT id, n score FROM bat ORDER BY score
+----
+2	10
+3	20
+1	30
+
+# A bare alias on a computed expression, referenced in ORDER BY DESC.
+query
+SELECT id, n * 2 dbl FROM bat ORDER BY dbl DESC
+----
+1	60
+3	40
+2	20
+
+# AS and bare aliases mix in one list; FROM is still recognised as the clause
+# keyword (not an alias for the preceding column).
+query
+SELECT id ident, n AS amount FROM bat ORDER BY ident
+----
+1	30
+2	10
+3	20
