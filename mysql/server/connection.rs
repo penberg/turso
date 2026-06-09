@@ -19,6 +19,7 @@ use turso_mysql_protocol::{
 };
 
 use crate::session::{self, SessionResponse};
+use crate::show::{self, ShowOutcome};
 use crate::Server;
 
 /// MySQL error code for "general error" — adequate for the proof of concept.
@@ -27,6 +28,8 @@ const ER_ERROR_GENERAL: u16 = 1105;
 const ER_PARSE_ERROR: u16 = 1064;
 /// `ER_NOT_SUPPORTED_YET`: a statement the front-end recognizes but cannot run.
 const ER_NOT_SUPPORTED_YET: u16 = 1235;
+/// `ER_NO_SUCH_TABLE`: a statement referenced a table that does not exist.
+const ER_NO_SUCH_TABLE: u16 = 1146;
 
 /// Wraps the blocking socket with a frame decoder and a write buffer.
 struct Wire {
@@ -158,6 +161,17 @@ fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8) -> Vec<u8> {
         return encode_session_response(first_seq, response);
     }
 
+    // `SHOW [FULL] COLUMNS FROM tbl` is answered from the schema here; the AST
+    // has no `SHOW`, so it cannot go through the parser. Every other `SHOW`
+    // falls through and is rejected by the parser as unsupported.
+    if let Some(outcome) = show::try_handle(conn, sql) {
+        return match outcome {
+            Ok(ShowOutcome::Columns(result)) => encode_columns_result(first_seq, result),
+            Ok(ShowOutcome::NoSuchTable(name)) => no_such_table_response(first_seq, &name),
+            Err(e) => error_response(first_seq, &e),
+        };
+    }
+
     let stmt = match turso_mysql_parser::parse(sql) {
         Ok(stmt) => stmt,
         Err(e) => return parse_error_response(first_seq, &e),
@@ -203,6 +217,51 @@ fn encode_session_response(first_seq: u8, response: SessionResponse) -> Vec<u8> 
             );
         }
     }
+    out
+}
+
+/// Frames a synthesized result set (e.g. the reply to `SHOW COLUMNS`): a column
+/// header for each name, then one text row per data row.
+fn encode_columns_result(first_seq: u8, result: show::ColumnsResult) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut seq = encode_frame(
+        &mut out,
+        first_seq,
+        &encode_column_count(result.columns.len() as u64),
+    );
+    for name in &result.columns {
+        seq = encode_frame(
+            &mut out,
+            seq,
+            &ColumnDefinition::text((*name).to_string()).encode(),
+        );
+    }
+    seq = encode_frame(
+        &mut out,
+        seq,
+        &EofPacket::new(SERVER_STATUS_AUTOCOMMIT).encode(),
+    );
+    for row in result.rows {
+        let cells = row
+            .into_iter()
+            .map(|v| v.map(String::into_bytes))
+            .collect::<Vec<_>>();
+        seq = encode_frame(&mut out, seq, &encode_text_row(cells));
+    }
+    encode_frame(
+        &mut out,
+        seq,
+        &EofPacket::new(SERVER_STATUS_AUTOCOMMIT).encode(),
+    );
+    out
+}
+
+/// Builds a MySQL ERR packet for a reference to a table that does not exist.
+fn no_such_table_response(first_seq: u8, table: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let err = ErrPacket::new(ER_NO_SUCH_TABLE, format!("Table '{table}' doesn't exist"))
+        .with_state(*b"42S02");
+    encode_frame(&mut out, first_seq, &err.encode());
     out
 }
 

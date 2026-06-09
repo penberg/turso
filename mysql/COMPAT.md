@@ -461,7 +461,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | SHOW BINLOG EVENTS         | ❌     |         |
 | SHOW CHARACTER SET         | ❌     |         |
 | SHOW COLLATION             | ❌     |         |
-| SHOW COLUMNS               | ❌     |         |
+| SHOW [FULL] COLUMNS / FIELDS FROM *tbl* | ✅ | Answered from the schema (`PRAGMA table_info`). `Field`, `Null`, `Key`, `Default`, `Extra` and the result-set shape match MySQL; `Type` is lowercased but **not** otherwise normalized (column sizes, `unsigned`, and integer display-width stripping are not applied), and text `Collation` is reported as a fixed `utf8mb4_general_ci`. The `LIKE`/`WHERE` filter forms are not handled (rejected as unsupported). A missing table errors with 1146. |
 | SHOW CREATE DATABASE       | ❌     |         |
 | SHOW CREATE EVENT          | ❌     |         |
 | SHOW CREATE FUNCTION       | ❌     |         |

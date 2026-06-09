@@ -1,0 +1,42 @@
+# SHOW [FULL] COLUMNS conformance.
+#
+# WordPress probes every table with `SHOW FULL COLUMNS FROM` during install to
+# learn each column's format. The front-end answers from the schema (via
+# PRAGMA table_info) and reshapes the result into MySQL's columns.
+#
+# The result-set shape and the schema-derived columns (Field, Type, Null, Key,
+# Default, Extra) match MySQL for the simple, size-free types used here. MySQL's
+# type-display normalization (column sizes, `unsigned`, integer width stripping)
+# and the exact text Collation are not modeled, so this file deliberately avoids
+# size-bearing types and, for the FULL form, uses integer columns whose
+# Collation is NULL on both targets. See mysql/COMPAT.md.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Rows are
+# tab-separated; the trailing empty Extra/Comment columns produce a trailing tab.
+
+statement ok
+CREATE TABLE IF NOT EXISTS show_demo (a INT NOT NULL PRIMARY KEY, c TEXT, d BIGINT)
+
+# SHOW COLUMNS: Field, Type, Null, Key, Default, Extra.
+query
+SHOW COLUMNS FROM show_demo
+----
+a	int	NO	PRI	NULL	
+c	text	YES		NULL	
+d	bigint	YES		NULL	
+
+# SHOW FULL COLUMNS adds Collation, Privileges, Comment. Integer-only columns so
+# every Collation is NULL on both targets (text collation is server-config
+# dependent and intentionally not asserted here).
+statement ok
+CREATE TABLE IF NOT EXISTS show_full_demo (a INT NOT NULL PRIMARY KEY, d BIGINT)
+
+query
+SHOW FULL COLUMNS FROM show_full_demo
+----
+a	int	NULL	NO	PRI	NULL		select,insert,update,references	
+d	bigint	NULL	YES		NULL		select,insert,update,references	
+
+# A SHOW COLUMNS on a missing table errors on both targets.
+statement error
+SHOW COLUMNS FROM show_no_such_table
