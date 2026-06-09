@@ -1,0 +1,45 @@
+# EXISTS / NOT EXISTS subqueries. EXISTS tests whether a (typically correlated)
+# subquery returns any row; its semantics are identical in MySQL and the engine
+# (and, unlike a scalar subquery, it has no multi-row divergence).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ex_a (id INT PRIMARY KEY, n INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS ex_b (ref INT, tag VARCHAR(8))
+
+statement ok
+INSERT INTO ex_a (id, n) VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO ex_b (ref, tag) VALUES (2, 'x'), (3, 'y')
+
+# EXISTS with a correlated subquery: rows of ex_a that have a matching ex_b row.
+query
+SELECT id FROM ex_a WHERE EXISTS (SELECT 1 FROM ex_b WHERE ex_b.ref = ex_a.id) ORDER BY id
+----
+2
+3
+
+# NOT EXISTS: rows of ex_a with no matching ex_b row.
+query
+SELECT id FROM ex_a WHERE NOT EXISTS (SELECT 1 FROM ex_b WHERE ex_b.ref = ex_a.id) ORDER BY id
+----
+1
+
+# EXISTS combined with another predicate.
+query
+SELECT id FROM ex_a WHERE n >= 20 AND EXISTS (SELECT 1 FROM ex_b WHERE ex_b.ref = ex_a.id AND ex_b.tag = 'y') ORDER BY id
+----
+3
+
+# An always-true EXISTS over a non-empty table returns every row.
+query
+SELECT id FROM ex_a WHERE EXISTS (SELECT 1 FROM ex_b) ORDER BY id
+----
+1
+2
+3

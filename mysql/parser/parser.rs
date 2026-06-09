@@ -1486,6 +1486,10 @@ impl Parser {
                         self.advance();
                         self.case_expr()
                     }
+                    "EXISTS" if self.peek_nth(1) == Some(&Token::LParen) => {
+                        self.advance();
+                        self.exists_expr()
+                    }
                     // A bare identifier followed by `(` is a function call;
                     // otherwise it is a column reference.
                     _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
@@ -1532,6 +1536,16 @@ impl Parser {
             when_then_pairs,
             else_expr,
         })
+    }
+
+    /// Parses an `EXISTS (SELECT ...)` predicate. `NOT EXISTS` is handled by the
+    /// prefix-`NOT` layer wrapping this. `EXISTS` has already been consumed.
+    fn exists_expr(&mut self) -> Result<ast::Expr> {
+        self.expect(&Token::LParen, "`(`")?;
+        self.expect_keyword("SELECT")?;
+        let select = self.parse_select()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::Exists(select))
     }
 
     /// Parses a function call `name(arg, ...)`. The name must be in the clean
@@ -2231,6 +2245,26 @@ mod tests {
             unreachable!()
         };
         assert!(matches!(columns[0], ast::ResultColumn::Expr(_, None)));
+    }
+
+    #[test]
+    fn exists_subquery() {
+        // EXISTS (SELECT ...) parses as an Exists predicate.
+        assert!(matches!(
+            parse_expr("EXISTS (SELECT 1 FROM b WHERE b.ref = a.id)").unwrap(),
+            ast::Expr::Exists(_)
+        ));
+
+        // NOT EXISTS wraps the Exists in a unary NOT.
+        let ast::Expr::Unary(ast::UnaryOperator::Not, inner) =
+            parse_expr("NOT EXISTS (SELECT 1 FROM b)").unwrap()
+        else {
+            panic!("expected NOT(Exists)");
+        };
+        assert!(matches!(inner.as_ref(), ast::Expr::Exists(_)));
+
+        // `exists` not followed by `(` is an ordinary column reference.
+        assert!(matches!(parse_expr("exists").unwrap(), ast::Expr::Id(_)));
     }
 
     #[test]
