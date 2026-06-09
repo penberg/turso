@@ -23,7 +23,7 @@
 //! assert!(matches!(stmt, ast::Stmt::Select(_)));
 //!
 //! // Unsupported statements (and sub-clauses) are reported, not forwarded.
-//! assert!(parse("SELECT DISTINCT a FROM t").is_err());
+//! assert!(parse("SELECT a FROM t1 JOIN t2 ON t1.id = t2.id").is_err());
 //! assert!(parse("DROP TABLE IF EXISTS t").is_err());
 //! ```
 

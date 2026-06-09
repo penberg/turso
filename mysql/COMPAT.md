@@ -268,7 +268,7 @@ incomplete.
 | REPLACE                                | ❌     |         |
 | SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
 | SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
-| SELECT DISTINCT                        | ❌     | **Not supported.** |
+| SELECT DISTINCT                        | ✅     | `DISTINCTROW` synonym not supported. |
 | SELECT ... INTO                        | ❌     | **Not supported.** |
 | JOIN clause                            | ❌     | **Not supported.** |
 | UNION                                  | ❌     |         |

@@ -612,12 +612,18 @@ impl Parser {
     /// aggregates, set operations, and CTEs are rejected as unsupported.
     fn select(&mut self) -> Result<ast::Stmt> {
         // `SELECT` has already been consumed.
-        if self.is_keyword("DISTINCT") || self.is_keyword("DISTINCTROW") {
+        if self.is_keyword("DISTINCTROW") {
+            // MySQL synonym for DISTINCT; not modeled.
             return Err(ParseError::Unsupported(
-                "SELECT DISTINCT is not supported yet".to_string(),
+                "SELECT DISTINCTROW is not supported yet".to_string(),
             ));
         }
-        self.eat_keyword("ALL"); // the default quantifier; accepted and ignored
+        let distinctness = if self.eat_keyword("DISTINCT") {
+            Some(ast::Distinctness::Distinct)
+        } else {
+            self.eat_keyword("ALL"); // the default quantifier; accepted and ignored
+            None
+        };
 
         let columns = self.select_list()?;
 
@@ -653,7 +659,7 @@ impl Parser {
             with: None,
             body: ast::SelectBody {
                 select: ast::OneSelect::Select {
-                    distinctness: None,
+                    distinctness,
                     columns,
                     from,
                     where_clause,
@@ -1602,9 +1608,30 @@ mod tests {
     }
 
     #[test]
+    fn select_distinct() {
+        let stmt = parse("SELECT DISTINCT cat FROM t").unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { distinctness, .. } = select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert_eq!(distinctness, Some(ast::Distinctness::Distinct));
+
+        // `ALL` is the default quantifier and yields no DISTINCT.
+        let ast::Stmt::Select(select) = parse("SELECT ALL cat FROM t").unwrap() else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { distinctness, .. } = select.body.select else {
+            unreachable!()
+        };
+        assert_eq!(distinctness, None);
+    }
+
+    #[test]
     fn select_unsupported_variants() {
         for sql in [
-            "SELECT DISTINCT a FROM t",
+            "SELECT DISTINCTROW a FROM t",
             "SELECT * FROM a, b",
             "SELECT * FROM a JOIN b ON a.id = b.id",
             "SELECT * FROM (SELECT 1)",
