@@ -1,0 +1,33 @@
+# Leading-dot float literals (`.5`) parse and evaluate identically in MySQL and
+# the engine. The lexer previously split `.5` into a `.` token and `5`, so it
+# failed to parse; it now reads it as a single numeric literal.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Cases are
+# chosen so MySQL's DECIMAL scale padding does not apply (e.g. no trailing-zero
+# results like 0.25 + 0.25 -> 0.50), which is a separate, excluded divergence.
+
+# Leading-dot literals render the same on both.
+query
+SELECT .5, 1.5, .25, .125
+----
+0.5	1.5	0.25	0.125
+
+# Mixing an integer with a leading-dot literal keeps the fractional scale.
+query
+SELECT 10 - .5, 3 + .25
+----
+9.5	3.25
+
+# A leading-dot literal still works next to a qualified column reference (the
+# dot in `t.v` is the qualifier, not a number).
+statement ok
+CREATE TABLE IF NOT EXISTS numlit (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO numlit (id, v) VALUES (1, 10), (2, 20)
+
+query
+SELECT t.id, t.v + .5 FROM numlit t ORDER BY t.id
+----
+1	10.5
+2	20.5

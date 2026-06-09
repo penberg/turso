@@ -50,6 +50,9 @@ impl<'a> Lexer<'a> {
             b'(' => self.single(Token::LParen),
             b')' => self.single(Token::RParen),
             b',' => self.single(Token::Comma),
+            // `.5` is a numeric literal; a bare `.` (e.g. `t.col`) is the
+            // qualifier dot.
+            b'.' if matches!(self.peek_at(1), Some(d) if d.is_ascii_digit()) => self.read_number(),
             b'.' => self.single(Token::Dot),
             b';' => self.single(Token::Semicolon),
             b'=' => self.single(Token::Eq),
@@ -303,6 +306,34 @@ mod tests {
         // Escapes and doubled quotes still work.
         assert_eq!(first_string(r"SELECT 'a\tb'"), "a\tb");
         assert_eq!(first_string("SELECT 'it''s'"), "it's");
+    }
+
+    fn tokens(sql: &str) -> Vec<Token> {
+        Lexer::new(sql.as_bytes())
+            .tokenize()
+            .unwrap()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    #[test]
+    fn leading_dot_float_literal() {
+        // `.5` is one numeric literal.
+        assert_eq!(
+            tokens("SELECT .5"),
+            vec![Token::Word("SELECT".into()), Token::Num(".5".into())]
+        );
+        // The dot in a qualified name is still a Dot token.
+        assert_eq!(
+            tokens("a.b"),
+            vec![Token::Word("a".into()), Token::Dot, Token::Word("b".into())]
+        );
+        // `tbl.*` keeps the dot too.
+        assert_eq!(
+            tokens("t.*"),
+            vec![Token::Word("t".into()), Token::Dot, Token::Star]
+        );
     }
 
     #[test]
