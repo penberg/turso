@@ -8,6 +8,7 @@ members = [
     "bindings/javascript/sync",
     "bindings/python",
     "bindings/rust",
+    "mysql/protocol",
     "cli",
     "core",
     "extensions/completion",
@@ -50,6 +51,7 @@ default-members = [
     "bindings/javascript/sync",
     "bindings/python",
     "bindings/rust",
+    "mysql/protocol",
     "cli",
     "core",
     "extensions/completion",
@@ -102,6 +104,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.6" }
 turso_ext = { path = "extensions/core", version = "0.7.0-pre.6" }
 turso_macros = { path = "macros", version = "0.7.0-pre.6" }
 turso_parser = { path = "parser", version = "0.7.0-pre.6" }
+turso-mysql-protocol = { path = "mysql/protocol", version = "0.7.0-pre.6" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }

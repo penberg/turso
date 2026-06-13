@@ -1,0 +1,16 @@
+# Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-mysql-protocol"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sans-IO MySQL client/server wire protocol codec for Turso"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+thiserror.workspace = true
