@@ -1,0 +1,22 @@
+# Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-mysql-conformance"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Conformance test runner that drives a MySQL endpoint over the wire"
+
+[[bin]]
+name = "turso-mysql-conformance"
+path = "main.rs"
+
+[dependencies]
+# The conformance runner talks to the server purely over the MySQL wire
+# protocol, using the standard `mysql` client crate. The same runner therefore
+# works against the Turso MySQL front-end and against a real `mysqld`.
+mysql = { version = "26", default-features = false, features = ["minimal"] }
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }

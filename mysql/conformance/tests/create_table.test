@@ -1,0 +1,34 @@
+# CREATE TABLE conformance.
+#
+# These exercise the part of MySQL the Turso front-end implements today, so the
+# file is expected to pass against both `turso-mysql-server` and a real mysqld.
+# `IF NOT EXISTS` keeps the file re-runnable against a persistent server.
+
+statement ok
+CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL)
+
+statement ok
+CREATE TABLE IF NOT EXISTS posts (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  title TEXT,
+  body TEXT,
+  author_id INT
+)
+
+statement ok
+CREATE TABLE IF NOT EXISTS kv (k VARCHAR(64), v VARCHAR(255), PRIMARY KEY (k))
+
+statement ok
+CREATE TABLE IF NOT EXISTS typed (
+  a TINYINT,
+  b INT UNSIGNED,
+  c BIGINT,
+  d DOUBLE,
+  e DECIMAL(10,2),
+  f VARCHAR(32) DEFAULT 'x',
+  g TEXT
+)
+
+# A CREATE TABLE with no body is a syntax error on MySQL and the front-end alike.
+statement error
+CREATE TABLE
