@@ -1,0 +1,17 @@
+# Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-mysql-parser"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hand-written MySQL SQL parser that emits the turso_parser AST"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+turso_parser = { workspace = true }
+thiserror.workspace = true

@@ -6581,6 +6581,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-mysql-parser"
+version = "0.7.0-pre.6"
+dependencies = [
+ "thiserror 2.0.16",
+ "turso_parser",
+]
+
+[[package]]
 name = "turso-mysql-protocol"
 version = "0.7.0-pre.6"
 dependencies = [
