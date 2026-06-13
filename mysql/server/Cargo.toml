@@ -1,0 +1,31 @@
+# Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-mysql-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A MySQL-protocol front-end for Turso (proof of concept)"
+
+[[bin]]
+name = "turso-mysql-server"
+path = "main.rs"
+
+[dependencies]
+turso-mysql-protocol = { workspace = true }
+turso-mysql-parser = { workspace = true }
+turso_core = { workspace = true, default-features = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "signal",
+    "sync",
+] }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true, features = ["derive"] }

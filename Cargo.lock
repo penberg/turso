@@ -6596,6 +6596,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-mysql-server"
+version = "0.7.0-pre.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turso-mysql-parser",
+ "turso-mysql-protocol",
+ "turso_core",
+]
+
+[[package]]
 name = "turso_cli"
 version = "0.7.0-pre.6"
 dependencies = [
