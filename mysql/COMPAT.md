@@ -1,0 +1,457 @@
+# Turso MySQL Compatibility
+
+This document tracks the current state of MySQL compatibility — both the wire
+**protocol** and the **SQL statement** surface taken from the
+[MySQL 8.0 SQL Statements reference](https://dev.mysql.com/doc/refman/8.0/en/sql-statements.html).
+
+> [!WARNING]
+> **Nothing here is implemented.** The MySQL front-end is an early proof of
+> concept. Every entry is marked ❌ on purpose: no feature is complete or
+> validated against MySQL's behavior, error codes, type system, and edge
+> cases. Where a code path already exists in the proof of concept, the comment
+> says so — but it still counts as not done until it is verified. The 🚧 and ✅
+> markers are intentionally not used anywhere yet; no feature has earned them.
+
+## Legend
+
+| Marker | Meaning                                                                       |
+|--------|-------------------------------------------------------------------------------|
+| ❌     | **No** — not implemented (the state of everything today).                      |
+| 🚧     | Partial — implemented but incomplete or unverified. *(Not used yet.)*          |
+| ✅     | Yes — complete and validated against MySQL. *(Not used yet.)*                  |
+
+## Table of contents
+
+- [Turso MySQL Compatibility](#turso-mysql-compatibility)
+  - [Legend](#legend)
+  - [Table of contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Wire protocol](#wire-protocol)
+    - [Connection phase](#connection-phase)
+    - [Authentication methods](#authentication-methods)
+    - [Capability flags](#capability-flags)
+    - [Command phase packets](#command-phase-packets)
+    - [Generic response packets](#generic-response-packets)
+    - [Result sets](#result-sets)
+    - [Prepared statements (binary protocol)](#prepared-statements-binary-protocol)
+    - [Transport-level features](#transport-level-features)
+  - [MySQL SQL statements](#mysql-sql-statements)
+    - [Data Definition Statements](#data-definition-statements)
+    - [Data Manipulation Statements](#data-manipulation-statements)
+    - [Transactional and Locking Statements](#transactional-and-locking-statements)
+    - [Replication Statements](#replication-statements)
+    - [Prepared SQL Statements](#prepared-sql-statements)
+    - [Compound Statement Syntax](#compound-statement-syntax)
+    - [Database Administration Statements](#database-administration-statements)
+      - [Account Management](#account-management)
+      - [Resource Group Management](#resource-group-management)
+      - [Table Maintenance](#table-maintenance)
+      - [Component, Plugin, and Loadable Function](#component-plugin-and-loadable-function)
+      - [SET Statements](#set-statements)
+      - [SHOW Statements](#show-statements)
+      - [Other Administrative Statements](#other-administrative-statements)
+    - [Utility Statements](#utility-statements)
+
+## Overview
+
+* ❌ MySQL wire protocol [[status](#wire-protocol)] — only the minimum needed
+  for a text-protocol `COM_QUERY` round trip is exercised by the proof of
+  concept; the handshake accepts any credentials without verification.
+* ❌ MySQL SQL statements [[status](#mysql-sql-statements)] — statements are
+  forwarded verbatim to the Turso (SQLite-dialect) engine. MySQL-specific
+  syntax, semantics, data types, and error codes are not yet translated.
+
+The proof of concept currently:
+
+* Sends a `HandshakeV10` greeting and accepts a `HandshakeResponse41` reply
+  **without authenticating** the user.
+* Handles `COM_QUERY` by running the SQL through the engine and streaming a
+  **text-protocol** result set (or an `OK`/`ERR` packet).
+* Handles `COM_PING`, `COM_INIT_DB` (acknowledged as a no-op), and `COM_QUIT`.
+
+Everything else — binary protocol, prepared statements, TLS, real
+authentication, MySQL dialect translation, the `information_schema`, `SHOW`,
+session variables, multi-statement/multi-result, compression — is unimplemented.
+
+## Wire protocol
+
+### Connection phase
+
+| Item                                                  | Status | Comment                                                            |
+|-------------------------------------------------------|--------|--------------------------------------------------------------------|
+| Initial handshake — `Protocol::HandshakeV10`          | ❌     | Server greeting is sent; encoded by `turso-mysql-protocol`.        |
+| Legacy handshake — `Protocol::HandshakeV9`            | ❌     | Not implemented.                                                   |
+| Handshake response — `HandshakeResponse41`            | ❌     | Parsed, but auth response is ignored (no verification).            |
+| Handshake response — `HandshakeResponse320`           | ❌     | Pre-4.1 clients not supported.                                     |
+| TLS upgrade — `Protocol::SSLRequest` / `CLIENT_SSL`   | ❌     | No TLS; connections are plaintext only.                            |
+| Auth method switch — `AuthSwitchRequest`/`Response`   | ❌     | Not implemented.                                                   |
+| Auth more data — `AuthMoreData`                       | ❌     | Not implemented.                                                   |
+| Connection attributes — `CLIENT_CONNECT_ATTRS`        | ❌     | Not parsed.                                                        |
+| Initial database — `CLIENT_CONNECT_WITH_DB`           | ❌     | Capability advertised; database name not acted upon.               |
+
+### Authentication methods
+
+| Method                        | Status | Comment                                              |
+|-------------------------------|--------|------------------------------------------------------|
+| `mysql_native_password`       | ❌     | Advertised in the handshake; response not verified.  |
+| `caching_sha2_password`       | ❌     | Not implemented (MySQL 8.0 default).                 |
+| `sha256_password`             | ❌     | Not implemented.                                     |
+| `mysql_clear_password`        | ❌     | Not implemented.                                     |
+| `auth_socket` / external      | ❌     | Not implemented.                                     |
+| Credential checking / users   | ❌     | No user store; every login is accepted.              |
+
+### Capability flags
+
+| Flag                                       | Status | Comment                                            |
+|--------------------------------------------|--------|----------------------------------------------------|
+| `CLIENT_PROTOCOL_41`                       | ❌     | Advertised; assumed for all packet layouts.        |
+| `CLIENT_LONG_PASSWORD` / `CLIENT_LONG_FLAG`| ❌     | Advertised.                                        |
+| `CLIENT_SECURE_CONNECTION`                 | ❌     | Advertised.                                        |
+| `CLIENT_PLUGIN_AUTH`                       | ❌     | Advertised.                                        |
+| `CLIENT_CONNECT_WITH_DB`                   | ❌     | Advertised; not honored.                           |
+| `CLIENT_TRANSACTIONS`                      | ❌     | Advertised; status flags are static.               |
+| `CLIENT_DEPRECATE_EOF`                     | ❌     | Not advertised; classic EOF packets are used.      |
+| `CLIENT_MULTI_STATEMENTS`                  | ❌     | Not advertised.                                    |
+| `CLIENT_MULTI_RESULTS`                     | ❌     | Not advertised.                                    |
+| `CLIENT_COMPRESS` / `CLIENT_ZSTD_*`        | ❌     | Not advertised; no compression.                    |
+| `CLIENT_SSL`                               | ❌     | Not advertised; no TLS.                            |
+| `CLIENT_SESSION_TRACK`                     | ❌     | Not advertised.                                    |
+| `CLIENT_LOCAL_FILES`                       | ❌     | Not advertised.                                    |
+| `CLIENT_OPTIONAL_RESULTSET_METADATA`       | ❌     | Not advertised.                                    |
+
+### Command phase packets
+
+| Command                       | Status | Comment                                                       |
+|-------------------------------|--------|---------------------------------------------------------------|
+| `COM_QUERY`                   | ❌     | Text protocol only; single statement; forwarded to engine.    |
+| `COM_QUIT`                    | ❌     | Closes the connection.                                        |
+| `COM_PING`                    | ❌     | Replies `OK`.                                                 |
+| `COM_INIT_DB`                 | ❌     | Acknowledged as a no-op (single schema).                      |
+| `COM_FIELD_LIST`              | ❌     | Not implemented (deprecated in MySQL).                        |
+| `COM_STATISTICS`              | ❌     | Not implemented.                                              |
+| `COM_PROCESS_INFO`            | ❌     | Not implemented.                                              |
+| `COM_PROCESS_KILL`            | ❌     | Not implemented.                                              |
+| `COM_DEBUG`                   | ❌     | Not implemented.                                              |
+| `COM_CHANGE_USER`             | ❌     | Not implemented.                                              |
+| `COM_RESET_CONNECTION`        | ❌     | Not implemented.                                              |
+| `COM_SET_OPTION`              | ❌     | Not implemented.                                              |
+| `COM_STMT_PREPARE`            | ❌     | Not implemented.                                              |
+| `COM_STMT_EXECUTE`            | ❌     | Not implemented.                                              |
+| `COM_STMT_SEND_LONG_DATA`     | ❌     | Not implemented.                                              |
+| `COM_STMT_CLOSE`              | ❌     | Not implemented.                                              |
+| `COM_STMT_RESET`              | ❌     | Not implemented.                                              |
+| `COM_STMT_FETCH`              | ❌     | Not implemented.                                              |
+| `COM_REFRESH` / `COM_SHUTDOWN`| ❌     | Not implemented (deprecated in MySQL).                        |
+
+### Generic response packets
+
+| Packet                         | Status | Comment                                                     |
+|--------------------------------|--------|-------------------------------------------------------------|
+| `OK_Packet`                    | ❌     | Encoded; `affected_rows`/`last_insert_id` from the engine.  |
+| `ERR_Packet`                   | ❌     | Encoded; always SQLSTATE `HY000`, error code `1105`.        |
+| `EOF_Packet`                   | ❌     | Encoded; used to terminate column lists and result sets.    |
+| MySQL error code mapping       | ❌     | All errors collapse to a single generic code.               |
+| SQLSTATE mapping               | ❌     | Always `HY000`.                                             |
+| Session state change tracking  | ❌     | Not implemented.                                            |
+
+### Result sets
+
+| Item                                       | Status | Comment                                              |
+|--------------------------------------------|--------|------------------------------------------------------|
+| Column count packet                        | ❌     | Encoded.                                             |
+| Column definition — `ColumnDefinition41`   | ❌     | Encoded; every column typed as `VAR_STRING`.         |
+| Real column types / flags / decimals       | ❌     | Not derived from the schema; placeholders only.      |
+| Text protocol rows                         | ❌     | Encoded; values rendered via the engine's `Display`. |
+| Binary protocol rows                       | ❌     | Not implemented.                                     |
+| `NULL` handling                            | ❌     | `0xfb` marker emitted for NULL.                      |
+| Charset / collation per column             | ❌     | Hard-coded to `utf8mb4_general_ci`.                  |
+| Multi-resultset (`SERVER_MORE_RESULTS`)    | ❌     | Not implemented.                                     |
+| `LOCAL INFILE` response                    | ❌     | Not implemented.                                     |
+
+### Prepared statements (binary protocol)
+
+| Item                                  | Status | Comment              |
+|---------------------------------------|--------|----------------------|
+| Server-side prepare/execute           | ❌     | Not implemented.     |
+| Parameter binding (binary)            | ❌     | Not implemented.     |
+| `COM_STMT_*` packets                  | ❌     | Not implemented.     |
+| Cursors / `COM_STMT_FETCH`            | ❌     | Not implemented.     |
+
+### Transport-level features
+
+| Item                                       | Status | Comment                                                       |
+|--------------------------------------------|--------|---------------------------------------------------------------|
+| Packet framing (3-byte len + seq id)       | ❌     | Implemented in `turso-mysql-protocol`.                        |
+| Multi-frame payloads (>16 MiB) reassembly  | ❌     | Implemented in the decoder; not exercised end to end.         |
+| Compression (`zlib` / `zstd`)              | ❌     | Not implemented.                                              |
+| TLS / encryption                           | ❌     | Not implemented.                                              |
+| Unix domain socket transport               | ❌     | TCP only.                                                     |
+| Named pipe / shared memory transport       | ❌     | Not implemented.                                              |
+| Connection / thread id                     | ❌     | Assigned per connection; not exposed via `CONNECTION_ID()`.   |
+
+## MySQL SQL statements
+
+Statement support reflects what is reachable through `COM_QUERY` today. Because
+queries are passed to the SQLite-dialect engine unchanged, MySQL-specific
+syntax and semantics for any statement below are **not** translated, even where
+a superficially similar statement executes. All entries are therefore marked
+incomplete.
+
+### Data Definition Statements
+
+| Statement                              | Status | Comment |
+|----------------------------------------|--------|---------|
+| ALTER DATABASE                         | ❌     |         |
+| ALTER EVENT                            | ❌     |         |
+| ALTER FUNCTION                         | ❌     |         |
+| ALTER INSTANCE                         | ❌     |         |
+| ALTER LOGFILE GROUP                    | ❌     |         |
+| ALTER PROCEDURE                        | ❌     |         |
+| ALTER SERVER                           | ❌     |         |
+| ALTER TABLE                            | ❌     | MySQL clauses (ALGORITHM, partitioning, etc.) not translated. |
+| ALTER TABLESPACE                       | ❌     |         |
+| ALTER VIEW                             | ❌     |         |
+| CREATE DATABASE                        | ❌     |         |
+| CREATE EVENT                           | ❌     |         |
+| CREATE FUNCTION                        | ❌     |         |
+| CREATE INDEX                           | ❌     |         |
+| CREATE LOGFILE GROUP                   | ❌     |         |
+| CREATE PROCEDURE / CREATE FUNCTION     | ❌     |         |
+| CREATE SERVER                          | ❌     |         |
+| CREATE SPATIAL REFERENCE SYSTEM        | ❌     |         |
+| CREATE TABLE                           | ❌     | MySQL types, storage engines, and table options not translated. |
+| CREATE TEMPORARY TABLE                 | ❌     |         |
+| CREATE TABLE ... LIKE                  | ❌     |         |
+| CREATE TABLE ... SELECT                | ❌     |         |
+| CREATE TABLESPACE                      | ❌     |         |
+| CREATE TRIGGER                         | ❌     |         |
+| CREATE VIEW                            | ❌     |         |
+| DROP DATABASE                          | ❌     |         |
+| DROP EVENT                             | ❌     |         |
+| DROP FUNCTION                          | ❌     |         |
+| DROP INDEX                             | ❌     |         |
+| DROP LOGFILE GROUP                     | ❌     |         |
+| DROP PROCEDURE / DROP FUNCTION         | ❌     |         |
+| DROP SERVER                            | ❌     |         |
+| DROP SPATIAL REFERENCE SYSTEM          | ❌     |         |
+| DROP TABLE                             | ❌     |         |
+| DROP TABLESPACE                        | ❌     |         |
+| DROP TRIGGER                           | ❌     |         |
+| DROP VIEW                              | ❌     |         |
+| RENAME TABLE                           | ❌     |         |
+| TRUNCATE TABLE                         | ❌     |         |
+
+### Data Manipulation Statements
+
+| Statement                              | Status | Comment |
+|----------------------------------------|--------|---------|
+| CALL                                   | ❌     |         |
+| DELETE                                 | ❌     |         |
+| DO                                     | ❌     |         |
+| EXCEPT clause                          | ❌     |         |
+| HANDLER                                | ❌     |         |
+| IMPORT TABLE                           | ❌     |         |
+| INSERT                                 | ❌     |         |
+| INSERT ... SELECT                      | ❌     |         |
+| INSERT ... ON DUPLICATE KEY UPDATE     | ❌     | MySQL upsert syntax differs from SQLite's. |
+| INSERT DELAYED                         | ❌     |         |
+| INTERSECT clause                       | ❌     |         |
+| LOAD DATA                              | ❌     |         |
+| LOAD XML                               | ❌     |         |
+| Parenthesized Query Expressions        | ❌     |         |
+| REPLACE                                | ❌     |         |
+| SELECT                                 | ❌     | Basic SELECT round-trips via the engine; unverified for MySQL semantics. |
+| SELECT ... INTO                        | ❌     |         |
+| JOIN clause                            | ❌     |         |
+| UNION                                  | ❌     |         |
+| INTERSECT / EXCEPT set operations      | ❌     |         |
+| Subqueries                             | ❌     |         |
+| Derived / lateral derived tables       | ❌     |         |
+| TABLE statement                        | ❌     |         |
+| UPDATE                                 | ❌     |         |
+| VALUES statement                       | ❌     |         |
+| WITH (Common Table Expressions)        | ❌     |         |
+
+### Transactional and Locking Statements
+
+| Statement                                       | Status | Comment |
+|-------------------------------------------------|--------|---------|
+| START TRANSACTION / BEGIN                       | ❌     |         |
+| COMMIT                                           | ❌     |         |
+| ROLLBACK                                         | ❌     |         |
+| SAVEPOINT                                        | ❌     |         |
+| ROLLBACK TO SAVEPOINT                            | ❌     |         |
+| RELEASE SAVEPOINT                                | ❌     |         |
+| LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE       | ❌     |         |
+| LOCK TABLES / UNLOCK TABLES                      | ❌     |         |
+| SET TRANSACTION                                  | ❌     |         |
+| XA transactions (XA START/END/PREPARE/COMMIT...) | ❌     |         |
+
+### Replication Statements
+
+| Statement                                       | Status | Comment |
+|-------------------------------------------------|--------|---------|
+| PURGE BINARY LOGS                               | ❌     |         |
+| RESET MASTER / RESET BINARY LOGS AND GTIDS      | ❌     |         |
+| SET sql_log_bin                                 | ❌     |         |
+| CHANGE MASTER TO / CHANGE REPLICATION SOURCE TO | ❌     |         |
+| CHANGE REPLICATION FILTER                       | ❌     |         |
+| RESET REPLICA / RESET SLAVE                     | ❌     |         |
+| START REPLICA / START SLAVE                     | ❌     |         |
+| STOP REPLICA / STOP SLAVE                       | ❌     |         |
+| START GROUP_REPLICATION                         | ❌     |         |
+| STOP GROUP_REPLICATION                          | ❌     |         |
+
+### Prepared SQL Statements
+
+| Statement            | Status | Comment |
+|----------------------|--------|---------|
+| PREPARE              | ❌     |         |
+| EXECUTE              | ❌     |         |
+| DEALLOCATE PREPARE   | ❌     |         |
+
+### Compound Statement Syntax
+
+| Statement                                   | Status | Comment |
+|---------------------------------------------|--------|---------|
+| BEGIN ... END                               | ❌     |         |
+| Statement labels                            | ❌     |         |
+| DECLARE                                     | ❌     |         |
+| Variables in stored programs                | ❌     |         |
+| CASE                                        | ❌     |         |
+| IF                                          | ❌     |         |
+| ITERATE                                     | ❌     |         |
+| LEAVE                                       | ❌     |         |
+| LOOP                                        | ❌     |         |
+| REPEAT                                      | ❌     |         |
+| RETURN                                      | ❌     |         |
+| WHILE                                       | ❌     |         |
+| Cursors (OPEN / FETCH / CLOSE / DECLARE)    | ❌     |         |
+| DECLARE ... CONDITION                       | ❌     |         |
+| DECLARE ... HANDLER                         | ❌     |         |
+| GET DIAGNOSTICS                             | ❌     |         |
+| SIGNAL / RESIGNAL                           | ❌     |         |
+
+### Database Administration Statements
+
+#### Account Management
+
+| Statement              | Status | Comment |
+|------------------------|--------|---------|
+| ALTER USER             | ❌     |         |
+| CREATE ROLE            | ❌     |         |
+| CREATE USER            | ❌     |         |
+| DROP ROLE              | ❌     |         |
+| DROP USER              | ❌     |         |
+| GRANT                  | ❌     |         |
+| RENAME USER            | ❌     |         |
+| REVOKE                 | ❌     |         |
+| SET DEFAULT ROLE       | ❌     |         |
+| SET PASSWORD           | ❌     |         |
+| SET ROLE               | ❌     |         |
+
+#### Resource Group Management
+
+| Statement                | Status | Comment |
+|--------------------------|--------|---------|
+| ALTER RESOURCE GROUP     | ❌     |         |
+| CREATE RESOURCE GROUP    | ❌     |         |
+| DROP RESOURCE GROUP      | ❌     |         |
+| SET RESOURCE GROUP       | ❌     |         |
+
+#### Table Maintenance
+
+| Statement          | Status | Comment |
+|--------------------|--------|---------|
+| ANALYZE TABLE      | ❌     |         |
+| CHECK TABLE        | ❌     |         |
+| CHECKSUM TABLE     | ❌     |         |
+| OPTIMIZE TABLE     | ❌     |         |
+| REPAIR TABLE       | ❌     |         |
+
+#### Component, Plugin, and Loadable Function
+
+| Statement                                     | Status | Comment |
+|-----------------------------------------------|--------|---------|
+| CREATE FUNCTION (loadable)                    | ❌     |         |
+| DROP FUNCTION (loadable)                       | ❌     |         |
+| INSTALL COMPONENT                              | ❌     |         |
+| INSTALL PLUGIN                                 | ❌     |         |
+| UNINSTALL COMPONENT                            | ❌     |         |
+| UNINSTALL PLUGIN                               | ❌     |         |
+| CLONE                                          | ❌     |         |
+
+#### SET Statements
+
+| Statement                          | Status | Comment |
+|------------------------------------|--------|---------|
+| SET (variable assignment)          | ❌     |         |
+| SET CHARACTER SET                  | ❌     |         |
+| SET NAMES                          | ❌     | Commonly sent by clients on connect; currently errors. |
+
+#### SHOW Statements
+
+| Statement                  | Status | Comment |
+|----------------------------|--------|---------|
+| SHOW BINARY LOGS           | ❌     |         |
+| SHOW BINLOG EVENTS         | ❌     |         |
+| SHOW CHARACTER SET         | ❌     |         |
+| SHOW COLLATION             | ❌     |         |
+| SHOW COLUMNS               | ❌     |         |
+| SHOW CREATE DATABASE       | ❌     |         |
+| SHOW CREATE EVENT          | ❌     |         |
+| SHOW CREATE FUNCTION       | ❌     |         |
+| SHOW CREATE PROCEDURE      | ❌     |         |
+| SHOW CREATE TABLE          | ❌     |         |
+| SHOW CREATE TRIGGER        | ❌     |         |
+| SHOW CREATE USER           | ❌     |         |
+| SHOW CREATE VIEW           | ❌     |         |
+| SHOW DATABASES             | ❌     |         |
+| SHOW ENGINE                | ❌     |         |
+| SHOW ENGINES               | ❌     |         |
+| SHOW ERRORS                | ❌     |         |
+| SHOW EVENTS                | ❌     |         |
+| SHOW FUNCTION CODE         | ❌     |         |
+| SHOW FUNCTION STATUS       | ❌     |         |
+| SHOW GRANTS                | ❌     |         |
+| SHOW INDEX                 | ❌     |         |
+| SHOW MASTER STATUS / BINARY LOG STATUS | ❌ |   |
+| SHOW OPEN TABLES           | ❌     |         |
+| SHOW PLUGINS               | ❌     |         |
+| SHOW PRIVILEGES            | ❌     |         |
+| SHOW PROCEDURE CODE        | ❌     |         |
+| SHOW PROCEDURE STATUS      | ❌     |         |
+| SHOW PROCESSLIST           | ❌     |         |
+| SHOW PROFILE / PROFILES    | ❌     |         |
+| SHOW RELAYLOG EVENTS       | ❌     |         |
+| SHOW REPLICAS / SLAVE HOSTS| ❌     |         |
+| SHOW REPLICA / SLAVE STATUS| ❌     |         |
+| SHOW STATUS                | ❌     |         |
+| SHOW TABLE STATUS          | ❌     |         |
+| SHOW TABLES                | ❌     |         |
+| SHOW TRIGGERS              | ❌     |         |
+| SHOW VARIABLES             | ❌     | Frequently probed by clients/ORMs; currently errors. |
+| SHOW WARNINGS              | ❌     |         |
+
+#### Other Administrative Statements
+
+| Statement                  | Status | Comment |
+|----------------------------|--------|---------|
+| BINLOG                     | ❌     |         |
+| CACHE INDEX                | ❌     |         |
+| FLUSH                      | ❌     |         |
+| KILL                       | ❌     |         |
+| LOAD INDEX INTO CACHE      | ❌     |         |
+| RESET                      | ❌     |         |
+| RESET PERSIST              | ❌     |         |
+| RESTART                    | ❌     |         |
+| SHUTDOWN                   | ❌     |         |
+
+### Utility Statements
+
+| Statement   | Status | Comment |
+|-------------|--------|---------|
+| DESCRIBE / DESC | ❌ |         |
+| EXPLAIN     | ❌     | MySQL `EXPLAIN` output format not produced. |
+| HELP        | ❌     |         |
+| USE         | ❌     | Maps conceptually to `COM_INIT_DB`; single-schema no-op. |
