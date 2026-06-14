@@ -69,7 +69,11 @@ impl Parser {
             }
             "INSERT" => {
                 self.advance();
-                self.insert()
+                self.insert(None)
+            }
+            "REPLACE" => {
+                self.advance();
+                self.insert(Some(ast::ResolveType::Replace))
             }
             "SELECT" => {
                 self.advance();
@@ -100,13 +104,12 @@ impl Parser {
                 self.truncate_table()
             }
             // Recognized statement keywords that are simply not implemented yet.
-            "REPLACE" | "ALTER" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC"
-            | "EXPLAIN" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES"
-            | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE"
-            | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER"
-            | "IMPORT" => Err(ParseError::Unsupported(format!(
-                "{keyword} is not supported yet"
-            ))),
+            "ALTER" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN"
+            | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE"
+            | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE"
+            | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(
+                ParseError::Unsupported(format!("{keyword} is not supported yet")),
+            ),
             other => Err(ParseError::Unsupported(format!(
                 "unrecognized statement starting with `{other}`"
             ))),
@@ -643,12 +646,21 @@ impl Parser {
     /// Parses the basic `INSERT INTO tbl [(cols)] VALUES (...)[, (...)]` form.
     /// `INSERT ... SELECT`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE`, and the
     /// priority/`IGNORE` modifiers are rejected as unsupported.
-    fn insert(&mut self) -> Result<ast::Stmt> {
-        // `INSERT` has already been consumed.
+    /// Parses an `INSERT ... VALUES` statement, or — when `or_conflict` is
+    /// `Some(ResolveType::Replace)` — a `REPLACE ... VALUES` statement. MySQL's
+    /// `REPLACE` deletes any row that conflicts on a primary/unique key before
+    /// inserting, which is exactly the engine's `INSERT OR REPLACE`. The keyword
+    /// has already been consumed.
+    fn insert(&mut self, or_conflict: Option<ast::ResolveType>) -> Result<ast::Stmt> {
+        let kw = if or_conflict.is_some() {
+            "REPLACE"
+        } else {
+            "INSERT"
+        };
         for modifier in ["LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE"] {
             if self.is_keyword(modifier) {
                 return Err(ParseError::Unsupported(format!(
-                    "INSERT {modifier} is not supported yet"
+                    "{kw} {modifier} is not supported yet"
                 )));
             }
         }
@@ -706,7 +718,9 @@ impl Parser {
             break;
         }
 
-        let upsert = if self.eat_keyword("ON") {
+        // `ON DUPLICATE KEY UPDATE` is an INSERT-only clause; REPLACE has its
+        // own conflict resolution and does not take it.
+        let upsert = if or_conflict.is_none() && self.eat_keyword("ON") {
             Some(Box::new(self.on_duplicate_key_update()?))
         } else {
             None
@@ -714,7 +728,7 @@ impl Parser {
 
         Ok(ast::Stmt::Insert {
             with: None,
-            or_conflict: None,
+            or_conflict,
             tbl_name,
             columns,
             body: ast::InsertBody::Select(
@@ -2904,6 +2918,26 @@ mod tests {
             parse("SELECT a FROM t GROUP BY 1").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn replace_lowers_to_insert_or_replace() {
+        // REPLACE [INTO] becomes an INSERT with REPLACE conflict resolution.
+        for sql in [
+            "REPLACE INTO t (a, b) VALUES (1, 'x')",
+            "REPLACE t (a) VALUES (1)",
+        ] {
+            let ast::Stmt::Insert { or_conflict, .. } = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to parse as an Insert");
+            };
+            assert_eq!(or_conflict, Some(ast::ResolveType::Replace), "for `{sql}`");
+        }
+        // Plain INSERT keeps no conflict resolution.
+        let ast::Stmt::Insert { or_conflict, .. } = parse("INSERT INTO t (a) VALUES (1)").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(or_conflict, None);
     }
 
     #[test]

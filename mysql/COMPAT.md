@@ -276,7 +276,7 @@ incomplete.
 | LOAD DATA                              | ❌     |         |
 | LOAD XML                               | ❌     |         |
 | Parenthesized Query Expressions        | ❌     |         |
-| REPLACE                                | ❌     |         |
+| REPLACE ... VALUES                     | ✅     | `REPLACE [INTO] tbl ... VALUES ...` lowers to the engine's `INSERT OR REPLACE`: a row conflicting on a primary/unique key is deleted before the new row is inserted, like MySQL. The `REPLACE ... SET` and `REPLACE ... SELECT` forms are not supported. |
 | SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
 | SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
 | SELECT DISTINCT                        | ✅     | `DISTINCTROW` synonym not supported. |

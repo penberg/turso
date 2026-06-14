@@ -1,0 +1,40 @@
+# REPLACE INTO conformance.
+#
+# MySQL's REPLACE works like INSERT, except that an existing row with the same
+# PRIMARY KEY or UNIQUE value is deleted before the new row is inserted. This is
+# exactly the engine's INSERT OR REPLACE, so the front-end lowers REPLACE [INTO]
+# to an insert with the REPLACE conflict resolution. WordPress's $wpdb->replace()
+# emits REPLACE INTO.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS rep_demo (a INT PRIMARY KEY, b VARCHAR(16))
+
+# A REPLACE with a fresh key behaves like INSERT.
+statement ok
+REPLACE INTO rep_demo (a, b) VALUES (1, 'first')
+
+query
+SELECT a, b FROM rep_demo ORDER BY a
+----
+1	first
+
+# A REPLACE on an existing primary key overwrites the row.
+statement ok
+REPLACE INTO rep_demo (a, b) VALUES (1, 'second')
+
+query
+SELECT a, b FROM rep_demo ORDER BY a
+----
+1	second
+
+# The INTO keyword is optional, and multiple rows are allowed.
+statement ok
+REPLACE rep_demo (a, b) VALUES (2, 'two'), (1, 'updated')
+
+query
+SELECT a, b FROM rep_demo ORDER BY a
+----
+1	updated
+2	two
