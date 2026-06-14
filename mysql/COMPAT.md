@@ -342,7 +342,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `COUNT/SUM/MIN/MAX(DISTINCT expr)`     | ✅     | The `DISTINCT` quantifier on an aggregate; `ALL` is the default and ignored. `DISTINCT` on a scalar function or with `*` is rejected. |
 | `AVG`                                  | ❌     | **Excluded** — MySQL returns DECIMAL padded to 4 places; SQLite returns a plain float (text differs). |
 | `GROUP_CONCAT`                         | ❌     | **Excluded** — separator / `ORDER BY` syntax differs. |
-| `CONCAT`                               | ❌     | **Excluded** — MySQL returns NULL if any arg is NULL; SQLite ignores NULLs. |
+| `CONCAT`                               | ✅     | Lowered to the engine's `\|\|` operator (not `concat()`): like MySQL, the result is NULL if any argument is NULL. Requires at least one argument. |
 | `LENGTH`                               | ❌     | **Excluded** — MySQL counts bytes; SQLite counts characters. |
 | `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |
 | `IF`                                   | ✅     | Renamed on emit to the engine's `IIF`; semantics are identical (a NULL/zero condition is false). |

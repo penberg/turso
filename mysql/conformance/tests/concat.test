@@ -1,0 +1,39 @@
+# CONCAT(...) conformance.
+#
+# MySQL's CONCAT returns the concatenation of its arguments, or NULL if any
+# argument is NULL. The front-end lowers CONCAT to the engine's `||` operator,
+# which has the same NULL-propagating semantics. (The engine's own concat()
+# function instead skips NULLs, so it is deliberately not used.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS concat_demo (a INT PRIMARY KEY, b VARCHAR(16))
+
+statement ok
+INSERT INTO concat_demo (a, b) VALUES (1, 'x'), (2, NULL)
+
+# Concatenation of string literals and columns.
+query
+SELECT CONCAT('id_', a, '_', b) FROM concat_demo WHERE a = 1
+----
+id_1_x
+
+# A NULL argument makes the whole result NULL.
+query
+SELECT CONCAT('id_', b) FROM concat_demo WHERE a = 2
+----
+NULL
+
+# Numbers concatenate as their text form.
+query
+SELECT CONCAT(a, a) FROM concat_demo ORDER BY a
+----
+11
+22
+
+# A single argument returns that argument.
+query
+SELECT CONCAT(b) FROM concat_demo WHERE a = 1
+----
+x

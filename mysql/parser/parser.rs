@@ -1813,6 +1813,13 @@ impl Parser {
         let upper = name.as_str().to_ascii_uppercase();
         self.expect(&Token::LParen, "`(`")?;
 
+        // `CONCAT(a, b, ...)` lowers to the engine's `||` concatenation, which —
+        // like MySQL's CONCAT — yields NULL if any argument is NULL. (The
+        // engine's own `concat()` skips NULLs instead, so it is not used here.)
+        if upper == "CONCAT" {
+            return self.concat_call();
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -1878,6 +1885,37 @@ impl Parser {
                 over_clause: None,
             },
         })
+    }
+
+    /// Parses the arguments of a `CONCAT(a, b, ...)` call (the name and `(` are
+    /// already consumed) and lowers them to a left-associative chain of the
+    /// engine's `||` concatenation operator. MySQL's `CONCAT` yields NULL when
+    /// any argument is NULL, which is exactly the engine's `||` behaviour; the
+    /// engine's `concat()` function instead treats NULL as empty, so it is
+    /// deliberately not used. At least one argument is required.
+    fn concat_call(&mut self) -> Result<ast::Expr> {
+        let mut args = Vec::new();
+        if !self.is(&Token::RParen) {
+            loop {
+                args.push(self.expr()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+
+        let mut iter = args.into_iter();
+        let Some(mut acc) = iter.next() else {
+            return Err(ParseError::Unsupported(
+                "CONCAT() with no arguments is not supported".to_string(),
+            ));
+        };
+        for next in iter {
+            acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
+        }
+        Ok(acc)
     }
 
     /// Parses a column reference: `col` or `tbl.col`.
@@ -3102,6 +3140,19 @@ mod tests {
     }
 
     #[test]
+    fn concat_lowers_to_concat_operator_chain() {
+        // CONCAT(a, b, c) becomes ((a || b) || c).
+        let expected = ast::Expr::binary(
+            ast::Expr::binary(col("a"), ast::Operator::Concat, col("b")),
+            ast::Operator::Concat,
+            col("c"),
+        );
+        assert_eq!(parse_expr("CONCAT(a, b, c)").unwrap(), expected);
+        // A single argument is returned unwrapped.
+        assert_eq!(parse_expr("CONCAT(a)").unwrap(), col("a"));
+    }
+
+    #[test]
     fn convert_using_drops_charset_and_type_form_is_a_cast() {
         // CONVERT(expr USING charset) drops the charset and yields the bare expr.
         assert_eq!(parse_expr("CONVERT(a USING utf8mb4)").unwrap(), col("a"));
@@ -3306,13 +3357,7 @@ mod tests {
 
     #[test]
     fn function_call_not_in_allow_list_is_unsupported() {
-        for input in [
-            "CONCAT('a', 'b')",
-            "LENGTH(name)",
-            "NOW()",
-            "ROUND(2.7)",
-            "totally_made_up(1)",
-        ] {
+        for input in ["LENGTH(name)", "NOW()", "ROUND(2.7)", "totally_made_up(1)"] {
             let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
             assert!(
                 matches!(err, ParseError::Unsupported(_)),
