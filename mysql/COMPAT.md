@@ -310,7 +310,7 @@ diverge are deliberately excluded.
 | Arithmetic `+` `-` `*`                 | ✅     |         |
 | `[NOT] IN (value list)`                | ✅     | Includes the empty list: `x IN ()` folds to `0` and `x NOT IN ()` to `1` (MySQL semantics), since the engine has no empty-list `IN`. |
 | `[NOT] BETWEEN a AND b`                | ✅     |         |
-| `[NOT] LIKE` (ASCII patterns)          | ✅     |         |
+| `[NOT] LIKE` (ASCII patterns)          | ✅     | Backslash is the default escape character (so `\%` / `\_` match literally), as in MySQL — the front-end supplies `ESCAPE '\'` when the query gives no explicit `ESCAPE` clause. An explicit `LIKE ... ESCAPE 'c'` is honored. This is what `$wpdb->esc_like()` relies on. |
 | `[NOT] REGEXP` / `RLIKE`               | 🚧     | Mapped to the engine's `REGEXP` operator (Rust `regex` crate). **Case-sensitive**, unlike MySQL's default case-insensitive `REGEXP`; the regex dialect also differs for advanced constructs. Common anchored/character-class patterns match on both. |
 | `CASE` (searched and simple forms)     | ✅     | `CASE WHEN ... THEN ... [ELSE ...] END` and `CASE expr WHEN ... END`; standard SQL, identical. |
 | `expr COLLATE collation_name`          | 🚧     | The `COLLATE` postfix is parsed and **discarded** — the engine is effectively single-collation (binary), so the named collation is not honored (comparisons/sorts use the engine default). The collation name must be an identifier (`COLLATE 'string'` is rejected). |

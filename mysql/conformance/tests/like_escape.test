@@ -1,0 +1,40 @@
+# LIKE escaping conformance — MySQL's default backslash escape.
+#
+# MySQL's LIKE uses backslash as the default escape character, so an escaped
+# wildcard (\% or \_) matches that character literally. The engine's LIKE has no
+# default escape, so the front-end supplies ESCAPE '\' on every LIKE (unless the
+# query gives an explicit ESCAPE clause). This is what $wpdb->esc_like() relies
+# on, and it leaves ordinary wildcards working.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS like_demo (a INT PRIMARY KEY, b VARCHAR(32))
+
+statement ok
+INSERT INTO like_demo (a, b) VALUES (1, '100%'), (2, '100x'), (3, 'a_b'), (4, 'axb'), (5, 'plain')
+
+# \% matches a literal percent sign, not the wildcard.
+query
+SELECT a FROM like_demo WHERE b LIKE '100\%' ORDER BY a
+----
+1
+
+# \_ matches a literal underscore, not the single-character wildcard.
+query
+SELECT a FROM like_demo WHERE b LIKE 'a\_b' ORDER BY a
+----
+3
+
+# Ordinary wildcards still work.
+query
+SELECT a FROM like_demo WHERE b LIKE '1%' ORDER BY a
+----
+1
+2
+
+# An explicit ESCAPE clause overrides the default escape character.
+query
+SELECT a FROM like_demo WHERE b LIKE '100!%' ESCAPE '!' ORDER BY a
+----
+1

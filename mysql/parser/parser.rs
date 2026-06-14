@@ -1481,12 +1481,21 @@ impl Parser {
         }
         if self.eat_keyword("LIKE") {
             let rhs = self.additive_expr()?;
+            // MySQL's `LIKE` uses backslash as the default escape character (so
+            // `\%` matches a literal `%`), which is what `$wpdb->esc_like()`
+            // relies on. The engine's `LIKE` has no default escape, so supply
+            // `\` unless the query gives an explicit `ESCAPE` clause.
+            let escape = if self.eat_keyword("ESCAPE") {
+                Some(self.additive_expr()?)
+            } else {
+                Some(ast::Expr::Literal(ast::Literal::String(requote("\\"))))
+            };
             return Ok(ast::Expr::like(
                 lhs,
                 not,
                 ast::LikeOperator::Like,
                 rhs,
-                None,
+                escape,
             ));
         }
         // `REGEXP` and its synonym `RLIKE` map onto the engine's `REGEXP`
@@ -4071,11 +4080,31 @@ mod tests {
             assert_eq!(op, ast::LikeOperator::Regexp, "for `{sql}`");
         }
         let expr = parse_expr("name LIKE 'a%'").unwrap();
-        let ast::Expr::Like { lhs, not, .. } = expr else {
+        let ast::Expr::Like {
+            lhs, not, escape, ..
+        } = expr
+        else {
             panic!("expected Like");
         };
         assert_eq!(*lhs, col("name"));
         assert!(!not);
+        // A plain LIKE gets MySQL's default backslash escape.
+        assert_eq!(
+            escape.as_deref(),
+            Some(&ast::Expr::Literal(ast::Literal::String(
+                "'\\'".to_string()
+            )))
+        );
+
+        // An explicit ESCAPE clause overrides the default.
+        let ast::Expr::Like { escape, .. } = parse_expr("name LIKE 'a!%' ESCAPE '!'").unwrap()
+        else {
+            panic!("expected Like");
+        };
+        assert_eq!(
+            escape.as_deref(),
+            Some(&ast::Expr::Literal(ast::Literal::String("'!'".to_string())))
+        );
 
         let ast::Expr::Like { not, .. } = parse_expr("name NOT LIKE 'a%'").unwrap() else {
             panic!("expected Like");
