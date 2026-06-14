@@ -475,9 +475,9 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement                          | Status | Comment |
 |------------------------------------|--------|---------|
-| SET (variable assignment)          | ❌     |         |
-| SET CHARACTER SET                  | ❌     |         |
-| SET NAMES                          | ❌     | Commonly sent by clients on connect; currently errors. |
+| SET (variable assignment)          | 🚧     | Accepted as a no-op, except `SET [SESSION\|GLOBAL] sql_mode = '...'`, whose value is stored per session and returned by `SELECT @@[SESSION.\|GLOBAL.]sql_mode`. MySQL's default mode and mode normalization/reordering are not modeled (the value is stored verbatim). |
+| SET CHARACTER SET                  | 🚧     | Accepted as a no-op. |
+| SET NAMES                          | 🚧     | Accepted as a no-op (commonly sent by clients on connect). |
 
 #### SHOW Statements
 

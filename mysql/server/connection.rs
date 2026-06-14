@@ -120,6 +120,9 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
     // The unlimited row count remembered from the last `SQL_CALC_FOUND_ROWS`
     // query, answered by a subsequent `SELECT FOUND_ROWS()`.
     let mut found_rows: u64 = 0;
+    // The session SQL mode set via `SET sql_mode = '...'`, returned by
+    // `SELECT @@SESSION.sql_mode`. Empty until the client sets it.
+    let mut sql_mode = String::new();
 
     perform_handshake(&mut wire, connection_id)?;
 
@@ -142,7 +145,7 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
                 send_packet(&mut wire, seq, &OkPacket::default().encode())?;
             }
             Command::Query(sql) => {
-                let response = run_query(&conn, &sql, seq, &mut found_rows);
+                let response = run_query(&conn, &sql, seq, &mut found_rows, &mut sql_mode);
                 wire.write_frames(&response)?;
             }
             Command::StmtPrepare(sql) => {
@@ -209,7 +212,13 @@ fn send_packet(wire: &mut Wire, seq: u8, payload: &[u8]) -> io::Result<()> {
 /// does not support are rejected here with a MySQL error packet — they never
 /// reach the engine. A successfully parsed statement is handed to the engine as
 /// an AST via [`Connection::prepare_stmt`], with no round trip through SQL text.
-fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8, found_rows: &mut u64) -> Vec<u8> {
+fn run_query(
+    conn: &Arc<Connection>,
+    sql: &str,
+    first_seq: u8,
+    found_rows: &mut u64,
+    sql_mode: &mut String,
+) -> Vec<u8> {
     debug!(%sql, "COM_QUERY");
 
     // `SELECT FOUND_ROWS()` reports the count remembered from the last
@@ -221,6 +230,28 @@ fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8, found_rows: &mut 
             SessionResponse::Row {
                 columns: vec!["FOUND_ROWS()".to_string()],
                 values: vec![Some(found_rows.to_string())],
+            },
+        );
+    }
+
+    // `SET [SESSION|GLOBAL] sql_mode = '...'` stores the session SQL mode, and
+    // `SELECT @@[SESSION.|GLOBAL.]sql_mode` returns it. WordPress reads, sets,
+    // and re-reads it (`wpdb::set_sql_mode`); without this round trip it gets a
+    // constant value and `explode()` on it fails. MySQL's default value and
+    // mode normalization/reordering are not modeled — the value is stored and
+    // returned verbatim.
+    if let Some(value) = parse_set_sql_mode(sql) {
+        *sql_mode = value;
+        let mut out = Vec::new();
+        encode_frame(&mut out, first_seq, &OkPacket::default().encode());
+        return out;
+    }
+    if is_select_sql_mode(sql) {
+        return encode_session_response(
+            first_seq,
+            SessionResponse::Row {
+                columns: vec!["@@SESSION.sql_mode".to_string()],
+                values: vec![Some(sql_mode.clone())],
             },
         );
     }
@@ -264,6 +295,53 @@ fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8, found_rows: &mut 
     }
 
     execute_stmt(conn, stmt, first_seq)
+}
+
+/// Extracts the value from a `SET [SESSION|GLOBAL] sql_mode = '...'` statement
+/// (also the `SET @@[session.]sql_mode = '...'` spelling), or `None` if `sql` is
+/// not such a statement. Only the single-assignment quoted form WordPress emits
+/// is recognized; the quotes are stripped and `''` escapes are unescaped.
+fn parse_set_sql_mode(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let mut rest = trimmed.strip_prefix("SET ").or_else(|| {
+        // Case-insensitive `SET` prefix.
+        trimmed
+            .get(..4)
+            .filter(|p| p.eq_ignore_ascii_case("SET "))
+            .map(|_| &trimmed[4..])
+    })?;
+    rest = rest.trim_start();
+    // Optional SESSION / GLOBAL / @@session. / @@global. scope before the name.
+    for scope in ["SESSION ", "GLOBAL ", "@@session.", "@@global.", "@@"] {
+        if rest.len() >= scope.len() && rest[..scope.len()].eq_ignore_ascii_case(scope) {
+            rest = rest[scope.len()..].trim_start();
+            break;
+        }
+    }
+    let after = rest
+        .get(.."sql_mode".len())
+        .filter(|p| p.eq_ignore_ascii_case("sql_mode"))
+        .map(|_| rest["sql_mode".len()..].trim_start())?;
+    let value = after.strip_prefix('=')?.trim_start();
+    // The value must be a single-quoted string; anything else (DEFAULT, a bare
+    // identifier) is not modeled.
+    let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner.replace("''", "'"))
+}
+
+/// Whether `sql` is a standalone `SELECT @@[SESSION.|GLOBAL.]sql_mode` query,
+/// ignoring case, surrounding whitespace, and a trailing semicolon.
+fn is_select_sql_mode(sql: &str) -> bool {
+    let normalized = sql
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(
+        normalized.to_ascii_uppercase().as_str(),
+        "SELECT @@SQL_MODE" | "SELECT @@SESSION.SQL_MODE" | "SELECT @@GLOBAL.SQL_MODE"
+    )
 }
 
 /// Whether `sql` is a `SELECT FOUND_ROWS()` query (the only form WordPress

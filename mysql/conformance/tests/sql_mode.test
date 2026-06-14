@@ -1,0 +1,38 @@
+# Session sql_mode round-trips through SET / SELECT @@sql_mode.
+#
+# WordPress reads, sets, and re-reads @@SESSION.sql_mode (wpdb::set_sql_mode).
+# The front-end tracks the session sql_mode: a `SET [SESSION] sql_mode = '...'`
+# stores the value and `SELECT @@SESSION.sql_mode` returns it.
+#
+# The default value and MySQL's mode normalization/reordering are not modeled,
+# so these use a single mode at a time (no ordering ambiguity); see
+# mysql/COMPAT.md. The conformance runner uses one connection per file, so the
+# SELECT sees the value set earlier.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'
+
+query
+SELECT @@SESSION.sql_mode
+----
+NO_AUTO_VALUE_ON_ZERO
+
+# A later SET replaces the whole value.
+statement ok
+SET SESSION sql_mode = 'IGNORE_SPACE'
+
+query
+SELECT @@SESSION.sql_mode
+----
+IGNORE_SPACE
+
+# The short `SET sql_mode = ...` form and `@@sql_mode` read work too.
+statement ok
+SET sql_mode = 'ONLY_FULL_GROUP_BY'
+
+query
+SELECT @@sql_mode
+----
+ONLY_FULL_GROUP_BY
