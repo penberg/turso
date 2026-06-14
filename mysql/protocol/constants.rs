@@ -68,24 +68,54 @@ impl CommandByte {
     }
 }
 
-/// MySQL column types as sent in column-definition packets. Only the handful of
-/// types the text protocol needs are enumerated here.
+/// MySQL column types as sent in column-definition packets, matching the
+/// `enum_field_types` values from the server protocol.
 pub mod column_type {
     pub const MYSQL_TYPE_DECIMAL: u8 = 0x00;
     pub const MYSQL_TYPE_TINY: u8 = 0x01;
+    pub const MYSQL_TYPE_SHORT: u8 = 0x02;
     pub const MYSQL_TYPE_LONG: u8 = 0x03;
+    pub const MYSQL_TYPE_FLOAT: u8 = 0x04;
     pub const MYSQL_TYPE_DOUBLE: u8 = 0x05;
     pub const MYSQL_TYPE_NULL: u8 = 0x06;
+    pub const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
     pub const MYSQL_TYPE_LONGLONG: u8 = 0x08;
+    pub const MYSQL_TYPE_INT24: u8 = 0x09;
+    pub const MYSQL_TYPE_DATE: u8 = 0x0a;
+    pub const MYSQL_TYPE_TIME: u8 = 0x0b;
+    pub const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+    pub const MYSQL_TYPE_YEAR: u8 = 0x0d;
+    pub const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
+    pub const MYSQL_TYPE_JSON: u8 = 0xf5;
     pub const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
     pub const MYSQL_TYPE_STRING: u8 = 0xfe;
     pub const MYSQL_TYPE_BLOB: u8 = 0xfc;
 }
 
+/// Column-definition flags (the `flags` field of `ColumnDefinition41`). They
+/// describe nullability, key membership, and signedness.
+pub mod column_flags {
+    pub const NOT_NULL_FLAG: u16 = 0x0001;
+    pub const PRI_KEY_FLAG: u16 = 0x0002;
+    pub const UNIQUE_KEY_FLAG: u16 = 0x0004;
+    pub const MULTIPLE_KEY_FLAG: u16 = 0x0008;
+    pub const BLOB_FLAG: u16 = 0x0010;
+    pub const UNSIGNED_FLAG: u16 = 0x0020;
+    pub const ZEROFILL_FLAG: u16 = 0x0040;
+    pub const BINARY_FLAG: u16 = 0x0080;
+    pub const ENUM_FLAG: u16 = 0x0100;
+    pub const AUTO_INCREMENT_FLAG: u16 = 0x0200;
+    pub const TIMESTAMP_FLAG: u16 = 0x0400;
+    pub const SET_FLAG: u16 = 0x0800;
+    pub const NUM_FLAG: u16 = 0x8000;
+}
+
 /// Common collation identifiers used in the charset byte. `utf8mb4_general_ci`
-/// is a safe default that every modern client understands.
+/// is a safe default that every modern client understands; `binary` (id 63) is
+/// used for blob/binary columns.
 pub mod collation {
     pub const UTF8MB4_GENERAL_CI: u8 = 45;
+    pub const BINARY: u8 = 63;
 }
 
 /// The single byte that marks a SQL NULL value inside a text result row.

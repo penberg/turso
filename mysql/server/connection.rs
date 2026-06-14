@@ -324,8 +324,8 @@ fn encode_result_set(
     let mut seq = encode_frame(&mut out, seq, &encode_column_count(num_columns as u64));
 
     for i in 0..num_columns {
-        let name = stmt.get_column_name(i).to_string();
-        seq = encode_frame(&mut out, seq, &ColumnDefinition::text(name).encode());
+        let column = crate::types::column_definition(stmt, i);
+        seq = encode_frame(&mut out, seq, &column.encode());
     }
     // Marker between the column definitions and the rows.
     seq = encode_frame(
