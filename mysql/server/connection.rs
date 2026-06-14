@@ -117,6 +117,9 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
     let mut wire = Wire::new(stream);
     let conn = server.db.connect()?;
     let mut statements = StatementStore::default();
+    // The unlimited row count remembered from the last `SQL_CALC_FOUND_ROWS`
+    // query, answered by a subsequent `SELECT FOUND_ROWS()`.
+    let mut found_rows: u64 = 0;
 
     perform_handshake(&mut wire, connection_id)?;
 
@@ -139,7 +142,7 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
                 send_packet(&mut wire, seq, &OkPacket::default().encode())?;
             }
             Command::Query(sql) => {
-                let response = run_query(&conn, &sql, seq);
+                let response = run_query(&conn, &sql, seq, &mut found_rows);
                 wire.write_frames(&response)?;
             }
             Command::StmtPrepare(sql) => {
@@ -206,8 +209,21 @@ fn send_packet(wire: &mut Wire, seq: u8, payload: &[u8]) -> io::Result<()> {
 /// does not support are rejected here with a MySQL error packet — they never
 /// reach the engine. A successfully parsed statement is handed to the engine as
 /// an AST via [`Connection::prepare_stmt`], with no round trip through SQL text.
-fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8) -> Vec<u8> {
+fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8, found_rows: &mut u64) -> Vec<u8> {
     debug!(%sql, "COM_QUERY");
+
+    // `SELECT FOUND_ROWS()` reports the count remembered from the last
+    // `SQL_CALC_FOUND_ROWS` query (see below). It is answered here because the
+    // engine has no such function.
+    if is_found_rows_query(sql) {
+        return encode_session_response(
+            first_seq,
+            SessionResponse::Row {
+                columns: vec!["FOUND_ROWS()".to_string()],
+                values: vec![Some(found_rows.to_string())],
+            },
+        );
+    }
 
     // Client libraries probe the connection with session/introspection queries
     // (`SELECT @@max_allowed_packet`, `SET ...`) before running real SQL. Answer
@@ -232,7 +248,64 @@ fn run_query(conn: &Arc<Connection>, sql: &str, first_seq: u8) -> Vec<u8> {
         Err(e) => return parse_error_response(first_seq, &e),
     };
     debug!(%sql, "parsed by mysql front-end");
+
+    // `SELECT SQL_CALC_FOUND_ROWS ... LIMIT n` returns the limited rows, but
+    // also sets `FOUND_ROWS()` to the count the query would return without its
+    // LIMIT. The parser strips the modifier, so detect it from the SQL text and,
+    // for a SELECT, re-run the query with the LIMIT removed to count the rows.
+    if has_sql_calc_found_rows(sql) {
+        if let ast::Stmt::Select(select) = &stmt {
+            let mut unlimited = select.clone();
+            unlimited.limit = None;
+            if let Some(count) = count_rows(conn, ast::Stmt::Select(unlimited)) {
+                *found_rows = count;
+            }
+        }
+    }
+
     execute_stmt(conn, stmt, first_seq)
+}
+
+/// Whether `sql` is a `SELECT FOUND_ROWS()` query (the only form WordPress
+/// emits), ignoring case, surrounding whitespace, and a trailing semicolon.
+fn is_found_rows_query(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.eq_ignore_ascii_case("SELECT FOUND_ROWS()")
+        || normalized.eq_ignore_ascii_case("SELECT FOUND_ROWS ()")
+}
+
+/// Whether `sql` is a `SELECT` whose first item is the `SQL_CALC_FOUND_ROWS`
+/// modifier. The modifier always appears immediately after `SELECT`.
+fn has_sql_calc_found_rows(sql: &str) -> bool {
+    let s = sql.trim_start();
+    if s.len() < 6 || !s[..6].eq_ignore_ascii_case("SELECT") {
+        return false;
+    }
+    let after = s[6..].trim_start();
+    const MODIFIER: &str = "SQL_CALC_FOUND_ROWS";
+    after.len() >= MODIFIER.len()
+        && after[..MODIFIER.len()].eq_ignore_ascii_case(MODIFIER)
+        // The next character must not extend the identifier.
+        && after[MODIFIER.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+/// Prepares and steps a statement to completion, returning the number of rows
+/// it produced (or `None` if preparing or stepping failed). Used to compute the
+/// `SQL_CALC_FOUND_ROWS` count without sending a result to the client.
+fn count_rows(conn: &Arc<Connection>, stmt: ast::Stmt) -> Option<u64> {
+    let mut statement = conn.prepare_stmt(stmt).ok()?;
+    let mut count: u64 = 0;
+    statement
+        .run_with_row_callback(|_| {
+            count += 1;
+            Ok(())
+        })
+        .ok()?;
+    Some(count)
 }
 
 /// Frames a [`SessionResponse`] (the reply to a connection/introspection query).

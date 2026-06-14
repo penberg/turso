@@ -280,6 +280,7 @@ incomplete.
 | SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
 | SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
 | SELECT DISTINCT                        | ✅     | `DISTINCTROW` synonym not supported. |
+| `SELECT SQL_CALC_FOUND_ROWS ...` + `SELECT FOUND_ROWS()` | 🚧 | The modifier is honored: the query returns its limited rows, and a following `FOUND_ROWS()` on the same connection returns the count the query would return without its `LIMIT` (computed by re-running it without the limit). Drives `WP_Query` pagination. `FOUND_ROWS()` is only meaningful right after a `SQL_CALC_FOUND_ROWS` query — it is not updated after ordinary `SELECT`s. |
 | Column aliases (`expr AS a` / `expr a`) | ✅    | Both the `AS` and bare forms; resolvable in `ORDER BY`/`GROUP BY`. A string-literal alias (`expr AS 'name'`) is also accepted; the elided string form (`expr 'name'`) is not (ambiguous with literal concatenation). |
 | SELECT ... INTO                        | ❌     | **Not supported.** |
 | `[INNER] JOIN` / `LEFT [OUTER] JOIN` ... ON | ✅ | Table aliases (`t`, `t AS a`) and chained joins supported. Map identically onto the engine. |

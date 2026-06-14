@@ -1,0 +1,39 @@
+# SQL_CALC_FOUND_ROWS + FOUND_ROWS() conformance.
+#
+# SELECT SQL_CALC_FOUND_ROWS ... LIMIT n returns the limited rows, and a
+# following SELECT FOUND_ROWS() reports how many rows the query would have
+# returned without the LIMIT. This drives WP_Query pagination (found_posts /
+# max_num_pages). The conformance runner uses one connection per file, so the
+# FOUND_ROWS() call sees the count set by the preceding query.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS fr_demo (a INT PRIMARY KEY)
+
+statement ok
+INSERT INTO fr_demo (a) VALUES (1), (2), (3), (4), (5)
+
+# The query returns only the limited rows.
+query
+SELECT SQL_CALC_FOUND_ROWS a FROM fr_demo ORDER BY a LIMIT 2
+----
+1
+2
+
+# FOUND_ROWS() reports the unlimited count (5).
+query
+SELECT FOUND_ROWS()
+----
+5
+
+# With a WHERE clause, the count reflects the filter but not the LIMIT.
+query
+SELECT SQL_CALC_FOUND_ROWS a FROM fr_demo WHERE a >= 2 ORDER BY a LIMIT 1
+----
+2
+
+query
+SELECT FOUND_ROWS()
+----
+4

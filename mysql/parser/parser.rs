@@ -916,6 +916,12 @@ impl Parser {
             None
         };
 
+        // `SQL_CALC_FOUND_ROWS` is a SELECT modifier that asks MySQL to remember
+        // the unlimited row count for a later `FOUND_ROWS()`. It does not change
+        // the rows this query returns, so it is consumed here; the server
+        // recognizes it (from the SQL text) and maintains the count separately.
+        self.eat_keyword("SQL_CALC_FOUND_ROWS");
+
         let columns = self.select_list()?;
 
         let from = if self.eat_keyword("FROM") {
@@ -2866,6 +2872,21 @@ mod tests {
             &columns[1],
             ast::ResultColumn::Expr(_, Some(ast::As::As(_)))
         ));
+    }
+
+    #[test]
+    fn sql_calc_found_rows_modifier_is_stripped() {
+        // The modifier is consumed; the SELECT parses as if it were not there.
+        let stmt = parse("SELECT SQL_CALC_FOUND_ROWS a FROM t LIMIT 2").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            panic!("expected Select");
+        };
+        let ast::OneSelect::Select { columns, from, .. } = s.body.select else {
+            panic!("expected a plain select body");
+        };
+        assert_eq!(columns.len(), 1);
+        assert!(from.is_some());
+        assert!(s.limit.is_some());
     }
 
     #[test]
