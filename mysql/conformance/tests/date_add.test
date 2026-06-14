@@ -1,0 +1,49 @@
+# DATE_ADD / DATE_SUB with INTERVAL conformance.
+#
+# MySQL's DATE_ADD(d, INTERVAL n unit) / DATE_SUB(d, INTERVAL n unit) shift a
+# datetime by an interval. The front-end lowers them to the engine's
+# datetime(d, '+n unit') / datetime(d, '-n unit') modifier. On DATETIME values
+# both targets return 'YYYY-MM-DD HH:MM:SS'.
+#
+# Scope: only integer-literal intervals are supported. On a bare DATE value
+# MySQL returns a DATE (no time) while the engine keeps the time, and MONTH/YEAR
+# arithmetic that overflows a month end clamps in MySQL but rolls over in the
+# engine — both diverge and are avoided here (see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS dt_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO dt_demo (a, d) VALUES (1, '2020-01-31 10:20:30')
+
+# Add days.
+query
+SELECT DATE_ADD(d, INTERVAL 5 DAY) FROM dt_demo
+----
+2020-02-05 10:20:30
+
+# Add hours, crossing midnight into the next day.
+query
+SELECT DATE_ADD(d, INTERVAL 14 HOUR) FROM dt_demo
+----
+2020-02-01 00:20:30
+
+# Subtract days.
+query
+SELECT DATE_SUB(d, INTERVAL 1 DAY) FROM dt_demo
+----
+2020-01-30 10:20:30
+
+# A WEEK interval is seven days.
+query
+SELECT DATE_ADD('2020-03-01 00:00:00', INTERVAL 1 WEEK)
+----
+2020-03-08 00:00:00
+
+# Mid-month MONTH arithmetic (no month-end clamping involved).
+query
+SELECT DATE_ADD('2020-01-15 08:00:00', INTERVAL 2 MONTH)
+----
+2020-03-15 08:00:00

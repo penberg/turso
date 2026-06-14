@@ -1848,6 +1848,15 @@ impl Parser {
             return self.date_part_call(fmt);
         }
 
+        // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
+        // `datetime(x, '+n unit')` / `datetime(x, '-n unit')` modifier.
+        if upper == "DATE_ADD" {
+            return self.date_add_call(false);
+        }
+        if upper == "DATE_SUB" {
+            return self.date_add_call(true);
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -2005,6 +2014,78 @@ impl Parser {
                 size: None,
                 array_dimensions: 0,
             }),
+        })
+    }
+
+    /// Parses `DATE_ADD(x, INTERVAL n unit)` (or `DATE_SUB`, when `subtract` is
+    /// true) — the name and `(` are already consumed — and lowers it to the
+    /// engine's `datetime(x, '<signed-n> <unit>')` modifier. Only an
+    /// integer-literal interval value is supported; `WEEK` is expanded to days.
+    /// `datetime()` returns `'YYYY-MM-DD HH:MM:SS'`, matching MySQL's result for
+    /// a DATETIME argument.
+    fn date_add_call(&mut self, subtract: bool) -> Result<ast::Expr> {
+        let target = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        self.expect_keyword("INTERVAL")?;
+
+        let negative = self.eat(&Token::Minus);
+        let Some(Token::Num(n)) = self.peek() else {
+            return Err(self.unexpected("an integer interval value"));
+        };
+        let value: i64 = n.parse().map_err(|_| {
+            ParseError::Unsupported(
+                "DATE_ADD / DATE_SUB INTERVAL value must be an integer literal".to_string(),
+            )
+        })?;
+        self.advance();
+
+        let Some(Token::Word(u)) = self.peek() else {
+            return Err(self.unexpected("an interval unit"));
+        };
+        let unit = u.to_ascii_uppercase();
+        self.advance();
+        self.expect(&Token::RParen, "`)`")?;
+
+        // Map the MySQL unit onto the engine's modifier unit; `WEEK` has no
+        // engine modifier and is expanded to days.
+        let (engine_unit, multiplier) = match unit.as_str() {
+            "DAY" => ("days", 1),
+            "WEEK" => ("days", 7),
+            "MONTH" => ("months", 1),
+            "YEAR" => ("years", 1),
+            "HOUR" => ("hours", 1),
+            "MINUTE" => ("minutes", 1),
+            "SECOND" => ("seconds", 1),
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "DATE_ADD / DATE_SUB with INTERVAL unit {other} is not supported yet"
+                )))
+            }
+        };
+
+        let mut amount = value.saturating_mul(multiplier);
+        if negative {
+            amount = -amount;
+        }
+        if subtract {
+            amount = -amount;
+        }
+        // `{:+}` renders an explicit sign, e.g. `+5 days` / `-1 days`.
+        let modifier = format!("{amount:+} {engine_unit}");
+
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("datetime"),
+            distinctness: None,
+            args: vec![
+                Box::new(target),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(&modifier)))),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         })
     }
 
@@ -3265,6 +3346,31 @@ mod tests {
     }
 
     #[test]
+    fn date_add_sub_lower_to_datetime_modifier() {
+        // Each lowers to datetime(target, '<signed-n> <unit>').
+        let cases = [
+            ("DATE_ADD(d, INTERVAL 5 DAY)", "'+5 days'"),
+            ("DATE_SUB(d, INTERVAL 1 DAY)", "'-1 days'"),
+            ("DATE_ADD(d, INTERVAL 1 WEEK)", "'+7 days'"),
+            ("DATE_ADD(d, INTERVAL 2 MONTH)", "'+2 months'"),
+            ("DATE_SUB(d, INTERVAL 3 HOUR)", "'-3 hours'"),
+        ];
+        for (sql, modifier) in cases {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a datetime() call");
+            };
+            assert_eq!(name.as_str(), "datetime");
+            assert_eq!(args.len(), 2);
+            assert!(
+                matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == modifier),
+                "wrong modifier for `{sql}`"
+            );
+        }
+        // A non-literal interval value is rejected.
+        assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
+    }
+
+    #[test]
     fn date_parts_lower_to_cast_strftime() {
         // YEAR(d) becomes CAST(strftime('%Y', d) AS INTEGER); same shape for the
         // other parts, differing only in the format code.
@@ -3523,7 +3629,7 @@ mod tests {
 
     #[test]
     fn function_call_not_in_allow_list_is_unsupported() {
-        for input in ["NOW()", "ROUND(2.7)", "DATE_ADD(d)", "totally_made_up(1)"] {
+        for input in ["NOW()", "ROUND(2.7)", "RAND()", "totally_made_up(1)"] {
             let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
             assert!(
                 matches!(err, ParseError::Unsupported(_)),
