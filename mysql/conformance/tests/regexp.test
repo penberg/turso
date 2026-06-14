@@ -1,0 +1,48 @@
+# REGEXP / RLIKE conformance.
+#
+# MySQL's REGEXP (and its synonym RLIKE) matches a string against a regular
+# expression. The front-end maps it to the engine's REGEXP operator, backed by
+# the `regexp` function (the Rust regex crate).
+#
+# NOTE: the engine's regex is case-SENSITIVE, while MySQL's REGEXP is
+# case-insensitive by default — a documented divergence (see mysql/COMPAT.md).
+# These tests use lowercase data and patterns where the two agree.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS re_demo (a INT PRIMARY KEY, b VARCHAR(32))
+
+statement ok
+INSERT INTO re_demo (a, b) VALUES (1, 'rss_feed'), (2, 'hello'), (3, 'abc123')
+
+# Anchored prefix match.
+query
+SELECT a FROM re_demo WHERE b REGEXP '^rss_' ORDER BY a
+----
+1
+
+# Character class and quantifier.
+query
+SELECT a FROM re_demo WHERE b REGEXP '[0-9]+' ORDER BY a
+----
+3
+
+# RLIKE is a synonym for REGEXP.
+query
+SELECT a FROM re_demo WHERE b RLIKE 'll' ORDER BY a
+----
+2
+
+# NOT REGEXP negates the match.
+query
+SELECT a FROM re_demo WHERE b NOT REGEXP '[0-9]' ORDER BY a
+----
+1
+2
+
+# As a boolean expression (1 when the pattern is found).
+query
+SELECT 'abc' REGEXP 'b'
+----
+1

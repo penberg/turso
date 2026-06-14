@@ -1489,8 +1489,22 @@ impl Parser {
                 None,
             ));
         }
+        // `REGEXP` and its synonym `RLIKE` map onto the engine's `REGEXP`
+        // operator (the `regexp` function). The engine's regex is
+        // case-sensitive, unlike MySQL's default case-insensitive REGEXP — a
+        // documented divergence (see `mysql/COMPAT.md`).
+        if self.eat_keyword("REGEXP") || self.eat_keyword("RLIKE") {
+            let rhs = self.additive_expr()?;
+            return Ok(ast::Expr::like(
+                lhs,
+                not,
+                ast::LikeOperator::Regexp,
+                rhs,
+                None,
+            ));
+        }
         if not {
-            return Err(self.unexpected("`IN`, `BETWEEN`, or `LIKE` after `NOT`"));
+            return Err(self.unexpected("`IN`, `BETWEEN`, `LIKE`, or `REGEXP` after `NOT`"));
         }
 
         let op = match self.peek() {
@@ -3907,6 +3921,16 @@ mod tests {
 
     #[test]
     fn expr_like() {
+        for sql in [
+            "name REGEXP '^a'",
+            "name RLIKE '^a'",
+            "name NOT REGEXP '^a'",
+        ] {
+            let ast::Expr::Like { op, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to parse as a Like/Regexp expression");
+            };
+            assert_eq!(op, ast::LikeOperator::Regexp, "for `{sql}`");
+        }
         let expr = parse_expr("name LIKE 'a%'").unwrap();
         let ast::Expr::Like { lhs, not, .. } = expr else {
             panic!("expected Like");
