@@ -29,14 +29,24 @@
 //! * `query` — the SQL must succeed and produce exactly the rows after `----`,
 //!   in order, with columns separated by a single tab and SQL `NULL` rendered
 //!   as the literal `NULL`.
+//! * `query types` — like `query`, but the single expected line lists the
+//!   MySQL column *type* of each result column (e.g. `LONG`, `VAR_STRING`),
+//!   checking the result-set metadata rather than the rows.
+//! * `exec ok` / `exec error` — like `statement`, but run over the binary
+//!   protocol as a prepared statement. An optional `params` line binds the
+//!   `?` placeholders (tab-separated; `NULL` for SQL NULL).
+//! * `exec query` — like `query`, but run as a prepared statement with an
+//!   optional `params` line before the `----` separator.
 //!
 //! Execution happens entirely over the MySQL wire protocol via the `mysql`
 //! client crate, so the same file runs against the Turso MySQL front-end or a
-//! real `mysqld`.
+//! real `mysqld`. The `exec*` directives exercise the binary (prepared
+//! statement) protocol; the others use the text protocol.
 
 use anyhow::{bail, Context, Result};
+use mysql::consts::ColumnType;
 use mysql::prelude::Queryable;
-use mysql::{Conn, Value};
+use mysql::{Conn, Params, Value};
 
 /// One record (test directive plus its payload) parsed from a `.test` file.
 #[derive(Debug, Clone)]
@@ -51,6 +61,29 @@ pub enum Record {
     Query {
         line: usize,
         sql: String,
+        expected: Vec<String>,
+    },
+    /// A query whose result-column types must match `expected` (a single line
+    /// of tab-separated MySQL type names).
+    QueryTypes {
+        line: usize,
+        sql: String,
+        expected: Vec<String>,
+    },
+    /// A prepared statement (binary protocol) that must succeed or fail, with
+    /// its `?` placeholders bound from `params`.
+    Exec {
+        line: usize,
+        expect_ok: bool,
+        sql: String,
+        params: Vec<String>,
+    },
+    /// A prepared query (binary protocol) whose rows must match `expected`,
+    /// with its `?` placeholders bound from `params`.
+    ExecQuery {
+        line: usize,
+        sql: String,
+        params: Vec<String>,
         expected: Vec<String>,
     },
 }
@@ -115,10 +148,138 @@ pub fn parse(content: &str) -> Result<Vec<Record>> {
                     sql: sql.join("\n"),
                 });
             }
+            "query types" => {
+                let (sql, expected) = read_query_block(&lines, &mut i, directive_line)?;
+                records.push(Record::QueryTypes {
+                    line: directive_line,
+                    sql,
+                    expected,
+                });
+            }
+            "exec ok" | "exec error" => {
+                let expect_ok = directive.ends_with("ok");
+                let (sql, params) =
+                    read_sql_with_params(&lines, &mut i, &directive, directive_line)?;
+                records.push(Record::Exec {
+                    line: directive_line,
+                    expect_ok,
+                    sql,
+                    params,
+                });
+            }
+            "exec query" => {
+                let (sql, params, expected) = read_exec_query(&lines, &mut i, directive_line)?;
+                records.push(Record::ExecQuery {
+                    line: directive_line,
+                    sql,
+                    params,
+                    expected,
+                });
+            }
             other => bail!("line {directive_line}: unknown directive `{other}`"),
         }
     }
     Ok(records)
+}
+
+/// Reads a query block: the SQL lines up to a `----` separator, then the
+/// expected lines up to a blank line. Advances `i` past the block.
+fn read_query_block(
+    lines: &[&str],
+    i: &mut usize,
+    directive_line: usize,
+) -> Result<(String, Vec<String>)> {
+    let mut sql = Vec::new();
+    while *i < lines.len() && lines[*i].trim_end() != "----" {
+        if lines[*i].trim().is_empty() {
+            bail!("line {directive_line}: query block is missing its `----` separator");
+        }
+        sql.push(lines[*i]);
+        *i += 1;
+    }
+    if *i >= lines.len() {
+        bail!("line {directive_line}: query block is missing its `----` separator");
+    }
+    *i += 1; // consume the `----` line
+    let mut expected = Vec::new();
+    while *i < lines.len() && !lines[*i].trim().is_empty() {
+        expected.push(lines[*i].to_string());
+        *i += 1;
+    }
+    Ok((sql.join("\n"), expected))
+}
+
+/// Reads SQL lines up to a blank line or a `params` line. Returns the SQL and
+/// any bound parameters.
+fn read_sql_with_params(
+    lines: &[&str],
+    i: &mut usize,
+    directive: &str,
+    directive_line: usize,
+) -> Result<(String, Vec<String>)> {
+    let mut sql = Vec::new();
+    let mut params = Vec::new();
+    while *i < lines.len() && !lines[*i].trim().is_empty() {
+        if let Some(values) = parse_params_line(lines[*i]) {
+            params = values;
+            *i += 1;
+            break;
+        }
+        sql.push(lines[*i]);
+        *i += 1;
+    }
+    if sql.is_empty() {
+        bail!("line {directive_line}: `{directive}` has no SQL");
+    }
+    Ok((sql.join("\n"), params))
+}
+
+/// Reads an `exec query` block: SQL, an optional `params` line, the `----`
+/// separator, then the expected rows.
+fn read_exec_query(
+    lines: &[&str],
+    i: &mut usize,
+    directive_line: usize,
+) -> Result<(String, Vec<String>, Vec<String>)> {
+    let mut sql = Vec::new();
+    let mut params = Vec::new();
+    loop {
+        if *i >= lines.len() {
+            bail!("line {directive_line}: `exec query` block is missing its `----` separator");
+        }
+        let line = lines[*i];
+        if line.trim_end() == "----" {
+            break;
+        }
+        if line.trim().is_empty() {
+            bail!("line {directive_line}: `exec query` block is missing its `----` separator");
+        }
+        if let Some(values) = parse_params_line(line) {
+            params = values;
+            *i += 1;
+            continue;
+        }
+        sql.push(line);
+        *i += 1;
+    }
+    *i += 1; // consume the `----` line
+    let mut expected = Vec::new();
+    while *i < lines.len() && !lines[*i].trim().is_empty() {
+        expected.push(lines[*i].to_string());
+        *i += 1;
+    }
+    Ok((sql.join("\n"), params, expected))
+}
+
+/// Parses a `params` line into its tab-separated values, or returns `None` if
+/// the line is not a `params` line.
+fn parse_params_line(line: &str) -> Option<Vec<String>> {
+    let rest = line.trim().strip_prefix("params")?;
+    // Require a separator after the keyword so `paramsX` is not mistaken for it.
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some(rest.trim_start().split('\t').map(str::to_string).collect())
 }
 
 /// The outcome of a single record.
@@ -165,6 +326,54 @@ fn run_record(conn: &mut Conn, record: &Record) -> Outcome {
                 message: format!("query failed: {e}"),
             },
         },
+        Record::QueryTypes {
+            line,
+            sql,
+            expected,
+        } => match query_types(conn, sql) {
+            Ok(actual) if &actual == expected => Outcome::Pass,
+            Ok(actual) => Outcome::Fail {
+                line: *line,
+                message: format!("column-type mismatch:\n{}", diff(expected, &actual)),
+            },
+            Err(e) => Outcome::Fail {
+                line: *line,
+                message: format!("query failed: {e}"),
+            },
+        },
+        Record::Exec {
+            line,
+            expect_ok,
+            sql,
+            params,
+        } => match (expect_ok, conn.exec_drop(sql, to_params(params))) {
+            (true, Ok(())) => Outcome::Pass,
+            (true, Err(e)) => Outcome::Fail {
+                line: *line,
+                message: format!("expected success, but prepared statement failed: {e}"),
+            },
+            (false, Ok(())) => Outcome::Fail {
+                line: *line,
+                message: "expected an error, but prepared statement succeeded".to_string(),
+            },
+            (false, Err(_)) => Outcome::Pass,
+        },
+        Record::ExecQuery {
+            line,
+            sql,
+            params,
+            expected,
+        } => match exec_query_rows(conn, sql, to_params(params)) {
+            Ok(actual) if &actual == expected => Outcome::Pass,
+            Ok(actual) => Outcome::Fail {
+                line: *line,
+                message: format!("result mismatch:\n{}", diff(expected, &actual)),
+            },
+            Err(e) => Outcome::Fail {
+                line: *line,
+                message: format!("prepared query failed: {e}"),
+            },
+        },
     }
 }
 
@@ -178,6 +387,64 @@ fn query_rows(conn: &mut Conn, sql: &str) -> Result<Vec<String>> {
         rows.push(cells.join("\t"));
     }
     Ok(rows)
+}
+
+/// Runs a query and renders its result-set column types as a single
+/// tab-separated line (e.g. `LONG<TAB>VAR_STRING`).
+fn query_types(conn: &mut Conn, sql: &str) -> Result<Vec<String>> {
+    let result = conn.query_iter(sql).context("query_iter")?;
+    let types: Vec<String> = result
+        .columns()
+        .as_ref()
+        .iter()
+        .map(|column| type_name(column.column_type()))
+        .collect();
+    Ok(vec![types.join("\t")])
+}
+
+/// Runs a prepared query over the binary protocol and renders its rows.
+fn exec_query_rows(conn: &mut Conn, sql: &str, params: Params) -> Result<Vec<String>> {
+    let mut rows = Vec::new();
+    let result = conn.exec_iter(sql, params).context("exec_iter")?;
+    for row in result {
+        let row = row.context("reading row")?;
+        let cells: Vec<String> = row.unwrap().iter().map(render_value).collect();
+        rows.push(cells.join("\t"));
+    }
+    Ok(rows)
+}
+
+/// Maps a MySQL column type to its short name, dropping the `MYSQL_TYPE_`
+/// prefix (`MYSQL_TYPE_LONG` becomes `LONG`).
+fn type_name(ty: ColumnType) -> String {
+    format!("{ty:?}")
+        .strip_prefix("MYSQL_TYPE_")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{ty:?}"))
+}
+
+/// Converts parsed parameter tokens into bound values. A token that parses as
+/// an integer or float binds as that number; `NULL` binds as SQL NULL;
+/// everything else binds as a string.
+fn to_params(tokens: &[String]) -> Params {
+    if tokens.is_empty() {
+        return Params::Empty;
+    }
+    let values = tokens
+        .iter()
+        .map(|token| {
+            if token == "NULL" {
+                Value::NULL
+            } else if let Ok(i) = token.parse::<i64>() {
+                Value::Int(i)
+            } else if let Ok(f) = token.parse::<f64>() {
+                Value::Double(f)
+            } else {
+                Value::Bytes(token.as_bytes().to_vec())
+            }
+        })
+        .collect();
+    Params::Positional(values)
 }
 
 /// Renders a single MySQL value the way the test format expects.

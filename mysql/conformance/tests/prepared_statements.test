@@ -1,0 +1,53 @@
+# Prepared statements over the binary protocol. The `exec*` directives run SQL
+# via COM_STMT_PREPARE / COM_STMT_EXECUTE, binding `?` placeholders from a
+# `params` line, where `query`/`statement` use the text protocol.
+#
+# This exercises parameter binding (integers, strings, doubles, NULL) and binary
+# result rows, including the typed decoding the client driver performs. Expected
+# to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS prep (id INT PRIMARY KEY, name VARCHAR(40), score DOUBLE, big BIGINT)
+
+# Bind a full row of parameters and run an INSERT as a prepared statement.
+exec ok
+INSERT INTO prep (id, name, score, big) VALUES (?, ?, ?, ?)
+params 1	alice	9.5	10000000000
+
+# Negative numbers and a NULL bind correctly.
+exec ok
+INSERT INTO prep (id, name, score, big) VALUES (?, ?, ?, ?)
+params 2	bob	-3.25	NULL
+
+# A prepared query with a bound parameter returns binary rows.
+exec query
+SELECT id, name, score, big FROM prep WHERE id = ?
+params 1
+----
+1	alice	9.5	10000000000
+
+# NULL round-trips through a binary result row.
+exec query
+SELECT id, name, score, big FROM prep WHERE id = ?
+params 2
+----
+2	bob	-3.25	NULL
+
+# A prepared query with no parameters still uses the binary protocol.
+exec query
+SELECT id, name FROM prep ORDER BY id
+----
+1	alice
+2	bob
+
+# Bound parameters work in expressions, not just as whole values.
+exec query
+SELECT id FROM prep WHERE score > ? ORDER BY id
+params 0
+----
+1
+
+# A prepared statement that violates a constraint fails.
+exec error
+INSERT INTO prep (id, name, score, big) VALUES (?, ?, ?, ?)
+params 1	dup	1.0	1

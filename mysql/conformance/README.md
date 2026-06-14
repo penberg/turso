@@ -28,6 +28,27 @@ SELECT id, name FROM t ORDER BY id
 - `statement error` — the SQL must fail.
 - `query` — the SQL must succeed and return exactly the rows after `----`, in
   order, columns separated by a single tab, SQL `NULL` rendered as `NULL`.
+- `query types` — like `query`, but the single expected line lists the MySQL
+  column *type* of each result column (`LONG`, `VAR_STRING`, …), checking the
+  result-set metadata rather than the rows.
+- `exec ok` / `exec error` — like `statement`, but run over the binary
+  (prepared-statement) protocol. An optional `params` line binds the `?`
+  placeholders, tab-separated, with `NULL` for SQL NULL.
+- `exec query` — like `query`, run as a prepared statement, with an optional
+  `params` line before the `----` separator.
+
+```text
+query types
+SELECT id, name FROM t
+----
+LONG	VAR_STRING
+
+exec query
+SELECT name FROM t WHERE id = ?
+params 1
+----
+alice
+```
 
 ## Running
 

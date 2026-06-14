@@ -1,0 +1,44 @@
+# Result-set column types. The `query types` directive checks the MySQL type
+# code the server reports for each result column (the metadata, not the rows).
+#
+# Every column here comes straight from a table, so the reported type is derived
+# from the declared type and matches a real mysqld: INT -> LONG, BIGINT ->
+# LONGLONG, VARCHAR -> VAR_STRING, TEXT -> BLOB, and so on. Expression columns
+# are intentionally excluded — their type is engine-defined and not part of this
+# check. Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS coltypes (
+  c_tiny TINYINT,
+  c_small SMALLINT,
+  c_int INT,
+  c_big BIGINT,
+  c_double DOUBLE,
+  c_decimal DECIMAL(10, 2),
+  c_varchar VARCHAR(40),
+  c_text TEXT,
+  c_date DATE,
+  c_datetime DATETIME
+)
+
+# Each result column reports the MySQL type of its underlying table column.
+query types
+SELECT c_tiny, c_small, c_int, c_big, c_double, c_decimal, c_varchar, c_text, c_date, c_datetime FROM coltypes
+----
+TINY	SHORT	LONG	LONGLONG	DOUBLE	NEWDECIMAL	VAR_STRING	BLOB	DATE	DATETIME
+
+# A projection reorders columns; the types follow the projected columns.
+query types
+SELECT c_varchar, c_int FROM coltypes
+----
+VAR_STRING	LONG
+
+# Unsigned integers keep their base type code (the unsigned flag rides
+# alongside it, which this directive does not inspect).
+statement ok
+CREATE TABLE IF NOT EXISTS coltypes_u (id BIGINT UNSIGNED, n INT UNSIGNED)
+
+query types
+SELECT id, n FROM coltypes_u
+----
+LONGLONG	LONG
