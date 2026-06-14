@@ -1656,6 +1656,12 @@ impl Parser {
                         self.advance();
                         self.exists_expr()
                     }
+                    // `CAST(expr AS type)` is real cast syntax, not a function
+                    // call, so it is parsed separately from the function path.
+                    "CAST" if self.peek_nth(1) == Some(&Token::LParen) => {
+                        self.advance();
+                        self.cast_expr()
+                    }
                     // A bare identifier followed by `(` is a function call;
                     // otherwise it is a column reference.
                     _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
@@ -1665,6 +1671,62 @@ impl Parser {
             Some(Token::QuotedIdent(_)) => self.column_ref(),
             _ => Err(self.unexpected("an expression")),
         }
+    }
+
+    /// Parses `CAST(expr AS type)`. The engine's `CAST` follows SQLite affinity
+    /// rules, so MySQL's cast target types are mapped to a type name with the
+    /// matching affinity (see [`Self::cast_type`]). `CAST` has already been
+    /// consumed.
+    fn cast_expr(&mut self) -> Result<ast::Expr> {
+        self.expect(&Token::LParen, "`(`")?;
+        let expr = self.expr()?;
+        self.expect_keyword("AS")?;
+        let type_name = self.cast_type()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::Cast {
+            expr: Box::new(expr),
+            type_name: Some(type_name),
+        })
+    }
+
+    /// Parses and maps a MySQL `CAST` target type onto an engine type whose
+    /// SQLite affinity matches the intended conversion: `CHAR`→text,
+    /// `SIGNED`/`UNSIGNED`→integer, `DECIMAL`→numeric, `DOUBLE`/`FLOAT`/`REAL`→
+    /// real, `BINARY`→blob. Date/time and JSON targets diverge from the engine
+    /// and are rejected. A length/precision is accepted but dropped (the engine
+    /// does not enforce it); rounding of fractional values to an integer also
+    /// differs from MySQL — see `mysql/COMPAT.md`.
+    fn cast_type(&mut self) -> Result<ast::Type> {
+        let Some(Token::Word(w)) = self.peek() else {
+            return Err(self.unexpected("a CAST target type"));
+        };
+        let kw = w.to_ascii_uppercase();
+        self.advance();
+        // A trailing length/precision (`CHAR(8)`, `DECIMAL(10,2)`) parses but is
+        // not carried onto the cast.
+        if self.is(&Token::LParen) {
+            let _ = self.type_size()?;
+        }
+        let name = match kw.as_str() {
+            "CHAR" | "NCHAR" | "CHARACTER" => "CHAR",
+            "SIGNED" | "UNSIGNED" => {
+                self.eat_keyword("INTEGER");
+                "INTEGER"
+            }
+            "DECIMAL" | "DEC" | "NUMERIC" | "FIXED" => "DECIMAL",
+            "DOUBLE" | "FLOAT" | "REAL" => "REAL",
+            "BINARY" => "BLOB",
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "CAST to {other} is not supported yet"
+                )))
+            }
+        };
+        Ok(ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        })
     }
 
     /// Parses a `CASE` expression — both the searched form
@@ -2977,6 +3039,37 @@ mod tests {
             ),
         );
         assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn cast_maps_mysql_types_to_engine_affinity() {
+        // CAST is a real cast, not a function call; MySQL target types map to an
+        // engine type with the matching affinity.
+        let cases = [
+            ("CAST(a AS CHAR)", "CHAR"),
+            ("CAST(a AS SIGNED)", "INTEGER"),
+            ("CAST(a AS SIGNED INTEGER)", "INTEGER"),
+            ("CAST(a AS UNSIGNED)", "INTEGER"),
+            ("CAST(a AS DECIMAL)", "DECIMAL"),
+            ("CAST(a AS DOUBLE)", "REAL"),
+            ("CAST(a AS BINARY)", "BLOB"),
+            ("CAST(a AS CHAR(8))", "CHAR"), // length parses but is dropped
+        ];
+        for (sql, expected) in cases {
+            let ast::Expr::Cast { type_name, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected a Cast for `{sql}`");
+            };
+            let ty = type_name.expect("cast has a target type");
+            assert_eq!(ty.name, expected, "for `{sql}`");
+            assert!(ty.size.is_none(), "length must be dropped for `{sql}`");
+        }
+        // Targets that diverge from the engine are rejected.
+        for sql in ["CAST(a AS DATE)", "CAST(a AS DATETIME)", "CAST(a AS JSON)"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
     }
 
     #[test]

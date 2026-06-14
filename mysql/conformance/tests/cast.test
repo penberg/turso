@@ -1,0 +1,45 @@
+# CAST(expr AS type) conformance.
+#
+# MySQL CAST is parsed as a real cast (not a function call) and mapped onto the
+# engine's affinity-based CAST. Supported targets: CHAR (text), SIGNED /
+# UNSIGNED (integer), DECIMAL (numeric), DOUBLE / FLOAT / REAL (real), BINARY
+# (blob). A length/precision (CHAR(n), DECIMAL(m,d)) is accepted but not
+# enforced, and rounding of fractional values when casting to an integer differs
+# from MySQL — see mysql/COMPAT.md.
+#
+# These cases use integer/string inputs where both targets agree, so they pass
+# against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS cast_demo (a INT PRIMARY KEY, b VARCHAR(16))
+
+statement ok
+INSERT INTO cast_demo (a, b) VALUES (10, '7'), (2, '30')
+
+# Integer to CHAR (text).
+query
+SELECT CAST(a AS CHAR) FROM cast_demo ORDER BY a
+----
+2
+10
+
+# String to SIGNED integer: ordering is numeric, not lexical ('30' < '7' as text).
+query
+SELECT b FROM cast_demo ORDER BY CAST(b AS SIGNED)
+----
+7
+30
+
+# String to UNSIGNED, projected.
+query
+SELECT CAST(b AS UNSIGNED) FROM cast_demo ORDER BY a
+----
+30
+7
+
+# CHAR with an (ignored) length still parses and casts to text.
+query
+SELECT CAST(a AS CHAR(4)) FROM cast_demo ORDER BY a
+----
+2
+10
