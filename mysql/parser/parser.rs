@@ -1650,10 +1650,17 @@ impl Parser {
 
     fn primary_expr(&mut self) -> Result<ast::Expr> {
         match self.peek() {
-            // Parenthesized sub-expression. The wrapper node is kept so the
-            // rendered SQL preserves the original grouping.
+            // A parenthesized group: either a scalar subquery `(SELECT ...)` —
+            // usable as a value, possibly correlated — or an ordinary
+            // parenthesized expression. The `Parenthesized` wrapper is kept so
+            // the rendered SQL preserves the original grouping.
             Some(Token::LParen) => {
                 self.advance();
+                if self.eat_keyword("SELECT") {
+                    let select = self.parse_select()?;
+                    self.expect(&Token::RParen, "`)`")?;
+                    return Ok(ast::Expr::Subquery(select));
+                }
                 let inner = self.expr()?;
                 self.expect(&Token::RParen, "`)`")?;
                 Ok(ast::Expr::Parenthesized(vec![Box::new(inner)]))
@@ -3161,6 +3168,26 @@ mod tests {
         assert!(matches!(
             parse_expr("id IN (1, 2, 3)").unwrap(),
             ast::Expr::InList { .. }
+        ));
+    }
+
+    #[test]
+    fn scalar_subquery_in_expression() {
+        // `(SELECT ...)` in an expression parses as a scalar subquery.
+        assert!(matches!(
+            parse_expr("(SELECT COUNT(*) FROM t WHERE t.a = u.b)").unwrap(),
+            ast::Expr::Subquery(_)
+        ));
+        // It composes in a comparison.
+        let expr = parse_expr("(SELECT MIN(x) FROM t) = 5").unwrap();
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, _) = expr else {
+            panic!("expected a comparison with a subquery on the left");
+        };
+        assert!(matches!(*lhs, ast::Expr::Subquery(_)));
+        // A plain parenthesized expression is still parenthesized, not a subquery.
+        assert!(matches!(
+            parse_expr("(1 + 2)").unwrap(),
+            ast::Expr::Parenthesized(_)
         ));
     }
 

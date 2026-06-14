@@ -288,7 +288,7 @@ incomplete.
 | `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, `JOIN ... USING`, ON-less keyword joins | ❌ | Rejected as unsupported (semantics differ or unmodeled). |
 | UNION / UNION ALL                      | ✅     | `UNION` deduplicates, `UNION ALL` does not; a trailing `ORDER BY`/`LIMIT` applies to the whole result. Identical to MySQL 8.x. |
 | INTERSECT / EXCEPT set operations      | ✅     | Deduplicating set operations, identical to MySQL 8.x. Mixed-operator precedence is not exercised. |
-| Subqueries                             | ❌     |         |
+| Subqueries                             | ✅     | `IN (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`, scalar `(SELECT ...)` in expressions, and derived tables in `FROM` — including correlated forms. See the Expressions section. |
 | Derived / lateral derived tables       | ❌     |         |
 | TABLE statement                        | ❌     |         |
 | UPDATE tbl SET ... [WHERE] (single table) | ✅  |         |
@@ -322,7 +322,8 @@ diverge are deliberately excluded.
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
 | `[NOT] IN (SELECT ...)`                | ✅     | Uncorrelated subquery in `IN`/`NOT IN`; evaluates identically. |
 | `[NOT] EXISTS (SELECT ...)`            | ✅     | Correlated subqueries supported; identical semantics. |
-| Derived table `FROM (SELECT ...) alias` | ✅    | Subquery in `FROM`; the alias is required (as in MySQL). Scalar subqueries (in the select list) are not yet parsed. |
+| Derived table `FROM (SELECT ...) alias` | ✅    | Subquery in `FROM`; the alias is required (as in MySQL). |
+| Scalar subquery `(SELECT ...)` in an expression | ✅ | A parenthesized `SELECT` returning a single value, usable in the select list or `WHERE`, including correlated subqueries. Evaluated identically to MySQL. |
 
 #### Scalar functions
 
