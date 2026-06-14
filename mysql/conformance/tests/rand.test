@@ -1,0 +1,35 @@
+# RAND() conformance.
+#
+# MySQL's RAND() returns a pseudo-random float in [0, 1). The front-end lowers it
+# to abs(random() % 1000000000) / 1000000000.0, which is in the same range.
+# WordPress uses RAND() for `ORDER BY RAND()` (random ordering).
+#
+# The value is non-deterministic, so these checks assert only the [0, 1) range,
+# which holds on both targets. A seed argument (RAND(n)) is accepted but not
+# honored (see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS rand_demo (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO rand_demo (id) VALUES (1), (2), (3), (4), (5)
+
+# RAND() is always in [0, 1).
+query
+SELECT RAND() >= 0 AND RAND() < 1
+----
+1
+
+# RAND() is a number (multiplying by 0 gives 0).
+query
+SELECT (RAND() * 0) = 0
+----
+1
+
+# `WHERE RAND() >= 0` keeps every row; `ORDER BY RAND()` doesn't drop any.
+query
+SELECT COUNT(*) FROM rand_demo WHERE RAND() >= 0 ORDER BY RAND()
+----
+5

@@ -1898,6 +1898,12 @@ impl Parser {
             return self.field_call();
         }
 
+        // `RAND()` lowers to a random float in `[0, 1)` built from the engine's
+        // `random()`. A seed argument is accepted but not honored.
+        if upper == "RAND" {
+            return self.rand_call();
+        }
+
         // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
         // `datetime(x, '+n unit')` / `datetime(x, '-n unit')` modifier.
         if upper == "DATE_ADD" {
@@ -2073,6 +2079,57 @@ impl Parser {
                 "0".to_string(),
             )))),
         })
+    }
+
+    /// Parses a `RAND([seed])` call (the name and `(` are already consumed) and
+    /// lowers it to `abs(random() % 1000000000) / 1000000000.0`, a pseudo-random
+    /// float in `[0, 1)` like MySQL's `RAND()`. A seed argument is parsed but
+    /// discarded — the engine's RNG is not seedable, so `RAND(n)` is not the
+    /// deterministic sequence MySQL produces (see `mysql/COMPAT.md`).
+    fn rand_call(&mut self) -> Result<ast::Expr> {
+        if !self.is(&Token::RParen) {
+            loop {
+                let _ = self.expr()?;
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+
+        let random = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("random"),
+            distinctness: None,
+            args: Vec::new(),
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let modulo = ast::Expr::binary(
+            random,
+            ast::Operator::Modulus,
+            ast::Expr::Literal(ast::Literal::Numeric("1000000000".to_string())),
+        );
+        let magnitude = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("abs"),
+            distinctness: None,
+            args: vec![Box::new(modulo)],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        Ok(ast::Expr::binary(
+            magnitude,
+            ast::Operator::Divide,
+            ast::Expr::Literal(ast::Literal::Numeric("1000000000.0".to_string())),
+        ))
     }
 
     /// Parses the single argument of a `LENGTH(x)` call (the name and `(` are
@@ -3857,6 +3914,19 @@ mod tests {
     }
 
     #[test]
+    fn rand_lowers_to_random_division() {
+        // RAND() -> abs(random() % N) / N.0 (a float in [0, 1)).
+        let ast::Expr::Binary(_, ast::Operator::Divide, _) = parse_expr("RAND()").unwrap() else {
+            panic!("expected RAND() to lower to a division");
+        };
+        // A seed argument is accepted (and discarded), still a division.
+        assert!(matches!(
+            parse_expr("RAND(5)").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Divide, _)
+        ));
+    }
+
+    #[test]
     fn field_lowers_to_case() {
         // FIELD(x, a, b) -> CASE x WHEN a THEN 1 WHEN b THEN 2 ELSE 0 END.
         let ast::Expr::Case {
@@ -4094,7 +4164,12 @@ mod tests {
 
     #[test]
     fn function_call_not_in_allow_list_is_unsupported() {
-        for input in ["SLEEP(1)", "ROUND(2.7)", "RAND()", "totally_made_up(1)"] {
+        for input in [
+            "SLEEP(1)",
+            "ROUND(2.7)",
+            "GREATEST(1, 2)",
+            "totally_made_up(1)",
+        ] {
             let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
             assert!(
                 matches!(err, ParseError::Unsupported(_)),

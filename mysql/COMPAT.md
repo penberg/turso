@@ -348,6 +348,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `GROUP_CONCAT`                         | ❌     | **Excluded** — separator / `ORDER BY` syntax differs. |
 | `CONCAT`                               | ✅     | Lowered to the engine's `\|\|` operator (not `concat()`): like MySQL, the result is NULL if any argument is NULL. Requires at least one argument. |
 | `FIELD`                                | ✅     | Lowered to `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0 END` — the 1-based index of the first argument among the rest, or 0 if absent/NULL. WordPress uses it for `ORDER BY FIELD(...)` (e.g. `orderby=post__in`). |
+| `RAND`                                 | 🚧     | Lowered to `abs(random() % 1000000000) / 1000000000.0`, a pseudo-random float in `[0, 1)` like MySQL — enough for `ORDER BY RAND()`. A seed argument (`RAND(n)`) is accepted but **not** honored: the engine's RNG is not seedable, so it does not reproduce MySQL's deterministic seeded sequence. |
 | `LENGTH`                               | ✅     | Byte count. Lowered to `length(CAST(x AS BLOB))` (the engine's `length()` of a blob counts bytes); matches MySQL's byte semantics, distinct from `CHAR_LENGTH`. |
 | `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |
 | `IF`                                   | ✅     | Renamed on emit to the engine's `IIF`; semantics are identical (a NULL/zero condition is false). |
