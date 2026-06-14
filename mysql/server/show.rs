@@ -38,13 +38,14 @@ pub enum ShowOutcome {
     NoSuchTable(String),
 }
 
-/// Tries to handle `sql` as `SHOW [FULL] {COLUMNS|FIELDS} {FROM|IN} tbl` or
+/// Tries to handle `sql` as `SHOW [FULL] {COLUMNS|FIELDS} {FROM|IN} tbl`,
+/// `{DESCRIBE|DESC} tbl` (a synonym for the non-FULL form), or
 /// `SHOW [FULL] TABLES [LIKE 'pat']`.
 ///
-/// Returns `None` if `sql` is neither, so every other `SHOW` form falls through
-/// to the parser (which rejects it as unsupported).
+/// Returns `None` if `sql` is none of these, so every other `SHOW` form falls
+/// through to the parser (which rejects it as unsupported).
 pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcome, LimboError>> {
-    if let Some(parsed) = parse_show_columns(sql) {
+    if let Some(parsed) = parse_show_columns(sql).or_else(|| parse_describe(sql)) {
         return Some(build(conn, &parsed));
     }
     if let Some(parsed) = parse_show_tables(sql) {
@@ -274,6 +275,42 @@ fn parse_show_columns(sql: &str) -> Option<ShowColumns> {
         return None;
     }
     Some(ShowColumns { full, table })
+}
+
+/// Parses `{DESCRIBE | DESC} tbl` (optionally `db.tbl`), MySQL's synonym for
+/// `SHOW COLUMNS FROM tbl`. DESCRIBE always yields the non-FULL six-column
+/// shape. The `DESCRIBE tbl col_name` / `DESCRIBE tbl 'wild'` column-filter
+/// forms are not handled here, so they fall through (and are rejected as
+/// unsupported); WordPress only issues the bare `DESCRIBE tbl` form.
+fn parse_describe(sql: &str) -> Option<ShowColumns> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let mut k = 0;
+
+    let kw = |t: &str, kw: &str| t.eq_ignore_ascii_case(kw);
+
+    if !toks
+        .get(k)
+        .is_some_and(|t| kw(t, "DESCRIBE") || kw(t, "DESC"))
+    {
+        return None;
+    }
+    k += 1;
+
+    let mut table = toks.get(k)?.clone();
+    k += 1;
+    // `db.tbl`: the real table name follows the dot.
+    if toks.get(k).is_some_and(|t| t == ".") {
+        k += 1;
+        table = toks.get(k)?.clone();
+        k += 1;
+    }
+
+    // A trailing column name or wildcard (DESCRIBE tbl col) is not handled here.
+    if k != toks.len() {
+        return None;
+    }
+    Some(ShowColumns { full: false, table })
 }
 
 /// Parses `SHOW [FULL] TABLES [{FROM|IN} db] [LIKE 'pat']`. Returns `None` for

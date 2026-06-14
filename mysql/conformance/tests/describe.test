@@ -1,0 +1,33 @@
+# DESCRIBE / DESC conformance.
+#
+# In MySQL, DESCRIBE (and its short form DESC) is a synonym for
+# SHOW COLUMNS FROM tbl — it returns the non-FULL six-column shape (Field, Type,
+# Null, Key, Default, Extra). WordPress and the PHPUnit harness issue DESCRIBE
+# constantly to read column metadata, so the front-end must answer it the same
+# way it already answers SHOW COLUMNS.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Rows are
+# tab-separated; the trailing empty Extra column produces a trailing tab.
+
+statement ok
+CREATE TABLE IF NOT EXISTS describe_demo (a INT NOT NULL PRIMARY KEY, c TEXT, d BIGINT)
+
+# DESCRIBE returns the same six columns as SHOW COLUMNS.
+query
+DESCRIBE describe_demo
+----
+a	int	NO	PRI	NULL	
+c	text	YES		NULL	
+d	bigint	YES		NULL	
+
+# DESC is the documented short form and behaves identically.
+query
+DESC describe_demo
+----
+a	int	NO	PRI	NULL	
+c	text	YES		NULL	
+d	bigint	YES		NULL	
+
+# DESCRIBE on a missing table errors on both targets (MySQL error 1146).
+statement error
+DESCRIBE describe_no_such_table
