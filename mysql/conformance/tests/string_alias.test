@@ -1,0 +1,38 @@
+# String-literal column aliases: `expr AS 'name'`.
+#
+# MySQL accepts a quoted string as a column alias after AS, e.g.
+# `SELECT col AS 'name'`. The front-end uses the string's text as the
+# (case-exact) alias, so the statement parses and the result is identical to the
+# identifier-alias form. WordPress emits this in its table-size introspection
+# query (`SELECT TABLE_NAME AS 'table', ...`).
+#
+# Only the `AS 'name'` form is supported; the elided `SELECT 1 'name'` form is
+# ambiguous in MySQL (adjacent string literals concatenate) and is not handled.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS alias_demo (a INT PRIMARY KEY, b TEXT)
+
+statement ok
+INSERT INTO alias_demo (a, b) VALUES (1, 'x'), (2, 'y')
+
+# A string-literal alias parses and returns the same rows as a bare alias.
+query
+SELECT a AS 'id', b AS 'label' FROM alias_demo ORDER BY a
+----
+1	x
+2	y
+
+# An aggregate aliased with a string literal.
+query
+SELECT COUNT(*) AS 'total' FROM alias_demo
+----
+2
+
+# A string alias containing spaces (only expressible as a quoted string).
+query
+SELECT a AS 'row id' FROM alias_demo ORDER BY a
+----
+1
+2

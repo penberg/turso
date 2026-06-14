@@ -962,7 +962,7 @@ impl Parser {
     /// select list (e.g. `FROM`).
     fn column_alias(&mut self) -> Result<Option<ast::As>> {
         if self.eat_keyword("AS") {
-            return Ok(Some(ast::As::As(self.name()?)));
+            return Ok(Some(ast::As::As(self.alias_name()?)));
         }
         match self.peek() {
             Some(Token::QuotedIdent(_)) => Ok(Some(ast::As::Elided(self.name()?))),
@@ -971,6 +971,20 @@ impl Parser {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Parses a column alias following `AS`. MySQL allows the alias to be written
+    /// as a string literal (`expr AS 'name'`), not just an identifier; the
+    /// string's text is used as the (case-exact) alias name. Only the `AS` form
+    /// accepts a string — the elided `SELECT 1 'name'` form is ambiguous in
+    /// MySQL (adjacent string literals concatenate) and is not handled.
+    fn alias_name(&mut self) -> Result<ast::Name> {
+        if let Some(Token::Str(s)) = self.peek() {
+            let name = ast::Name::exact(s.clone());
+            self.advance();
+            return Ok(name);
+        }
+        self.name()
     }
 
     /// Parses the `FROM` clause: a table reference optionally followed by
@@ -2403,6 +2417,22 @@ mod tests {
             &columns[1],
             ast::ResultColumn::Expr(_, Some(ast::As::As(_)))
         ));
+    }
+
+    #[test]
+    fn select_string_literal_alias() {
+        // MySQL allows `expr AS 'name'`; the string text becomes the alias.
+        let stmt = parse("SELECT a AS 'row id' FROM t").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { columns, .. } = s.body.select else {
+            unreachable!()
+        };
+        let ast::ResultColumn::Expr(_, Some(ast::As::As(n))) = &columns[0] else {
+            panic!("expected an `AS` alias");
+        };
+        assert_eq!(n.as_str(), "row id");
     }
 
     #[test]

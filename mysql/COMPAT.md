@@ -280,7 +280,7 @@ incomplete.
 | SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
 | SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
 | SELECT DISTINCT                        | ✅     | `DISTINCTROW` synonym not supported. |
-| Column aliases (`expr AS a` / `expr a`) | ✅    | Both the `AS` and bare forms; resolvable in `ORDER BY`/`GROUP BY`. |
+| Column aliases (`expr AS a` / `expr a`) | ✅    | Both the `AS` and bare forms; resolvable in `ORDER BY`/`GROUP BY`. A string-literal alias (`expr AS 'name'`) is also accepted; the elided string form (`expr 'name'`) is not (ambiguous with literal concatenation). |
 | SELECT ... INTO                        | ❌     | **Not supported.** |
 | `[INNER] JOIN` / `LEFT [OUTER] JOIN` ... ON | ✅ | Table aliases (`t`, `t AS a`) and chained joins supported. Map identically onto the engine. |
 | `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, comma joins, `JOIN ... USING`, ON-less joins | ❌ | Rejected as unsupported (semantics differ or unmodeled). |
