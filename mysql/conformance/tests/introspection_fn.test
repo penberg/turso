@@ -1,0 +1,27 @@
+# Introspection functions in expression context: VERSION / DATABASE /
+# CONNECTION_ID / USER / CURRENT_USER.
+#
+# These return server/connection metadata. The front-end answered a few as
+# standalone queries (e.g. `SELECT VERSION()`); this makes them usable inside
+# any expression too. The values are server-specific and the front-end's are
+# fixed placeholders (see mysql/COMPAT.md), so these checks assert only portable
+# properties that hold on both turso-mysql-server and a real mysqld.
+
+# DATABASE() is NULL when no schema is selected (the conformance connection has
+# none), usable inside IS NULL.
+query
+SELECT DATABASE() IS NULL
+----
+1
+
+# CONNECTION_ID() is a positive integer, usable in a comparison.
+query
+SELECT CONNECTION_ID() > 0
+----
+1
+
+# VERSION() and CURRENT_USER() are non-empty and usable mid-expression / list.
+query
+SELECT LENGTH(VERSION()) > 0, CURRENT_USER() IS NOT NULL
+----
+1	1

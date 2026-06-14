@@ -358,6 +358,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `CURDATE` / `CURRENT_DATE` / `CURTIME` / `CURRENT_TIME` / `UTC_DATE` / `UTC_TIME` | 🚧 | Lowered to `date('now')` / `time('now')`; UTC, as above. |
 | `UNIX_TIMESTAMP([d])` / `FROM_UNIXTIME(n)` | 🚧 | Lowered to `unixepoch(d)` (or `unixepoch('now')`) and `datetime(n, 'unixepoch')`. Absolute conversions are UTC (the engine has no session time zone), so they diverge from MySQL's session-local values, but the two are inverses on both targets, so a round trip is zone-independent. `FROM_UNIXTIME`'s two-argument formatting form is not supported. |
 | Other date/time functions (`STR_TO_DATE`, `DATEDIFF`, `TIMESTAMPDIFF`, …) | ❌ | **Excluded** — format/type or timezone differences. |
+| `VERSION` / `DATABASE` / `SCHEMA` / `CONNECTION_ID` / `USER` / `CURRENT_USER` / `SESSION_USER` / `SYSTEM_USER` | 🚧 | Introspection functions, usable in any expression (not just as a standalone `SELECT`). Fold to fixed placeholder values matching the server's standalone-query answers (`VERSION()`→`8.0.0-turso`, `USER()`→`root@localhost`, `CONNECTION_ID()`→`1`); `DATABASE()`/`SCHEMA()`→`NULL` (no current schema). Not the real per-connection values. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 
 ### Transactional and Locking Statements

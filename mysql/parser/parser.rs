@@ -1898,6 +1898,15 @@ impl Parser {
             return self.from_unixtime_call();
         }
 
+        // Server/connection introspection functions (`VERSION()`, `DATABASE()`,
+        // ...) fold to the same canned literal the server reports for the
+        // standalone forms, so they also work inside larger expressions. They
+        // take no arguments.
+        if let Some(literal) = introspection_literal(&upper) {
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(literal);
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -2566,6 +2575,24 @@ fn translate_date_format(mysql_fmt: &str) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// The canned literal a server/connection introspection function folds to, or
+/// `None` if `upper_name` is not one. The values mirror the standalone-query
+/// answers in the server's `session` module (placeholder server identity — see
+/// `mysql/COMPAT.md`); `DATABASE()`/`SCHEMA()` are genuinely `NULL` because the
+/// front-end has no current schema. `upper_name` must already be uppercased.
+fn introspection_literal(upper_name: &str) -> Option<ast::Expr> {
+    let literal = match upper_name {
+        "VERSION" => ast::Literal::String(requote("8.0.0-turso")),
+        "DATABASE" | "SCHEMA" => ast::Literal::Null,
+        "CONNECTION_ID" => ast::Literal::Numeric("1".to_string()),
+        "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
+            ast::Literal::String(requote("root@localhost"))
+        }
+        _ => return None,
+    };
+    Some(ast::Expr::Literal(literal))
 }
 
 /// The engine function (`datetime`/`date`/`time`) that a MySQL current
@@ -3553,6 +3580,30 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn introspection_functions_fold_to_literals() {
+        // VERSION()/USER() fold to string literals, DATABASE() to NULL,
+        // CONNECTION_ID() to a number — usable mid-expression.
+        assert!(matches!(
+            parse_expr("VERSION()").unwrap(),
+            ast::Expr::Literal(ast::Literal::String(_))
+        ));
+        assert!(matches!(
+            parse_expr("DATABASE()").unwrap(),
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        assert!(matches!(
+            parse_expr("CONNECTION_ID()").unwrap(),
+            ast::Expr::Literal(ast::Literal::Numeric(_))
+        ));
+        assert!(matches!(
+            parse_expr("CURRENT_USER()").unwrap(),
+            ast::Expr::Literal(ast::Literal::String(_))
+        ));
+        // Usable inside a larger expression (the case that used to error).
+        assert!(parse_expr("LENGTH(VERSION()) > 0").is_ok());
     }
 
     #[test]
