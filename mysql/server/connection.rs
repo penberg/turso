@@ -339,6 +339,21 @@ fn parse_error_response(first_seq: u8, error: &ParseError) -> Vec<u8> {
 /// that, if execution fails partway through, we can discard a partial result
 /// set and reply with a clean ERR packet instead of a truncated stream.
 fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u8> {
+    // MySQL treats `COMMIT` / `ROLLBACK` with no transaction in progress as a
+    // silent no-op, whereas the engine errors ("no transaction is active").
+    // Clients — notably the WordPress test harness, which brackets every test
+    // class with a bare `COMMIT` — depend on the no-op behavior, so answer with
+    // a clean OK packet before the statement ever reaches the engine. When a
+    // transaction *is* active (`get_auto_commit()` is false), fall through and
+    // let the engine commit or roll it back as usual.
+    if matches!(stmt, ast::Stmt::Commit { .. } | ast::Stmt::Rollback { .. })
+        && conn.get_auto_commit()
+    {
+        let mut out = Vec::new();
+        encode_frame(&mut out, first_seq, &OkPacket::default().encode());
+        return out;
+    }
+
     let mut statement = match conn.prepare_stmt(stmt) {
         Ok(statement) => statement,
         Err(e) => return error_response(first_seq, &e),

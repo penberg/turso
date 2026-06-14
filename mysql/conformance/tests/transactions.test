@@ -58,3 +58,22 @@ SELECT a, label FROM tx ORDER BY a
 ----
 2	committed
 3	via-begin
+
+# A bare COMMIT or ROLLBACK with no transaction in progress is a silent no-op
+# in MySQL, not an error. WordPress's test harness brackets every test class
+# with a bare COMMIT (WP_UnitTestCase_Base::commit_transaction), so the
+# front-end must accept these and leave committed data untouched.
+statement ok
+COMMIT
+
+statement ok
+ROLLBACK
+
+statement ok
+COMMIT
+
+query
+SELECT a, label FROM tx ORDER BY a
+----
+2	committed
+3	via-begin
