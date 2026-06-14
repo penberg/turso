@@ -354,6 +354,18 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u
         return out;
     }
 
+    // MySQL has no nested transactions: `START TRANSACTION` / `BEGIN` issued
+    // while one is already in progress implicitly commits it before starting
+    // the new one. The engine instead errors ("cannot start a transaction
+    // within a transaction"), so perform that implicit commit here when a
+    // transaction is active (`get_auto_commit()` is false) and then fall
+    // through to start the new one.
+    if matches!(stmt, ast::Stmt::Begin { .. }) && !conn.get_auto_commit() {
+        if let Err(e) = run_for_side_effects(conn, ast::Stmt::Commit { name: None }) {
+            return error_response(first_seq, &e);
+        }
+    }
+
     let mut statement = match conn.prepare_stmt(stmt) {
         Ok(statement) => statement,
         Err(e) => return error_response(first_seq, &e),
@@ -380,6 +392,14 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u
             Err(e) => error_response(first_seq, &e),
         }
     }
+}
+
+/// Prepares and runs a statement purely for its side effects, discarding any
+/// rows. Used for statements the front-end issues on the client's behalf, such
+/// as the implicit `COMMIT` before a nested `START TRANSACTION`.
+fn run_for_side_effects(conn: &Arc<Connection>, stmt: ast::Stmt) -> Result<(), LimboError> {
+    let mut statement = conn.prepare_stmt(stmt)?;
+    statement.run_with_row_callback(|_| Ok(()))
 }
 
 /// Encodes a complete text result set into a freshly framed buffer, starting at

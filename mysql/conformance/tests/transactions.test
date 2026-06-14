@@ -77,3 +77,30 @@ SELECT a, label FROM tx ORDER BY a
 ----
 2	committed
 3	via-begin
+
+# MySQL has no nested transactions: a START TRANSACTION (or BEGIN) issued while
+# one is already in progress implicitly commits the open transaction before
+# starting the new one. Here the first insert is committed by the implicit
+# commit that the second START TRANSACTION triggers, while the second insert is
+# rolled back, so only the first survives.
+statement ok
+START TRANSACTION
+
+statement ok
+INSERT INTO tx (a, label) VALUES (4, 'auto-committed')
+
+statement ok
+START TRANSACTION
+
+statement ok
+INSERT INTO tx (a, label) VALUES (5, 'rolled-back')
+
+statement ok
+ROLLBACK
+
+query
+SELECT a, label FROM tx ORDER BY a
+----
+2	committed
+3	via-begin
+4	auto-committed
