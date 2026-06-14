@@ -1,0 +1,44 @@
+# Single-target multi-table DELETE: DELETE t1 FROM <refs> WHERE ...
+#
+# MySQL's multi-table DELETE with one target table deletes the rows of that
+# table that match a join. The front-end lowers it to
+# DELETE FROM t1 WHERE rowid IN (SELECT t1.rowid FROM <refs> WHERE ...), which
+# the engine evaluates identically. The multiple-target form
+# (DELETE a, b FROM ...) needs a two-phase delete and is not supported (see
+# mysql/COMPAT.md) — so it is not exercised here.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS mt_a (id INT PRIMARY KEY, n VARCHAR(8))
+
+statement ok
+CREATE TABLE IF NOT EXISTS mt_b (ref INT)
+
+statement ok
+INSERT INTO mt_a (id, n) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')
+
+statement ok
+INSERT INTO mt_b (ref) VALUES (2), (3)
+
+# Comma-join single target: delete the mt_a rows that match an mt_b row.
+statement ok
+DELETE a FROM mt_a a, mt_b b WHERE a.id = b.ref
+
+query
+SELECT id FROM mt_a ORDER BY id
+----
+1
+4
+
+# JOIN form, single target.
+statement ok
+INSERT INTO mt_b (ref) VALUES (1)
+
+statement ok
+DELETE a FROM mt_a a INNER JOIN mt_b b ON a.id = b.ref WHERE b.ref = 1
+
+query
+SELECT id FROM mt_a ORDER BY id
+----
+4

@@ -262,7 +262,9 @@ incomplete.
 |----------------------------------------|--------|---------|
 | CALL                                   | ❌     |         |
 | DELETE FROM tbl [WHERE] (single table) | ✅     |         |
-| DELETE (multi-table / USING / ORDER BY / LIMIT) | ❌ | **Not supported.** |
+| DELETE `t1 FROM <refs> [WHERE]` (multi-table, single target) | ✅ | Lowered to `DELETE FROM <table> WHERE rowid IN (SELECT t1.rowid FROM <refs> [WHERE])`. The target may be a table or a `FROM` alias; the join may be comma or `JOIN ... ON`. |
+| DELETE (multiple target tables, e.g. `DELETE a, b FROM ...`) | ❌ | **Not supported** — matching MySQL needs a two-phase delete (rows computed before any are removed). |
+| DELETE (`... USING` / `ORDER BY` / `LIMIT`) | ❌ | **Not supported.** |
 | DO                                     | ❌     |         |
 | EXCEPT clause                          | ❌     |         |
 | HANDLER                                | ❌     |         |

@@ -1383,17 +1383,16 @@ impl Parser {
             ));
         }
 
-        // The multi-table form is `DELETE t1 FROM ...` — i.e. a table list
-        // before `FROM`.
+        // The multi-table form is `DELETE t1 FROM ...` — a target list before
+        // `FROM`, rather than `DELETE FROM tbl`.
         if !self.is_keyword("FROM") {
-            return Err(ParseError::Unsupported(
-                "multi-table DELETE is not supported yet".to_string(),
-            ));
+            return self.multi_table_delete();
         }
         self.expect_keyword("FROM")?;
 
         let tbl_name = self.qualified_name()?;
         if self.is(&Token::Comma) {
+            // `DELETE FROM t1, t2 USING ...` — the other multi-table spelling.
             return Err(ParseError::Unsupported(
                 "multi-table DELETE is not supported yet".to_string(),
             ));
@@ -1421,6 +1420,81 @@ impl Parser {
             tbl_name,
             indexed: None,
             where_clause,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        })
+    }
+
+    /// Parses a multi-table `DELETE <targets> FROM <refs> [WHERE ...]` (the
+    /// target list precedes `FROM`). A single target is lowered to
+    /// `DELETE FROM <table> WHERE rowid IN (SELECT <target>.rowid FROM <refs>
+    /// [WHERE ...])`, which the engine evaluates identically to MySQL. The
+    /// multiple-target form (`DELETE a, b FROM ...`) needs a two-phase delete to
+    /// match MySQL (the matching rows must be computed before any are removed),
+    /// so it is rejected. `DELETE` has already been consumed.
+    fn multi_table_delete(&mut self) -> Result<ast::Stmt> {
+        let mut targets = vec![self.qualified_name()?];
+        while self.eat(&Token::Comma) {
+            targets.push(self.qualified_name()?);
+        }
+        self.expect_keyword("FROM")?;
+        let from = self.from_clause()?;
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+            return Err(ParseError::Unsupported(
+                "ORDER BY / LIMIT on DELETE is not supported yet".to_string(),
+            ));
+        }
+        if targets.len() != 1 {
+            return Err(ParseError::Unsupported(
+                "multi-table DELETE with more than one target table is not supported yet"
+                    .to_string(),
+            ));
+        }
+
+        let target = targets[0].name.as_str().to_string();
+        let Some(table) = resolve_delete_target(&from, &target) else {
+            return Err(ParseError::Unsupported(format!(
+                "multi-table DELETE target `{target}` is not a table in the FROM clause"
+            )));
+        };
+
+        // SELECT <target>.rowid FROM <refs> [WHERE ...]
+        let rowid_of_target = ast::Expr::Qualified(
+            ast::Name::from_string(&target),
+            ast::Name::from_string("rowid"),
+        );
+        let subquery = ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(rowid_of_target), None)],
+                    from: Some(from),
+                    where_clause,
+                    group_by: None,
+                    window_clause: Vec::new(),
+                },
+                compounds: Vec::new(),
+            },
+            order_by: Vec::new(),
+            limit: None,
+        };
+
+        Ok(ast::Stmt::Delete {
+            with: None,
+            tbl_name: table,
+            indexed: None,
+            where_clause: Some(Box::new(ast::Expr::InSelect {
+                lhs: Box::new(ast::Expr::Id(ast::Name::from_string("rowid"))),
+                not: false,
+                rhs: subquery,
+            })),
             returning: Vec::new(),
             order_by: Vec::new(),
             limit: None,
@@ -2754,6 +2828,28 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
         _ => return None,
     })
+}
+
+/// Finds the underlying table named by a multi-table `DELETE` target, matching
+/// `target` against each `FROM` table's alias (`t AS a` / `t a`) or its own
+/// name. Returns the table's qualified name, or `None` if no `FROM` table
+/// matches.
+fn resolve_delete_target(from: &ast::FromClause, target: &str) -> Option<ast::QualifiedName> {
+    let first = std::iter::once(from.select.as_ref());
+    let rest = from.joins.iter().map(|join| join.table.as_ref());
+    for table in first.chain(rest) {
+        let ast::SelectTable::Table(name, alias, _) = table else {
+            continue;
+        };
+        let alias_matches = alias.as_ref().is_some_and(|a| {
+            let (ast::As::As(n) | ast::As::Elided(n) | ast::As::ImplicitColumnName(n)) = a;
+            n.as_str().eq_ignore_ascii_case(target)
+        });
+        if alias_matches || name.name.as_str().eq_ignore_ascii_case(target) {
+            return Some(name.clone());
+        }
+    }
+    None
 }
 
 /// Keywords that begin a table-level constraint or index definition.
@@ -4368,9 +4464,34 @@ mod tests {
     }
 
     #[test]
+    fn single_target_multi_table_delete_lowers_to_rowid_subquery() {
+        // `DELETE a FROM a, b WHERE ...` becomes
+        // `DELETE FROM <a's table> WHERE rowid IN (SELECT a.rowid FROM a, b WHERE ...)`.
+        let ast::Stmt::Delete {
+            tbl_name,
+            where_clause,
+            ..
+        } = parse("DELETE a FROM posts a, terms b WHERE a.id = b.ref").unwrap()
+        else {
+            panic!("expected a Delete");
+        };
+        assert_eq!(tbl_name.name.as_str(), "posts"); // alias `a` resolved to its table
+        assert!(matches!(
+            where_clause.as_deref(),
+            Some(ast::Expr::InSelect { not: false, .. })
+        ));
+
+        // More than one target table is still unsupported.
+        assert!(matches!(
+            parse("DELETE a, b FROM posts a, terms b WHERE a.id = b.ref").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+    }
+
+    #[test]
     fn delete_unsupported_variants() {
         for sql in [
-            "DELETE t1 FROM t1, t2 WHERE t1.id = t2.id",
+            "DELETE t1, t2 FROM t1, t2 WHERE t1.id = t2.id", // multiple target tables
             "DELETE FROM a, b",
             "DELETE FROM t USING u",
             "DELETE FROM t ORDER BY a",
