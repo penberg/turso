@@ -9,11 +9,14 @@
 //! schema, so it reads the table's columns from the engine via
 //! `PRAGMA table_info` and reshapes them into MySQL's result-set columns.
 //!
-//! Only the result-set *shape* and the schema-derived columns (`Field`, `Null`,
-//! `Key`, `Default`) are reproduced faithfully. MySQL's type-display
-//! normalization (column sizes, `unsigned`, integer display-width stripping) and
-//! the exact `Collation`/`Extra` text are not modeled — see `mysql/COMPAT.md`.
+//! The result-set *shape*, the schema-derived columns (`Field`, `Null`, `Key`,
+//! `Default`), and the declared column size (`varchar(60)`, recovered from the
+//! stored `CREATE TABLE` text since `PRAGMA table_info` drops it) are reproduced
+//! faithfully. MySQL's other type-display normalization (`unsigned`, integer
+//! display-width stripping) and the exact `Collation`/`Extra` text are not
+//! modeled — see `mysql/COMPAT.md`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use turso_core::{Connection, LimboError, Value};
@@ -92,6 +95,19 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
         return Ok(ShowOutcome::NoSuchTable(show.table.clone()));
     }
 
+    // `PRAGMA table_info` reports the bare type name and drops any declared
+    // length (e.g. `varchar(60)` becomes `varchar`). MySQL clients parse that
+    // length out of `SHOW COLUMNS` to bound string values — notably `wpdb`,
+    // which otherwise reads a length of 0 and truncates every string, aborting
+    // `$wpdb->insert()`. Recover the declared sizes from the stored CREATE TABLE
+    // text and restore them on the reported types.
+    let declared = declared_column_types(conn, &show.table);
+    for col in &mut info {
+        if let Some(ty) = declared.get(&col.name.to_ascii_lowercase()) {
+            col.ty = ty.clone();
+        }
+    }
+
     let columns = if show.full {
         vec![
             "Field",
@@ -114,6 +130,164 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
         .collect::<Vec<_>>();
 
     Ok(ShowOutcome::Columns(ColumnsResult { columns, rows }))
+}
+
+/// Reads the declared column types — including any length/precision such as
+/// `varchar(60)` — from the table's stored `CREATE TABLE` text, which the
+/// engine preserves even though `PRAGMA table_info` does not. Returns a map from
+/// lowercased column name to a size-bearing type string (e.g. `varchar(60)`);
+/// columns without a declared size are absent and keep their `PRAGMA` type.
+/// Best-effort: any failure to read the schema yields an empty map.
+///
+/// The column list is scanned directly rather than parsed: the engine renders
+/// it with SQLite-isms (e.g. `PRIMARY KEY (ID AUTOINCREMENT)`) that the MySQL
+/// front-end parser rejects, and only each column's leading `name type(size)` is
+/// needed, so the rest of every definition is ignored.
+fn declared_column_types(conn: &Arc<Connection>, table: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let query = format!(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '{}'",
+        table.replace('\'', "''")
+    );
+    let Ok(Some(mut stmt)) = conn.query(&query) else {
+        return out;
+    };
+    let mut create_sql = None;
+    let _ = stmt.run_with_row_callback(|row| {
+        create_sql = value_to_string(row.get_value(0));
+        Ok(())
+    });
+    let Some(create_sql) = create_sql else {
+        return out;
+    };
+    // The column list is the contents of the first parenthesized group.
+    let Some(open) = create_sql.find('(') else {
+        return out;
+    };
+    for segment in split_column_list(&create_sql[open + 1..]) {
+        if let Some((name, ty)) = parse_column_def(&segment) {
+            out.insert(name, ty);
+        }
+    }
+    out
+}
+
+/// Splits a `CREATE TABLE` column list into its top-level comma-separated
+/// definitions, respecting nested parentheses (type sizes, `PRIMARY KEY (...)`)
+/// and single-quoted string literals (default values). Stops at the closing
+/// parenthesis that ends the column list.
+fn split_column_list(body: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if in_string => {
+                // A doubled `''` is an escaped quote, not the end of the string.
+                if chars.peek() == Some(&'\'') {
+                    current.push(c);
+                    current.push(chars.next().unwrap());
+                } else {
+                    in_string = false;
+                    current.push(c);
+                }
+            }
+            '\'' => {
+                in_string = true;
+                current.push(c);
+            }
+            _ if in_string => current.push(c),
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' if depth == 0 => break, // closes the column list
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Extracts `(lowercased column name, size-bearing type)` from one column
+/// definition, e.g. `user_login varchar (60) NOT NULL` yields
+/// `("user_login", "varchar(60)")`. Returns `None` for a table constraint
+/// (`PRIMARY KEY (...)`, `UNIQUE (...)`, ...) or a column with no declared size.
+fn parse_column_def(segment: &str) -> Option<(String, String)> {
+    let segment = segment.trim();
+    let mut rest = segment;
+
+    // Column name: a bare or backtick/quote-delimited identifier.
+    let name = if let Some(after) = rest.strip_prefix('`') {
+        let end = after.find('`')?;
+        rest = &after[end + 1..];
+        after[..end].to_string()
+    } else {
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(rest.len());
+        let name = rest[..end].to_string();
+        rest = &rest[end..];
+        name
+    };
+    let name_lower = name.to_ascii_lowercase();
+    if is_table_constraint_keyword(&name_lower) {
+        return None;
+    }
+
+    // Type name follows the column name.
+    let rest = rest.trim_start();
+    let type_end = rest
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(rest.len());
+    let type_name = &rest[..type_end];
+    if type_name.is_empty() {
+        return None;
+    }
+
+    // Optional `(size)` — possibly separated from the type name by spaces, as
+    // the engine renders it (`varchar (60)`).
+    let after_type = rest[type_end..].trim_start();
+    let size: String = after_type
+        .strip_prefix('(')
+        .and_then(|s| s.find(')').map(|end| &s[..end]))?
+        // Drop all whitespace so a multi-argument size renders like MySQL
+        // (`decimal(10,2)`, not the engine's `decimal (10, 2)`).
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if size.is_empty() {
+        return None;
+    }
+    Some((name_lower, format!("{type_name}({size})")))
+}
+
+/// Whether `word` (already lowercased) begins a table-level constraint rather
+/// than a column definition.
+fn is_table_constraint_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "primary"
+            | "unique"
+            | "key"
+            | "index"
+            | "fulltext"
+            | "spatial"
+            | "foreign"
+            | "constraint"
+            | "check"
+    )
 }
 
 /// The parsed form of a `SHOW [FULL] TABLES [LIKE 'pat']` statement.

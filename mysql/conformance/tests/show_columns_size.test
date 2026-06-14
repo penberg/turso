@@ -1,0 +1,21 @@
+# SHOW COLUMNS reports declared column sizes.
+#
+# MySQL's SHOW COLUMNS reports a column's declared length/precision in the Type
+# (e.g. varchar(60), char(5), decimal(10,2)). Clients parse that length to bound
+# string values — notably wpdb, which reads a missing length as 0 and truncates
+# every string, aborting $wpdb->insert(). The engine's PRAGMA table_info drops
+# the size, so the front-end recovers it from the stored CREATE TABLE text.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Rows are
+# tab-separated; the trailing empty Extra column produces a trailing tab.
+
+statement ok
+CREATE TABLE IF NOT EXISTS size_demo (a INT NOT NULL PRIMARY KEY, b VARCHAR(60), c CHAR(5), d DECIMAL(10,2))
+
+query
+SHOW COLUMNS FROM size_demo
+----
+a	int	NO	PRI	NULL	
+b	varchar(60)	YES		NULL	
+c	char(5)	YES		NULL	
+d	decimal(10,2)	YES		NULL	
