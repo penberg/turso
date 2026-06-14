@@ -1885,6 +1885,12 @@ impl Parser {
             return self.date_part_call(fmt);
         }
 
+        // `FIELD(x, a, b, ...)` (the 1-based index of `x` in the list, else 0)
+        // lowers to a `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0 END`.
+        if upper == "FIELD" {
+            return self.field_call();
+        }
+
         // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
         // `datetime(x, '+n unit')` / `datetime(x, '-n unit')` modifier.
         if upper == "DATE_ADD" {
@@ -2020,6 +2026,46 @@ impl Parser {
             acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
         }
         Ok(acc)
+    }
+
+    /// Parses a `FIELD(x, a, b, ...)` call (the name and `(` are already
+    /// consumed) and lowers it to `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0
+    /// END`, which the engine evaluates the same way MySQL's `FIELD` does: the
+    /// 1-based index of the first argument among the rest, or 0 if absent or
+    /// NULL. At least one argument is required.
+    fn field_call(&mut self) -> Result<ast::Expr> {
+        let mut args = Vec::new();
+        if !self.is(&Token::RParen) {
+            loop {
+                args.push(self.expr()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+
+        let mut iter = args.into_iter();
+        let Some(base) = iter.next() else {
+            return Err(ParseError::Unsupported(
+                "FIELD() requires at least one argument".to_string(),
+            ));
+        };
+        let when_then_pairs = iter
+            .enumerate()
+            .map(|(i, value)| {
+                let index = ast::Expr::Literal(ast::Literal::Numeric((i + 1).to_string()));
+                (Box::new(value), Box::new(index))
+            })
+            .collect();
+        Ok(ast::Expr::Case {
+            base: Some(Box::new(base)),
+            when_then_pairs,
+            else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                "0".to_string(),
+            )))),
+        })
     }
 
     /// Parses the single argument of a `LENGTH(x)` call (the name and `(` are
@@ -3781,6 +3827,26 @@ mod tests {
             panic!("expected the argument to be a CAST");
         };
         assert_eq!(type_name.as_ref().unwrap().name, "BLOB");
+    }
+
+    #[test]
+    fn field_lowers_to_case() {
+        // FIELD(x, a, b) -> CASE x WHEN a THEN 1 WHEN b THEN 2 ELSE 0 END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("FIELD(id, 3, 1, 2)").unwrap()
+        else {
+            panic!("expected FIELD to lower to a CASE");
+        };
+        assert_eq!(base.as_deref(), Some(&col("id")));
+        assert_eq!(when_then_pairs.len(), 3);
+        // The THEN results are the 1-based indices.
+        for (i, (_, then)) in when_then_pairs.iter().enumerate() {
+            assert_eq!(**then, num(&(i + 1).to_string()));
+        }
+        assert_eq!(else_expr.as_deref(), Some(&num("0")));
     }
 
     #[test]
