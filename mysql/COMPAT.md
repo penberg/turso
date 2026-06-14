@@ -284,7 +284,8 @@ incomplete.
 | Column aliases (`expr AS a` / `expr a`) | ✅    | Both the `AS` and bare forms; resolvable in `ORDER BY`/`GROUP BY`. A string-literal alias (`expr AS 'name'`) is also accepted; the elided string form (`expr 'name'`) is not (ambiguous with literal concatenation). |
 | SELECT ... INTO                        | ❌     | **Not supported.** |
 | `[INNER] JOIN` / `LEFT [OUTER] JOIN` ... ON | ✅ | Table aliases (`t`, `t AS a`) and chained joins supported. Map identically onto the engine. |
-| `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, comma joins, `JOIN ... USING`, ON-less joins | ❌ | Rejected as unsupported (semantics differ or unmodeled). |
+| Comma join (`FROM a, b WHERE ...`)     | ✅     | Implicit cross join with the condition in `WHERE`; the engine evaluates it identically to MySQL. Used by WordPress term/post-count queries. |
+| `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, `JOIN ... USING`, ON-less keyword joins | ❌ | Rejected as unsupported (semantics differ or unmodeled). |
 | UNION / UNION ALL                      | ✅     | `UNION` deduplicates, `UNION ALL` does not; a trailing `ORDER BY`/`LIMIT` applies to the whole result. Identical to MySQL 8.x. |
 | INTERSECT / EXCEPT set operations      | ✅     | Deduplicating set operations, identical to MySQL 8.x. Mixed-operator precedence is not exercised. |
 | Subqueries                             | ❌     |         |

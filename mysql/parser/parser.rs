@@ -1007,25 +1007,33 @@ impl Parser {
         self.name()
     }
 
-    /// Parses the `FROM` clause: a table reference optionally followed by
-    /// `[INNER] JOIN` / `LEFT [OUTER] JOIN` joins, each with an `ON` condition.
-    /// These map identically onto the engine. Comma joins, `RIGHT`/`FULL`/
-    /// `CROSS`/`NATURAL`/`STRAIGHT_JOIN`, `USING`, ON-less joins, and subqueries
-    /// are rejected as unsupported.
+    /// Parses the `FROM` clause: a table reference optionally followed by comma
+    /// joins (`a, b`) and/or `[INNER] JOIN` / `LEFT [OUTER] JOIN` joins with an
+    /// `ON` condition. A comma join is an implicit cross join whose condition is
+    /// supplied by `WHERE`; the engine evaluates it identically to MySQL.
+    /// `RIGHT`/`FULL`/`CROSS`/`NATURAL`/`STRAIGHT_JOIN`, `USING`, ON-less keyword
+    /// joins, and subqueries are rejected as unsupported.
     // Not a constructor: the `from_` prefix names the SQL `FROM` clause, so the
     // `wrong_self_convention` heuristic does not apply here.
     #[allow(clippy::wrong_self_convention)]
     fn from_clause(&mut self) -> Result<ast::FromClause> {
         let select = Box::new(self.table_ref()?);
 
-        if self.is(&Token::Comma) {
-            return Err(ParseError::Unsupported(
-                "SELECT from multiple tables (comma join) is not supported yet".to_string(),
-            ));
-        }
-
         let mut joins = Vec::new();
-        while let Some(operator) = self.join_operator()? {
+        loop {
+            // Comma join: `a, b` is a cross join; the `WHERE` clause supplies the
+            // join condition, as in MySQL.
+            if self.eat(&Token::Comma) {
+                joins.push(ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::Comma,
+                    table: Box::new(self.table_ref()?),
+                    constraint: None,
+                });
+                continue;
+            }
+            let Some(operator) = self.join_operator()? else {
+                break;
+            };
             let table = Box::new(self.table_ref()?);
             let constraint = if self.eat_keyword("ON") {
                 Some(ast::JoinConstraint::On(Box::new(self.expr()?)))
@@ -2917,6 +2925,25 @@ mod tests {
     }
 
     #[test]
+    fn select_comma_join() {
+        // `FROM a, b` is a comma (cross) join with no ON constraint; the WHERE
+        // clause supplies the condition.
+        let stmt = parse("SELECT a.x FROM a, b, c WHERE a.x = b.y").unwrap();
+        let ast::Stmt::Select(s) = stmt else {
+            unreachable!()
+        };
+        let ast::OneSelect::Select { from, .. } = s.body.select else {
+            unreachable!()
+        };
+        let from = from.unwrap();
+        assert_eq!(from.joins.len(), 2);
+        for join in &from.joins {
+            assert!(matches!(join.operator, ast::JoinOperator::Comma));
+            assert!(join.constraint.is_none());
+        }
+    }
+
+    #[test]
     fn select_plain_and_left_join() {
         // Plain JOIN is INNER; LEFT JOIN sets LEFT|OUTER.
         let plain = parse("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
@@ -3109,7 +3136,6 @@ mod tests {
     fn select_unsupported_variants() {
         for sql in [
             "SELECT DISTINCTROW a FROM t",
-            "SELECT * FROM a, b",
             "SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
             "SELECT * FROM a CROSS JOIN b",
             "SELECT * FROM a JOIN b USING (id)",

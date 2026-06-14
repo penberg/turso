@@ -1,0 +1,40 @@
+# Comma joins (implicit cross join): FROM a, b WHERE a.x = b.y.
+#
+# The old-style comma join lists tables separated by commas and supplies the
+# join condition in WHERE. It is equivalent to a cross join filtered by WHERE,
+# which the engine evaluates identically to MySQL. WordPress uses it in its term
+# and post-count queries (e.g. _update_post_term_count).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS cj_a (x INT PRIMARY KEY, n VARCHAR(8))
+
+statement ok
+CREATE TABLE IF NOT EXISTS cj_b (y INT PRIMARY KEY, m VARCHAR(8))
+
+statement ok
+INSERT INTO cj_a (x, n) VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')
+
+statement ok
+INSERT INTO cj_b (y, m) VALUES (1, 'b1'), (2, 'b2')
+
+# Two-table comma join with the join condition in WHERE.
+query
+SELECT cj_a.n, cj_b.m FROM cj_a, cj_b WHERE cj_a.x = cj_b.y ORDER BY cj_a.x
+----
+a1	b1
+a2	b2
+
+# COUNT over a comma join (the WordPress term-count shape).
+query
+SELECT COUNT(*) FROM cj_a, cj_b WHERE cj_a.x = cj_b.y
+----
+2
+
+# A three-table comma join with an aliased table.
+query
+SELECT cj_a.n FROM cj_a, cj_b, cj_a AS cj_c WHERE cj_a.x = cj_b.y AND cj_c.x = cj_a.x ORDER BY cj_a.x
+----
+a1
+a2
