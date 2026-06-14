@@ -837,6 +837,7 @@ impl Parser {
 
         let order_by = self.order_by()?;
         let limit = self.limit()?;
+        self.skip_locking_clause();
 
         if self.is_keyword("INTO") {
             return Err(ParseError::Unsupported(
@@ -853,6 +854,34 @@ impl Parser {
             order_by,
             limit,
         })
+    }
+
+    /// Consumes and discards an optional trailing row-locking clause —
+    /// `FOR UPDATE`, `FOR SHARE`, or `LOCK IN SHARE MODE`. The engine is a single
+    /// writer, so explicit row locking is a no-op and the locked query returns
+    /// exactly the same rows as the unlocked one; see `mysql/COMPAT.md`. The
+    /// `OF tbl` / `NOWAIT` / `SKIP LOCKED` refinements are not consumed here, so
+    /// they fall through and are rejected as unsupported.
+    fn skip_locking_clause(&mut self) {
+        if self.is_keyword("FOR") {
+            // Only `FOR UPDATE` / `FOR SHARE` is a locking clause; leave anything
+            // else beginning with `FOR` for the caller to reject.
+            if matches!(
+                self.peek_nth(1),
+                Some(Token::Word(w)) if w.eq_ignore_ascii_case("UPDATE") || w.eq_ignore_ascii_case("SHARE")
+            ) {
+                self.advance(); // FOR
+                self.advance(); // UPDATE | SHARE
+            }
+        } else if self.is_keyword("LOCK") {
+            // `LOCK IN SHARE MODE`.
+            if matches!(self.peek_nth(1), Some(Token::Word(w)) if w.eq_ignore_ascii_case("IN")) {
+                self.advance(); // LOCK
+                self.eat_keyword("IN");
+                self.eat_keyword("SHARE");
+                self.eat_keyword("MODE");
+            }
+        }
     }
 
     /// Parses a single `SELECT` branch — distinctness, the column list, and the
@@ -2236,6 +2265,26 @@ mod tests {
             upper.contains("WHERE") && upper.contains("ORDER BY"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn select_locking_clause_is_accepted_and_ignored() {
+        // The trailing row-locking clause parses (and is dropped); the SELECT is
+        // otherwise unchanged.
+        for sql in [
+            "SELECT a FROM t FOR UPDATE",
+            "SELECT a FROM t FOR SHARE",
+            "SELECT a FROM t LOCK IN SHARE MODE",
+            "SELECT a FROM t WHERE a = 1 ORDER BY a FOR UPDATE",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap(), ast::Stmt::Select(_)),
+                "expected `{sql}` to parse as a SELECT"
+            );
+        }
+        // A `FOR`-prefixed clause that is not a locking read is still rejected
+        // (the stray `FOR` is left for the end-of-input check).
+        assert!(parse("SELECT a FROM t FOR somethingelse").is_err());
     }
 
     #[test]

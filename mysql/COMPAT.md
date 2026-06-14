@@ -359,6 +359,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | SAVEPOINT                                        | ❌     |         |
 | ROLLBACK TO SAVEPOINT                            | ❌     | Rejected as unsupported. |
 | RELEASE SAVEPOINT                                | ❌     |         |
+| SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE | 🚧 | The trailing locking-read clause is accepted and ignored. The engine is a single writer, so the locked query returns the same rows as the unlocked one; no real row locking is performed. `OF tbl` / `NOWAIT` / `SKIP LOCKED` refinements are rejected. |
 | LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE       | ❌     |         |
 | LOCK TABLES / UNLOCK TABLES                      | ❌     |         |
 | SET TRANSACTION                                  | ❌     |         |

@@ -1,0 +1,36 @@
+# Row-locking read clauses: FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE.
+#
+# MySQL's locking reads lock the matched rows but return exactly the same result
+# set as the unlocked query. The engine is a single writer, so explicit row
+# locking is a no-op; the front-end accepts the trailing clause and ignores it,
+# returning the same rows. This is an intentional divergence (no real locking) —
+# see mysql/COMPAT.md.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS lock_demo (a INT PRIMARY KEY, b TEXT)
+
+statement ok
+INSERT INTO lock_demo (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+# FOR UPDATE after WHERE/ORDER BY returns the same rows as the plain query.
+query
+SELECT a, b FROM lock_demo WHERE a < 3 ORDER BY a FOR UPDATE
+----
+1	x
+2	y
+
+# LOCK IN SHARE MODE is the older spelling of a shared lock.
+query
+SELECT a FROM lock_demo ORDER BY a LOCK IN SHARE MODE
+----
+1
+2
+3
+
+# FOR SHARE is the MySQL 8.0 spelling of a shared lock.
+query
+SELECT a FROM lock_demo WHERE a = 2 FOR SHARE
+----
+2
