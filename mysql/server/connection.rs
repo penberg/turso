@@ -5,17 +5,20 @@
 //! [`turso_mysql_protocol`] crate; this file only does socket I/O and bridges
 //! commands onto the [`turso_core`] engine.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use tracing::debug;
-use turso_core::{Connection, LimboError, Value};
+use turso_core::{Connection, LimboError, Statement, Value};
 use turso_mysql_parser::{ast, ParseError};
 use turso_mysql_protocol::constants::status::SERVER_STATUS_AUTOCOMMIT;
 use turso_mysql_protocol::{
-    encode_column_count, encode_frame, encode_text_row, ColumnDefinition, Command, EofPacket,
-    ErrPacket, FrameDecoder, HandshakeResponse41, HandshakeV10, OkPacket,
+    encode_binary_row, encode_column_count, encode_frame, encode_text_row, ColumnDefinition,
+    Command, EofPacket, ErrPacket, FrameDecoder, HandshakeResponse41, HandshakeV10, OkPacket,
+    StmtExecute, StmtPrepareOk,
 };
 
 use crate::session::{self, SessionResponse};
@@ -73,11 +76,47 @@ impl Wire {
     }
 }
 
+/// A prepared statement held open for binary execution, along with the column
+/// metadata computed once at prepare time.
+struct Prepared {
+    statement: Statement,
+    /// Typed result-column definitions, reused for every execution.
+    columns: Vec<ColumnDefinition>,
+    /// Number of `?` parameters the statement binds.
+    num_params: usize,
+}
+
+/// The prepared statements opened on one connection, keyed by statement id.
+#[derive(Default)]
+struct StatementStore {
+    next_id: u32,
+    map: HashMap<u32, Prepared>,
+}
+
+impl StatementStore {
+    /// Stores a freshly prepared statement and returns its new id.
+    fn insert(&mut self, prepared: Prepared) -> u32 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.map.insert(id, prepared);
+        id
+    }
+
+    fn get_mut(&mut self, id: u32) -> Option<&mut Prepared> {
+        self.map.get_mut(&id)
+    }
+
+    fn close(&mut self, id: u32) {
+        self.map.remove(&id);
+    }
+}
+
 /// Drives one client connection to completion. Returns `Ok(())` on a clean
 /// disconnect; transport errors propagate.
 pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> anyhow::Result<()> {
     let mut wire = Wire::new(stream);
     let conn = server.db.connect()?;
+    let mut statements = StatementStore::default();
 
     perform_handshake(&mut wire, connection_id)?;
 
@@ -102,6 +141,22 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
             Command::Query(sql) => {
                 let response = run_query(&conn, &sql, seq);
                 wire.write_frames(&response)?;
+            }
+            Command::StmtPrepare(sql) => {
+                let response = prepare_stmt(&conn, &mut statements, &sql, seq);
+                wire.write_frames(&response)?;
+            }
+            Command::StmtExecute(exec) => {
+                let response = execute_stmt_binary(&conn, &mut statements, &exec, seq);
+                wire.write_frames(&response)?;
+            }
+            Command::StmtReset(id) => {
+                let response = reset_stmt(&mut statements, id, seq);
+                wire.write_frames(&response)?;
+            }
+            Command::StmtClose(id) => {
+                // COM_STMT_CLOSE expects no reply; just drop the statement.
+                statements.close(id);
             }
             Command::Unsupported(cmd) => {
                 let err = ErrPacket::new(ER_ERROR_GENERAL, format!("unsupported command: {cmd:?}"));
@@ -359,6 +414,191 @@ fn value_to_text(value: &Value) -> Option<Vec<u8>> {
         Value::Blob(blob) => Some(blob.clone()),
         other => Some(format!("{other}").into_bytes()),
     }
+}
+
+/// Handles `COM_STMT_PREPARE`: parse and prepare the statement, retain it for
+/// later execution, and reply with the prepare-OK header followed by the
+/// parameter and column definition packets.
+fn prepare_stmt(
+    conn: &Arc<Connection>,
+    statements: &mut StatementStore,
+    sql: &str,
+    first_seq: u8,
+) -> Vec<u8> {
+    debug!(%sql, "COM_STMT_PREPARE");
+    let ast = match turso_mysql_parser::parse(sql) {
+        Ok(ast) => ast,
+        Err(e) => return parse_error_response(first_seq, &e),
+    };
+    let statement = match conn.prepare_stmt(ast) {
+        Ok(statement) => statement,
+        Err(e) => return error_response(first_seq, &e),
+    };
+
+    let num_params = statement.parameters_count();
+    let num_columns = statement.num_columns();
+    let columns: Vec<ColumnDefinition> = (0..num_columns)
+        .map(|i| crate::types::column_definition(&statement, i))
+        .collect();
+
+    let mut out = Vec::new();
+    let id = statements.insert(Prepared {
+        statement,
+        columns,
+        num_params,
+    });
+    let prepared = statements.get_mut(id).expect("just inserted");
+
+    let ok = StmtPrepareOk {
+        statement_id: id,
+        num_columns: num_columns as u16,
+        num_params: num_params as u16,
+        warning_count: 0,
+    };
+    let mut seq = encode_frame(&mut out, first_seq, &ok.encode());
+
+    // Parameter definitions carry no useful type (a placeholder has none until
+    // it is bound), so a generic string column stands in for each.
+    if num_params > 0 {
+        for _ in 0..num_params {
+            seq = encode_frame(&mut out, seq, &ColumnDefinition::text("?").encode());
+        }
+        seq = encode_frame(
+            &mut out,
+            seq,
+            &EofPacket::new(SERVER_STATUS_AUTOCOMMIT).encode(),
+        );
+    }
+    if num_columns > 0 {
+        for column in &prepared.columns {
+            seq = encode_frame(&mut out, seq, &column.encode());
+        }
+        encode_frame(
+            &mut out,
+            seq,
+            &EofPacket::new(SERVER_STATUS_AUTOCOMMIT).encode(),
+        );
+    }
+    out
+}
+
+/// Handles `COM_STMT_EXECUTE`: decode and bind the parameters, run the
+/// statement, and reply with a binary result set (or an OK packet for a
+/// statement that returns no rows).
+fn execute_stmt_binary(
+    conn: &Arc<Connection>,
+    statements: &mut StatementStore,
+    exec: &StmtExecute,
+    first_seq: u8,
+) -> Vec<u8> {
+    let Some(prepared) = statements.get_mut(exec.statement_id) else {
+        return unknown_statement_response(first_seq, exec.statement_id);
+    };
+
+    let params = match exec.parse_params(prepared.num_params) {
+        Ok(params) => params,
+        Err(e) => return error_response(first_seq, &LimboError::InternalError(e.to_string())),
+    };
+
+    // Each execution starts from a clean slate: reset the program and rebind the
+    // freshly supplied parameters.
+    if let Err(e) = prepared.statement.reset() {
+        return error_response(first_seq, &e);
+    }
+    prepared.statement.clear_bindings();
+    for (i, value) in params.into_iter().enumerate() {
+        let index = NonZero::new(i + 1).expect("parameter index is >= 1");
+        if let Err(e) = prepared
+            .statement
+            .bind_at(index, crate::types::binary_to_value(value))
+        {
+            return error_response(first_seq, &e);
+        }
+    }
+
+    if prepared.columns.is_empty() {
+        // No result set: run for side effects and reply with an OK packet.
+        let mut out = Vec::new();
+        match prepared.statement.run_with_row_callback(|_| Ok(())) {
+            Ok(()) => {
+                let ok = OkPacket::with_affected_rows(
+                    conn.changes().max(0) as u64,
+                    conn.last_insert_rowid().max(0) as u64,
+                );
+                encode_frame(&mut out, first_seq, &ok.encode());
+                out
+            }
+            Err(e) => error_response(first_seq, &e),
+        }
+    } else {
+        match encode_binary_result_set(prepared, first_seq) {
+            Ok(bytes) => bytes,
+            Err(e) => error_response(first_seq, &e),
+        }
+    }
+}
+
+/// Encodes a binary result set: the column count, the typed column definitions,
+/// and one binary row per result row. Mirrors [`encode_result_set`] but uses the
+/// binary row format, so the column type codes drive how each value is encoded.
+fn encode_binary_result_set(prepared: &mut Prepared, seq: u8) -> Result<Vec<u8>, LimboError> {
+    let mut out = Vec::new();
+    let num_columns = prepared.columns.len();
+    let mut seq = encode_frame(&mut out, seq, &encode_column_count(num_columns as u64));
+    for column in &prepared.columns {
+        seq = encode_frame(&mut out, seq, &column.encode());
+    }
+    seq = encode_frame(
+        &mut out,
+        seq,
+        &EofPacket::new(SERVER_STATUS_AUTOCOMMIT).encode(),
+    );
+
+    let type_codes: Vec<u8> = prepared.columns.iter().map(|c| c.column_type).collect();
+    let mut seq_cell = seq;
+    prepared.statement.run_with_row_callback(|row| {
+        let cells: Vec<_> = row
+            .get_values()
+            .zip(&type_codes)
+            .map(|(value, &code)| (code, crate::types::value_to_binary(value, code)))
+            .collect();
+        seq_cell = encode_frame(&mut out, seq_cell, &encode_binary_row(&cells));
+        Ok(())
+    })?;
+
+    encode_frame(
+        &mut out,
+        seq_cell,
+        &EofPacket::new(SERVER_STATUS_AUTOCOMMIT).encode(),
+    );
+    Ok(out)
+}
+
+/// Handles `COM_STMT_RESET`: discard the statement's bound-parameter state.
+fn reset_stmt(statements: &mut StatementStore, id: u32, seq: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    match statements.get_mut(id) {
+        Some(prepared) => {
+            prepared.statement.clear_bindings();
+            if let Err(e) = prepared.statement.reset() {
+                return error_response(seq, &e);
+            }
+            encode_frame(&mut out, seq, &OkPacket::default().encode());
+        }
+        None => return unknown_statement_response(seq, id),
+    }
+    out
+}
+
+/// Builds an ERR packet for a command that referenced an unknown statement id.
+fn unknown_statement_response(seq: u8, id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let err = ErrPacket::new(
+        ER_ERROR_GENERAL,
+        format!("unknown prepared statement id {id}"),
+    );
+    encode_frame(&mut out, seq, &err.encode());
+    out
 }
 
 /// Builds a single ERR-packet response for a failed query.

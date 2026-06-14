@@ -49,6 +49,7 @@ pub enum CommandByte {
     StmtPrepare = 0x16,
     StmtExecute = 0x17,
     StmtClose = 0x19,
+    StmtReset = 0x1a,
 }
 
 impl CommandByte {
@@ -63,6 +64,7 @@ impl CommandByte {
             0x16 => Self::StmtPrepare,
             0x17 => Self::StmtExecute,
             0x19 => Self::StmtClose,
+            0x1a => Self::StmtReset,
             _ => return None,
         })
     }

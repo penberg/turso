@@ -10,8 +10,9 @@
 //! type because it preserves MySQL distinctions the affinity collapses — `TINYINT`
 //! vs `BIGINT`, signedness, `DECIMAL` — and fall back to the affinity otherwise.
 
+use turso_core::{Numeric, Value};
 use turso_mysql_protocol::constants::{collation, column_flags, column_type};
-use turso_mysql_protocol::ColumnDefinition;
+use turso_mysql_protocol::{BinaryValue, ColumnDefinition};
 
 /// The wire attributes of a column type: the MySQL type code plus the metadata
 /// fields a `ColumnDefinition41` carries alongside it.
@@ -190,6 +191,177 @@ fn blob_type() -> WireType {
         decimals: NOT_FIXED_DEC,
         flags: column_flags::BLOB_FLAG | column_flags::BINARY_FLAG,
     }
+}
+
+/// Converts an engine value into its binary-protocol form for a result column
+/// of the given MySQL type code.
+///
+/// Numbers and strings map directly. Temporal columns are special: the engine
+/// stores dates and times as text (SQLite has no native temporal type), so we
+/// parse the canonical string form into the structured value the binary
+/// protocol expects. A value that does not parse falls back to its raw bytes.
+pub fn value_to_binary(value: &Value, type_code: u8) -> BinaryValue {
+    use column_type::*;
+    match value {
+        Value::Null => BinaryValue::Null,
+        Value::Numeric(Numeric::Integer(i)) => BinaryValue::I64(*i),
+        Value::Numeric(Numeric::Float(f)) => BinaryValue::F64(f64::from(*f)),
+        Value::Blob(b) => BinaryValue::Bytes(b.clone()),
+        Value::Text(t) => {
+            let s = t.as_str();
+            match type_code {
+                MYSQL_TYPE_DATE | MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => {
+                    parse_datetime(s).unwrap_or_else(|| BinaryValue::Bytes(s.as_bytes().to_vec()))
+                }
+                MYSQL_TYPE_TIME => {
+                    parse_time(s).unwrap_or_else(|| BinaryValue::Bytes(s.as_bytes().to_vec()))
+                }
+                _ => BinaryValue::Bytes(s.as_bytes().to_vec()),
+            }
+        }
+    }
+}
+
+/// Converts a decoded binary-protocol parameter into an engine value for
+/// binding. Integers and floats map directly; everything else (strings, blobs,
+/// and temporal values) binds as text or a blob, matching how the engine stores
+/// such values.
+pub fn binary_to_value(value: BinaryValue) -> Value {
+    match value {
+        BinaryValue::Null => Value::Null,
+        BinaryValue::I64(i) => Value::from_i64(i),
+        // The engine has no unsigned 64-bit type; values that overflow i64 are
+        // bound as their decimal text so no information is lost.
+        BinaryValue::U64(u) => match i64::try_from(u) {
+            Ok(i) => Value::from_i64(i),
+            Err(_) => Value::build_text(u.to_string()),
+        },
+        BinaryValue::F64(f) => Value::from_f64(f),
+        BinaryValue::Bytes(b) => match String::from_utf8(b) {
+            Ok(s) => Value::build_text(s),
+            Err(e) => Value::Blob(e.into_bytes()),
+        },
+        BinaryValue::DateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            micros,
+        } => {
+            let date = format!("{year:04}-{month:02}-{day:02}");
+            let text = if hour != 0 || minute != 0 || second != 0 || micros != 0 {
+                let base = format!("{date} {hour:02}:{minute:02}:{second:02}");
+                if micros != 0 {
+                    format!("{base}.{micros:06}")
+                } else {
+                    base
+                }
+            } else {
+                date
+            };
+            Value::build_text(text)
+        }
+        BinaryValue::Time {
+            negative,
+            days,
+            hour,
+            minute,
+            second,
+            micros,
+        } => {
+            let total_hours = days * 24 + hour as u32;
+            let sign = if negative { "-" } else { "" };
+            let base = format!("{sign}{total_hours:02}:{minute:02}:{second:02}");
+            let text = if micros != 0 {
+                format!("{base}.{micros:06}")
+            } else {
+                base
+            };
+            Value::build_text(text)
+        }
+    }
+}
+
+/// Parses a `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` string into binary date/time
+/// components. Returns `None` if the leading date does not parse.
+fn parse_datetime(s: &str) -> Option<BinaryValue> {
+    let s = s.trim();
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse().ok()?;
+    let month = date_parts.next()?.parse().ok()?;
+    let day = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let (hour, minute, second, micros) = match time {
+        Some(t) => parse_hms(t)?,
+        None => (0, 0, 0, 0),
+    };
+    Some(BinaryValue::DateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        micros,
+    })
+}
+
+/// Parses an `HH:MM:SS[.ffffff]` string into a binary `TIME` value.
+fn parse_time(s: &str) -> Option<BinaryValue> {
+    let s = s.trim();
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (hours, minute, second, micros) = parse_hms_wide(rest)?;
+    Some(BinaryValue::Time {
+        negative,
+        days: hours / 24,
+        hour: (hours % 24) as u8,
+        minute,
+        second,
+        micros,
+    })
+}
+
+/// Parses `HH:MM:SS[.ffffff]` where the hour is a single clock hour (0–23).
+fn parse_hms(t: &str) -> Option<(u8, u8, u8, u32)> {
+    let (hours, minute, second, micros) = parse_hms_wide(t)?;
+    Some((hours as u8, minute, second, micros))
+}
+
+/// Parses `H[H..]:MM:SS[.ffffff]`, allowing an hour field wider than a day (as
+/// MySQL `TIME` permits), and returns `(hours, minute, second, micros)`.
+fn parse_hms_wide(t: &str) -> Option<(u32, u8, u8, u32)> {
+    let (sec_field, micros) = match t.split_once('.') {
+        Some((head, frac)) => {
+            // Pad/truncate the fraction to exactly six digits of microseconds.
+            let mut digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+            digits = digits.min(6);
+            let mut micros: u32 = frac.get(..digits)?.parse().ok()?;
+            for _ in digits..6 {
+                micros *= 10;
+            }
+            (head, micros)
+        }
+        None => (t, 0),
+    };
+    let mut parts = sec_field.split(':');
+    let hours = parts.next()?.parse().ok()?;
+    let minute = parts.next()?.parse().ok()?;
+    let second = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((hours, minute, second, micros))
 }
 
 #[cfg(test)]

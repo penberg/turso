@@ -47,6 +47,7 @@ pub mod handshake;
 pub mod packet;
 pub mod response;
 pub mod resultset;
+pub mod stmt;
 
 pub use command::Command;
 pub use error::{ProtocolError, Result};
@@ -54,3 +55,4 @@ pub use frame::{encode_frame, FrameDecoder, Packet};
 pub use handshake::{HandshakeResponse41, HandshakeV10};
 pub use response::{EofPacket, ErrPacket, OkPacket};
 pub use resultset::{encode_column_count, encode_text_row, ColumnDefinition};
+pub use stmt::{encode_binary_row, BinaryValue, StmtExecute, StmtPrepareOk};
