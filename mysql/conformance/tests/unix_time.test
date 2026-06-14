@@ -1,0 +1,34 @@
+# UNIX_TIMESTAMP / FROM_UNIXTIME conformance.
+#
+# UNIX_TIMESTAMP(d) returns the Unix epoch seconds of a datetime; FROM_UNIXTIME(n)
+# returns the 'YYYY-MM-DD HH:MM:SS' datetime for an epoch. The front-end lowers
+# them to the engine's unixepoch(d) and datetime(n, 'unixepoch').
+#
+# The engine has no session time zone, so absolute conversions are UTC — a
+# documented divergence from MySQL's session-local behavior (see mysql/COMPAT.md).
+# These checks are timezone-independent: a round trip cancels the zone, and
+# FROM_UNIXTIME's shape is fixed. They pass against both targets.
+
+# A round trip cancels the time zone (UNIX_TIMESTAMP and FROM_UNIXTIME are
+# inverses on both targets).
+query
+SELECT UNIX_TIMESTAMP(FROM_UNIXTIME(1609459200))
+----
+1609459200
+
+query
+SELECT UNIX_TIMESTAMP(FROM_UNIXTIME(1700000000))
+----
+1700000000
+
+# FROM_UNIXTIME produces a 19-char datetime string.
+query
+SELECT LENGTH(FROM_UNIXTIME(1609459200))
+----
+19
+
+# UNIX_TIMESTAMP() with no argument is the current epoch (> 0).
+query
+SELECT UNIX_TIMESTAMP() > 0
+----
+1

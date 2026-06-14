@@ -356,7 +356,8 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `DATE_FORMAT(x, fmt)`                   | 🚧     | Lowered to `strftime()` with the format translated: `%Y %m %d %H` pass through, `%i`→`%M` (minutes), `%s`→`%S` (seconds), `%%` literal, other characters copied. The format must be a string literal. Specifiers without a strftime equivalent (`%M` month name, `%h` 12-hour, `%p`, `%W`, `%j`, …) are rejected rather than silently mistranslated. |
 | `NOW` / `CURRENT_TIMESTAMP` / `UTC_TIMESTAMP` / `LOCALTIME` / `SYSDATE` | 🚧 | Current datetime, lowered to `datetime('now')`. **Always UTC** — the engine has no session time zone, so this diverges from MySQL's session-local `NOW()`. The no-argument form only (a fractional-seconds precision arg is not supported). |
 | `CURDATE` / `CURRENT_DATE` / `CURTIME` / `CURRENT_TIME` / `UTC_DATE` / `UTC_TIME` | 🚧 | Lowered to `date('now')` / `time('now')`; UTC, as above. |
-| Other date/time functions (`UNIX_TIMESTAMP`, `FROM_UNIXTIME`, `STR_TO_DATE`, …) | ❌ | **Excluded** — session-timezone-dependent or format/type differences. |
+| `UNIX_TIMESTAMP([d])` / `FROM_UNIXTIME(n)` | 🚧 | Lowered to `unixepoch(d)` (or `unixepoch('now')`) and `datetime(n, 'unixepoch')`. Absolute conversions are UTC (the engine has no session time zone), so they diverge from MySQL's session-local values, but the two are inverses on both targets, so a round trip is zone-independent. `FROM_UNIXTIME`'s two-argument formatting form is not supported. |
+| Other date/time functions (`STR_TO_DATE`, `DATEDIFF`, `TIMESTAMPDIFF`, …) | ❌ | **Excluded** — format/type or timezone differences. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 
 ### Transactional and Locking Statements

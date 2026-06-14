@@ -1889,6 +1889,15 @@ impl Parser {
             return self.current_time_call(engine_fn);
         }
 
+        // `UNIX_TIMESTAMP([d])` lowers to `unixepoch(d)` (or `unixepoch('now')`),
+        // and `FROM_UNIXTIME(n)` to `datetime(n, 'unixepoch')`.
+        if upper == "UNIX_TIMESTAMP" {
+            return self.unix_timestamp_call();
+        }
+        if upper == "FROM_UNIXTIME" {
+            return self.from_unixtime_call();
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -2167,6 +2176,55 @@ impl Parser {
             args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(requote(
                 "now",
             ))))],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Lowers `UNIX_TIMESTAMP([d])` to the engine's `unixepoch(...)`: with an
+    /// argument, the epoch of that datetime; with none, the current epoch
+    /// (`unixepoch('now')`). The engine treats the datetime as UTC (see
+    /// `mysql/COMPAT.md`). The name and `(` are already consumed.
+    fn unix_timestamp_call(&mut self) -> Result<ast::Expr> {
+        let arg = if self.is(&Token::RParen) {
+            ast::Expr::Literal(ast::Literal::String(requote("now")))
+        } else {
+            self.expr()?
+        };
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("unixepoch"),
+            distinctness: None,
+            args: vec![Box::new(arg)],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Lowers `FROM_UNIXTIME(n)` to the engine's `datetime(n, 'unixepoch')`,
+    /// which renders the epoch as a `'YYYY-MM-DD HH:MM:SS'` UTC datetime. The
+    /// two-argument formatting form is not supported. The name and `(` are
+    /// already consumed.
+    fn from_unixtime_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("datetime"),
+            distinctness: None,
+            args: vec![
+                Box::new(arg),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(
+                    "unixepoch",
+                )))),
+            ],
             order_by: Vec::new(),
             within_group: Vec::new(),
             filter_over: ast::FunctionTail {
@@ -3495,6 +3553,36 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn unix_time_functions_lower_to_engine() {
+        // UNIX_TIMESTAMP(d) -> unixepoch(d); the no-arg form uses 'now'.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("UNIX_TIMESTAMP(d)").unwrap()
+        else {
+            panic!("expected unixepoch call");
+        };
+        assert_eq!(name.as_str(), "unixepoch");
+        assert_eq!(args.len(), 1);
+
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("UNIX_TIMESTAMP()").unwrap()
+        else {
+            panic!("expected unixepoch call");
+        };
+        assert_eq!(name.as_str(), "unixepoch");
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'now'")
+        );
+
+        // FROM_UNIXTIME(n) -> datetime(n, 'unixepoch').
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("FROM_UNIXTIME(n)").unwrap()
+        else {
+            panic!("expected datetime call");
+        };
+        assert_eq!(name.as_str(), "datetime");
+        assert!(
+            matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'unixepoch'")
+        );
     }
 
     #[test]
