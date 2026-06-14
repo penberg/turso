@@ -6,6 +6,8 @@
 //! can reuse the engine's AST, optimizer, and SQL renderer. Unsupported
 //! constructs are reported as [`ParseError::Unsupported`].
 
+use std::num::NonZeroU32;
+
 use turso_parser::ast;
 
 use crate::error::{ParseError, Result};
@@ -18,6 +20,9 @@ pub struct Parser {
     pos: usize,
     /// Byte offset just past the end of input, for end-of-input errors.
     eof: usize,
+    /// Number of positional `?` placeholders seen so far. MySQL parameters are
+    /// purely positional, so each `?` takes the next index in appearance order.
+    params: u32,
 }
 
 impl Parser {
@@ -30,6 +35,7 @@ impl Parser {
             tokens,
             pos: 0,
             eof: input.len(),
+            params: 0,
         })
     }
 
@@ -1481,6 +1487,18 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// Allocates the next positional parameter and returns the AST node for it.
+    /// MySQL `?` placeholders are unnamed and numbered by appearance, so the
+    /// engine sees `Variable { index: 1.. }` with no name.
+    fn next_param(&mut self) -> ast::Variable {
+        self.params += 1;
+        ast::Variable {
+            index: NonZeroU32::new(self.params).expect("parameter index is >= 1"),
+            name: None,
+            col_type: None,
+        }
+    }
+
     fn primary_expr(&mut self) -> Result<ast::Expr> {
         match self.peek() {
             // Parenthesized sub-expression. The wrapper node is kept so the
@@ -1500,6 +1518,12 @@ impl Parser {
                 let lit = requote(s);
                 self.advance();
                 Ok(ast::Expr::Literal(ast::Literal::String(lit)))
+            }
+            // A `?` positional placeholder, bound at execution time. Each one
+            // takes the next 1-based parameter index in appearance order.
+            Some(Token::Param) => {
+                self.advance();
+                Ok(ast::Expr::Variable(self.next_param()))
             }
             // A signed numeric literal; the sign is folded into the literal.
             Some(Token::Minus) | Some(Token::Plus) => {
@@ -2823,6 +2847,44 @@ mod tests {
         // Parentheses survive the round trip back to SQL, preserving grouping.
         let sql = expr.to_string();
         assert!(sql.contains('('), "{sql}");
+    }
+
+    #[test]
+    fn positional_placeholders_are_numbered_by_appearance() {
+        // Each `?` becomes an unnamed Variable whose index is its 1-based
+        // position in the statement.
+        let stmt = parse("SELECT * FROM t WHERE a = ? AND b = ?").unwrap();
+        let indices = collect_param_indices(&stmt.to_string());
+        // The renderer keeps placeholders as `?N`, so the round-tripped SQL
+        // carries the assigned positions.
+        assert_eq!(indices, vec![1, 2], "{stmt}");
+    }
+
+    #[test]
+    fn placeholder_in_insert_values() {
+        let stmt = parse("INSERT INTO t (a, b, c) VALUES (?, ?, ?)").unwrap();
+        assert_eq!(collect_param_indices(&stmt.to_string()), vec![1, 2, 3]);
+    }
+
+    /// Extracts the indices from rendered `?N` placeholders, in order.
+    fn collect_param_indices(sql: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'?' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                out.push(sql[start..end].parse().expect("placeholder has an index"));
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub enum Token {
     Minus,
     /// `+`
     Plus,
+    /// `?` — a positional statement-parameter placeholder.
+    Param,
     /// Any other single character (operators like `*`, `<`, `=`, etc.). The
     /// supported grammar never consumes these, but lexing them keeps
     /// unsupported statements parseable enough to be reported cleanly.
@@ -71,6 +73,7 @@ impl Token {
             Token::Star => "`*`".to_string(),
             Token::Minus => "`-`".to_string(),
             Token::Plus => "`+`".to_string(),
+            Token::Param => "`?`".to_string(),
             Token::Other(c) => format!("`{c}`"),
         }
     }

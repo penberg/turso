@@ -72,6 +72,7 @@ impl<'a> Lexer<'a> {
             },
             b'-' => self.single(Token::Minus),
             b'+' => self.single(Token::Plus),
+            b'?' => self.single(Token::Param),
             b'`' => self.read_delimited(b'`', "identifier")?,
             b'"' => self.read_delimited(b'"', "identifier")?,
             b'\'' => self.read_string()?,
