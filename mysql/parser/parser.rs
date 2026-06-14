@@ -1820,6 +1820,13 @@ impl Parser {
             return self.concat_call();
         }
 
+        // MySQL's `LENGTH(x)` is a BYTE count. The engine's `length()` counts
+        // characters, but `length()` of a BLOB counts bytes, so lower it to
+        // `length(CAST(x AS BLOB))`.
+        if upper == "LENGTH" {
+            return self.length_call();
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -1916,6 +1923,36 @@ impl Parser {
             acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
         }
         Ok(acc)
+    }
+
+    /// Parses the single argument of a `LENGTH(x)` call (the name and `(` are
+    /// already consumed) and lowers it to `length(CAST(x AS BLOB))`. MySQL's
+    /// `LENGTH` is a byte count; the engine's `length()` counts characters, but
+    /// `length()` of a BLOB counts bytes, and casting to BLOB yields the value's
+    /// UTF-8 byte sequence. `CHAR_LENGTH` (the character count) maps to the
+    /// engine's `length()` directly elsewhere.
+    fn length_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let blob = ast::Expr::Cast {
+            expr: Box::new(arg),
+            type_name: Some(ast::Type {
+                name: "BLOB".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        };
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("length"),
+            distinctness: None,
+            args: vec![Box::new(blob)],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
     }
 
     /// Parses a column reference: `col` or `tbl.col`.
@@ -3140,6 +3177,20 @@ mod tests {
     }
 
     #[test]
+    fn length_lowers_to_length_of_blob_cast() {
+        // LENGTH(b) becomes length(CAST(b AS BLOB)) to get a byte count.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("LENGTH(b)").unwrap() else {
+            panic!("expected LENGTH to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "length");
+        assert_eq!(args.len(), 1);
+        let ast::Expr::Cast { type_name, .. } = args[0].as_ref() else {
+            panic!("expected the argument to be a CAST");
+        };
+        assert_eq!(type_name.as_ref().unwrap().name, "BLOB");
+    }
+
+    #[test]
     fn concat_lowers_to_concat_operator_chain() {
         // CONCAT(a, b, c) becomes ((a || b) || c).
         let expected = ast::Expr::binary(
@@ -3357,7 +3408,7 @@ mod tests {
 
     #[test]
     fn function_call_not_in_allow_list_is_unsupported() {
-        for input in ["LENGTH(name)", "NOW()", "ROUND(2.7)", "totally_made_up(1)"] {
+        for input in ["NOW()", "ROUND(2.7)", "DATE_ADD(d)", "totally_made_up(1)"] {
             let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
             assert!(
                 matches!(err, ParseError::Unsupported(_)),

@@ -343,7 +343,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `AVG`                                  | ❌     | **Excluded** — MySQL returns DECIMAL padded to 4 places; SQLite returns a plain float (text differs). |
 | `GROUP_CONCAT`                         | ❌     | **Excluded** — separator / `ORDER BY` syntax differs. |
 | `CONCAT`                               | ✅     | Lowered to the engine's `\|\|` operator (not `concat()`): like MySQL, the result is NULL if any argument is NULL. Requires at least one argument. |
-| `LENGTH`                               | ❌     | **Excluded** — MySQL counts bytes; SQLite counts characters. |
+| `LENGTH`                               | ✅     | Byte count. Lowered to `length(CAST(x AS BLOB))` (the engine's `length()` of a blob counts bytes); matches MySQL's byte semantics, distinct from `CHAR_LENGTH`. |
 | `ROUND`                                | ❌     | **Excluded** — MySQL pads to the requested decimals / returns DECIMAL; SQLite returns a bare float. |
 | `IF`                                   | ✅     | Renamed on emit to the engine's `IIF`; semantics are identical (a NULL/zero condition is false). |
 | `SUBSTRING` / `MID`                    | ✅     | Renamed on emit to `substr` (same behaviour). |

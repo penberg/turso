@@ -1,0 +1,38 @@
+# LENGTH(str) conformance — byte length.
+#
+# MySQL's LENGTH returns the length in BYTES (CHAR_LENGTH is the character
+# count). The engine's length() counts characters, but length() of a BLOB counts
+# bytes, so the front-end lowers LENGTH(x) to length(CAST(x AS BLOB)) to get
+# MySQL's byte semantics.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS len_demo (a INT PRIMARY KEY, b VARCHAR(32))
+
+statement ok
+INSERT INTO len_demo (a, b) VALUES (1, 'hello'), (2, 'café')
+
+# ASCII string: byte length equals character length.
+query
+SELECT LENGTH(b) FROM len_demo WHERE a = 1
+----
+5
+
+# Multibyte UTF-8: 'café' is 4 characters but 5 bytes (é is 2 bytes in utf8mb4).
+query
+SELECT LENGTH(b) FROM len_demo WHERE a = 2
+----
+5
+
+# Numeric argument: byte length of its text form.
+query
+SELECT LENGTH(12345)
+----
+5
+
+# NULL argument yields NULL.
+query
+SELECT LENGTH(NULL)
+----
+NULL
