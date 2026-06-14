@@ -1,0 +1,38 @@
+# CONVERT(...) conformance.
+#
+# CONVERT was parsed as a function call and rejected. It has two MySQL forms:
+#   * CONVERT(expr USING charset) — charset coercion. The engine is
+#     single-charset (UTF-8), so the charset is dropped and the value is
+#     unchanged (matches MySQL when converting to utf8mb4).
+#   * CONVERT(expr, type) — identical to CAST(expr AS type); the same type
+#     mapping and divergences apply (see mysql/COMPAT.md).
+#
+# These cases use integer/string inputs where both targets agree, so they pass
+# against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS conv_demo (a INT PRIMARY KEY, b VARCHAR(16))
+
+statement ok
+INSERT INTO conv_demo (a, b) VALUES (10, '7'), (2, '30')
+
+# CONVERT(expr USING utf8mb4) returns the value unchanged.
+query
+SELECT CONVERT(b USING utf8mb4) FROM conv_demo ORDER BY a
+----
+30
+7
+
+# CONVERT(expr, SIGNED) behaves like CAST: numeric ordering, not lexical.
+query
+SELECT b FROM conv_demo ORDER BY CONVERT(b, SIGNED)
+----
+7
+30
+
+# CONVERT(expr, CHAR) casts an integer to text.
+query
+SELECT CONVERT(a, CHAR) FROM conv_demo ORDER BY a
+----
+2
+10

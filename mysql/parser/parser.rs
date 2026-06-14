@@ -1662,6 +1662,12 @@ impl Parser {
                         self.advance();
                         self.cast_expr()
                     }
+                    // `CONVERT(...)` has its own grammar (a `USING` charset
+                    // clause or a `, type` cast), so it too is parsed here.
+                    "CONVERT" if self.peek_nth(1) == Some(&Token::LParen) => {
+                        self.advance();
+                        self.convert_expr()
+                    }
                     // A bare identifier followed by `(` is a function call;
                     // otherwise it is a column reference.
                     _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
@@ -1681,6 +1687,29 @@ impl Parser {
         self.expect(&Token::LParen, "`(`")?;
         let expr = self.expr()?;
         self.expect_keyword("AS")?;
+        let type_name = self.cast_type()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::Cast {
+            expr: Box::new(expr),
+            type_name: Some(type_name),
+        })
+    }
+
+    /// Parses `CONVERT(...)`, which has two MySQL forms:
+    /// `CONVERT(expr USING charset)` coerces a string's charset — the engine is
+    /// single-charset (UTF-8), so the charset is dropped and the value passes
+    /// through unchanged — and `CONVERT(expr, type)` is identical to
+    /// `CAST(expr AS type)`. `CONVERT` has already been consumed.
+    fn convert_expr(&mut self) -> Result<ast::Expr> {
+        self.expect(&Token::LParen, "`(`")?;
+        let expr = self.expr()?;
+        if self.eat_keyword("USING") {
+            // Charset name (an identifier such as `utf8mb4`); consumed and dropped.
+            self.name()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(expr);
+        }
+        self.expect(&Token::Comma, "`,` or `USING`")?;
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(ast::Expr::Cast {
@@ -3070,6 +3099,17 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn convert_using_drops_charset_and_type_form_is_a_cast() {
+        // CONVERT(expr USING charset) drops the charset and yields the bare expr.
+        assert_eq!(parse_expr("CONVERT(a USING utf8mb4)").unwrap(), col("a"));
+        // CONVERT(expr, type) is the same as CAST(expr AS type).
+        let ast::Expr::Cast { type_name, .. } = parse_expr("CONVERT(a, SIGNED)").unwrap() else {
+            panic!("expected CONVERT(expr, type) to parse as a Cast");
+        };
+        assert_eq!(type_name.unwrap().name, "INTEGER");
     }
 
     #[test]
