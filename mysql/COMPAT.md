@@ -307,7 +307,7 @@ diverge are deliberately excluded.
 | `AND` / `OR` / `NOT`, parentheses      | ✅     |         |
 | `IS [NOT] NULL`                        | ✅     |         |
 | Arithmetic `+` `-` `*`                 | ✅     |         |
-| `[NOT] IN (value list)`                | ✅     |         |
+| `[NOT] IN (value list)`                | ✅     | Includes the empty list: `x IN ()` folds to `0` and `x NOT IN ()` to `1` (MySQL semantics), since the engine has no empty-list `IN`. |
 | `[NOT] BETWEEN a AND b`                | ✅     |         |
 | `[NOT] LIKE` (ASCII patterns)          | ✅     |         |
 | `CASE` (searched and simple forms)     | ✅     | `CASE WHEN ... THEN ... [ELSE ...] END` and `CASE expr WHEN ... END`; standard SQL, identical. |

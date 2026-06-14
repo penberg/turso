@@ -1486,6 +1486,15 @@ impl Parser {
                 rhs,
             });
         }
+        // MySQL accepts an empty IN list, which SQLite and the engine do not:
+        // `x IN ()` is always 0 and `x NOT IN ()` always 1, for any `x`
+        // (including NULL). Fold the empty form to that constant. The left-hand
+        // side is dropped because the result never depends on it.
+        if self.eat(&Token::RParen) {
+            return Ok(ast::Expr::Literal(ast::Literal::Numeric(
+                if not { "1" } else { "0" }.to_string(),
+            )));
+        }
         let mut rhs = Vec::new();
         loop {
             rhs.push(Box::new(self.expr()?));
@@ -2471,6 +2480,20 @@ mod tests {
         assert!(matches!(
             parse_expr("id IN (1, 2, 3)").unwrap(),
             ast::Expr::InList { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_in_list_folds_to_constant() {
+        // `x IN ()` folds to 0 and `x NOT IN ()` to 1 (MySQL semantics); the
+        // engine has no empty-list IN.
+        assert!(matches!(
+            parse_expr("id IN ()").unwrap(),
+            ast::Expr::Literal(ast::Literal::Numeric(ref n)) if n == "0"
+        ));
+        assert!(matches!(
+            parse_expr("id NOT IN ()").unwrap(),
+            ast::Expr::Literal(ast::Literal::Numeric(ref n)) if n == "1"
         ));
     }
 

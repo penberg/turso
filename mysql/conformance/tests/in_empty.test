@@ -1,0 +1,45 @@
+# Empty IN ( ) list conformance.
+#
+# MySQL accepts an empty IN list: `x IN ()` is always 0 (false) and
+# `x NOT IN ()` is always 1 (true), for any x — including NULL. SQLite and the
+# engine have no empty-list IN, so the front-end folds the empty form to the
+# constant MySQL would return. WordPress generates `IN ()` when filtering by an
+# empty set of IDs (e.g. WP_Comment_Query with no matches).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS in_demo (a INT PRIMARY KEY, b TEXT)
+
+statement ok
+INSERT INTO in_demo (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+# WHERE a IN () matches no rows.
+query
+SELECT COUNT(*) FROM in_demo WHERE a IN ()
+----
+0
+
+# WHERE a NOT IN () matches every row.
+query
+SELECT COUNT(*) FROM in_demo WHERE a NOT IN ()
+----
+3
+
+# As scalars, IN () is 0 and NOT IN () is 1 regardless of the left-hand side.
+query
+SELECT 5 IN (), 5 NOT IN ()
+----
+0	1
+
+query
+SELECT NULL IN (), NULL NOT IN ()
+----
+0	1
+
+# A non-empty IN list is unaffected.
+query
+SELECT a FROM in_demo WHERE a IN (1, 3) ORDER BY a
+----
+1
+3
