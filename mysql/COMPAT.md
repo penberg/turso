@@ -351,6 +351,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `CHAR_LENGTH` / `CHARACTER_LENGTH`     | ✅     | Renamed on emit to `length` (a character count). Distinct from `LENGTH`, which counts bytes and stays excluded. |
 | `YEAR` / `MONTH` / `DAY` / `DAYOFMONTH` / `HOUR` / `MINUTE` / `SECOND` | ✅ | Date-part extractors, lowered to `CAST(strftime(fmt, x) AS INTEGER)`; return the integer component (no zero-padding) like MySQL for the standard `YYYY-MM-DD HH:MM:SS` format. |
 | `DATE_ADD` / `DATE_SUB` (`INTERVAL n unit`) | 🚧 | Lowered to the engine's `datetime(x, '±n unit')` modifier. `unit` ∈ `DAY`/`WEEK`/`MONTH`/`YEAR`/`HOUR`/`MINUTE`/`SECOND`; the interval value must be an integer literal. Matches MySQL for DATETIME arguments. Diverges on a bare DATE (the engine keeps the `00:00:00` time) and on `MONTH`/`YEAR` arithmetic that overflows a month end (MySQL clamps, the engine rolls over). |
+| `DATE_FORMAT(x, fmt)`                   | 🚧     | Lowered to `strftime()` with the format translated: `%Y %m %d %H` pass through, `%i`→`%M` (minutes), `%s`→`%S` (seconds), `%%` literal, other characters copied. The format must be a string literal. Specifiers without a strftime equivalent (`%M` month name, `%h` 12-hour, `%p`, `%W`, `%j`, …) are rejected rather than silently mistranslated. |
 | `NOW`, `CURDATE`, other date/time functions | ❌ | **Excluded** — types and formats differ, or the value is non-deterministic. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 

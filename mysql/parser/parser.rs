@@ -1857,6 +1857,12 @@ impl Parser {
             return self.date_add_call(true);
         }
 
+        // `DATE_FORMAT(x, fmt)` lowers to the engine's `strftime()` with the
+        // format specifiers translated from MySQL to strftime spelling.
+        if upper == "DATE_FORMAT" {
+            return self.date_format_call();
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -2079,6 +2085,39 @@ impl Parser {
             args: vec![
                 Box::new(target),
                 Box::new(ast::Expr::Literal(ast::Literal::String(requote(&modifier)))),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Parses `DATE_FORMAT(x, 'fmt')` (the name and `(` are already consumed)
+    /// and lowers it to the engine's `strftime(translated_fmt, x)`. The format
+    /// must be a string literal so its MySQL specifiers can be translated to
+    /// strftime spelling at parse time (see [`translate_date_format`]).
+    fn date_format_call(&mut self) -> Result<ast::Expr> {
+        let target = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let Some(Token::Str(fmt)) = self.peek() else {
+            return Err(self.unexpected("a string-literal DATE_FORMAT format"));
+        };
+        let fmt = fmt.clone();
+        self.advance();
+        self.expect(&Token::RParen, "`)`")?;
+
+        let translated = translate_date_format(&fmt)?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("strftime"),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(
+                    &translated,
+                )))),
+                Box::new(target),
             ],
             order_by: Vec::new(),
             within_group: Vec::new(),
@@ -2384,6 +2423,43 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
         "SECOND" => "%S",
         _ => return None,
     })
+}
+
+/// Translates a MySQL `DATE_FORMAT` format string into the engine's `strftime`
+/// spelling. Only specifiers with a direct strftime equivalent are accepted;
+/// `%i`/`%s` (MySQL minutes/seconds) become `%M`/`%S`, the shared codes
+/// (`%Y %m %d %H`) and `%%` pass through, and literal characters are copied.
+/// Any other specifier (e.g. `%M` month name, `%h`, `%p`, `%W`) is rejected so
+/// the front-end never silently produces a different string than MySQL.
+fn translate_date_format(mysql_fmt: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = mysql_fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str("%Y"),
+            Some('m') => out.push_str("%m"),
+            Some('d') => out.push_str("%d"),
+            Some('H') => out.push_str("%H"),
+            Some('i') => out.push_str("%M"),
+            Some('s') => out.push_str("%S"),
+            Some('%') => out.push_str("%%"),
+            Some(other) => {
+                return Err(ParseError::Unsupported(format!(
+                    "DATE_FORMAT specifier %{other} is not supported yet"
+                )))
+            }
+            None => {
+                return Err(ParseError::Unsupported(
+                    "DATE_FORMAT format ends with a dangling `%`".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The aggregate functions, which (unlike the scalar ones) accept a `DISTINCT`
@@ -3343,6 +3419,29 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn date_format_lowers_to_strftime_with_translated_codes() {
+        // DATE_FORMAT(d, fmt) becomes strftime(translated_fmt, d); %i/%s map to
+        // %M/%S, the rest pass through.
+        let ast::Expr::FunctionCall { name, args, .. } =
+            parse_expr("DATE_FORMAT(d, '%Y-%m-%d %H:%i:%s')").unwrap()
+        else {
+            panic!("expected DATE_FORMAT to lower to strftime");
+        };
+        assert_eq!(name.as_str(), "strftime");
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%Y-%m-%d %H:%M:%S'"),
+            "format was not translated correctly"
+        );
+        // A specifier without a strftime equivalent is rejected.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%W')").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+        // A non-literal format is rejected.
+        assert!(parse_expr("DATE_FORMAT(d, f)").is_err());
     }
 
     #[test]

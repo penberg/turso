@@ -1,0 +1,34 @@
+# DATE_FORMAT(d, fmt) conformance.
+#
+# MySQL's DATE_FORMAT formats a datetime with format specifiers. The front-end
+# lowers it to the engine's strftime(), translating the MySQL specifiers that
+# have a direct strftime equivalent: %Y %m %d %H, %i (minutes -> %M),
+# %s (seconds -> %S), and %%. Literal characters pass through. The format must
+# be a string literal; specifiers without a strftime equivalent (e.g. %M month
+# name, %p, %W, %h) are rejected. See mysql/COMPAT.md.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS df_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO df_demo (a, d) VALUES (1, '2020-03-15 09:07:42')
+
+# Reconstruct the standard datetime string (%i/%s map to minutes/seconds).
+query
+SELECT DATE_FORMAT(d, '%Y-%m-%d %H:%i:%s') FROM df_demo
+----
+2020-03-15 09:07:42
+
+# Custom separators and literal text are copied verbatim.
+query
+SELECT DATE_FORMAT(d, 'Y=%Y M=%m D=%d') FROM df_demo
+----
+Y=2020 M=03 D=15
+
+# A literal percent (%%).
+query
+SELECT DATE_FORMAT(d, '%H%%') FROM df_demo
+----
+09%
