@@ -262,8 +262,7 @@ incomplete.
 |----------------------------------------|--------|---------|
 | CALL                                   | ❌     |         |
 | DELETE FROM tbl [WHERE] (single table) | ✅     |         |
-| DELETE `t1 FROM <refs> [WHERE]` (multi-table, single target) | ✅ | Lowered to `DELETE FROM <table> WHERE rowid IN (SELECT t1.rowid FROM <refs> [WHERE])`. The target may be a table or a `FROM` alias; the join may be comma or `JOIN ... ON`. |
-| DELETE (multiple target tables, e.g. `DELETE a, b FROM ...`) | ❌ | **Not supported** — matching MySQL needs a two-phase delete (rows computed before any are removed). |
+| DELETE `t1[, t2, ...] FROM <refs> [WHERE]` (multi-table) | ✅ | Lowered to `DELETE FROM <table> WHERE rowid IN (SELECT t1.rowid FROM <refs> [WHERE] [UNION SELECT t2.rowid ...])`. The `rowid` subquery (including the `UNION` over every target) is materialized before any row is deleted, so it matches MySQL without a two-phase delete. Targets may be table names or `FROM` aliases; the join may be comma or `JOIN ... ON`. **All targets must resolve to the same table** (e.g. WordPress's transient-cleanup self-join); targets on different tables are rejected. |
 | DELETE (`... USING` / `ORDER BY` / `LIMIT`) | ❌ | **Not supported.** |
 | DO                                     | ❌     |         |
 | EXCEPT clause                          | ❌     |         |

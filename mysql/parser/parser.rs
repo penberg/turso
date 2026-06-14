@@ -1427,12 +1427,14 @@ impl Parser {
     }
 
     /// Parses a multi-table `DELETE <targets> FROM <refs> [WHERE ...]` (the
-    /// target list precedes `FROM`). A single target is lowered to
-    /// `DELETE FROM <table> WHERE rowid IN (SELECT <target>.rowid FROM <refs>
-    /// [WHERE ...])`, which the engine evaluates identically to MySQL. The
-    /// multiple-target form (`DELETE a, b FROM ...`) needs a two-phase delete to
-    /// match MySQL (the matching rows must be computed before any are removed),
-    /// so it is rejected. `DELETE` has already been consumed.
+    /// target list precedes `FROM`). It is lowered to
+    /// `DELETE FROM <table> WHERE rowid IN (SELECT t1.rowid FROM <refs> [WHERE]
+    /// [UNION SELECT t2.rowid ...])`, which the engine evaluates identically to
+    /// MySQL: the `rowid` subquery (including the `UNION` of every target's
+    /// rowids) is materialized against the pre-delete state before any row is
+    /// removed, so no two-phase delete is needed. All targets must resolve to
+    /// the **same** table — differing tables would need separate deletes and are
+    /// rejected. `DELETE` has already been consumed.
     fn multi_table_delete(&mut self) -> Result<ast::Stmt> {
         let mut targets = vec![self.qualified_name()?];
         while self.eat(&Token::Comma) {
@@ -1450,38 +1452,57 @@ impl Parser {
                 "ORDER BY / LIMIT on DELETE is not supported yet".to_string(),
             ));
         }
-        if targets.len() != 1 {
+
+        // Resolve every target alias/name to its underlying table; they must all
+        // be the same table for the single-DELETE-with-UNION lowering to match
+        // MySQL's multi-table delete.
+        let mut resolved = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let alias = target.name.as_str();
+            let Some(table) = resolve_delete_target(&from, alias) else {
+                return Err(ParseError::Unsupported(format!(
+                    "multi-table DELETE target `{alias}` is not a table in the FROM clause"
+                )));
+            };
+            resolved.push((alias.to_string(), table));
+        }
+        let table = resolved[0].1.clone();
+        if resolved
+            .iter()
+            .any(|(_, t)| !t.name.as_str().eq_ignore_ascii_case(table.name.as_str()))
+        {
             return Err(ParseError::Unsupported(
-                "multi-table DELETE with more than one target table is not supported yet"
-                    .to_string(),
+                "multi-table DELETE across different tables is not supported yet".to_string(),
             ));
         }
 
-        let target = targets[0].name.as_str().to_string();
-        let Some(table) = resolve_delete_target(&from, &target) else {
-            return Err(ParseError::Unsupported(format!(
-                "multi-table DELETE target `{target}` is not a table in the FROM clause"
-            )));
+        // One `SELECT <target>.rowid FROM <refs> [WHERE ...]` per target.
+        let rowid_select = |alias: &str| ast::OneSelect::Select {
+            distinctness: None,
+            columns: vec![ast::ResultColumn::Expr(
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::from_string(alias),
+                    ast::Name::from_string("rowid"),
+                )),
+                None,
+            )],
+            from: Some(from.clone()),
+            where_clause: where_clause.clone(),
+            group_by: None,
+            window_clause: Vec::new(),
         };
+        let select = rowid_select(&resolved[0].0);
+        let compounds = resolved[1..]
+            .iter()
+            .map(|(alias, _)| ast::CompoundSelect {
+                operator: ast::CompoundOperator::Union,
+                select: rowid_select(alias),
+            })
+            .collect();
 
-        // SELECT <target>.rowid FROM <refs> [WHERE ...]
-        let rowid_of_target = ast::Expr::Qualified(
-            ast::Name::from_string(&target),
-            ast::Name::from_string("rowid"),
-        );
         let subquery = ast::Select {
             with: None,
-            body: ast::SelectBody {
-                select: ast::OneSelect::Select {
-                    distinctness: None,
-                    columns: vec![ast::ResultColumn::Expr(Box::new(rowid_of_target), None)],
-                    from: Some(from),
-                    where_clause,
-                    group_by: None,
-                    window_clause: Vec::new(),
-                },
-                compounds: Vec::new(),
-            },
+            body: ast::SelectBody { select, compounds },
             order_by: Vec::new(),
             limit: None,
         };

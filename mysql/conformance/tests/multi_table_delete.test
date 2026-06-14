@@ -1,11 +1,12 @@
 # Single-target multi-table DELETE: DELETE t1 FROM <refs> WHERE ...
 #
-# MySQL's multi-table DELETE with one target table deletes the rows of that
-# table that match a join. The front-end lowers it to
-# DELETE FROM t1 WHERE rowid IN (SELECT t1.rowid FROM <refs> WHERE ...), which
-# the engine evaluates identically. The multiple-target form
-# (DELETE a, b FROM ...) needs a two-phase delete and is not supported (see
-# mysql/COMPAT.md) — so it is not exercised here.
+# MySQL's multi-table DELETE deletes the matching rows from each named target.
+# The front-end lowers it to
+# DELETE FROM <table> WHERE rowid IN (SELECT t1.rowid FROM <refs> WHERE ...
+#   [UNION SELECT t2.rowid ...]), which the engine evaluates identically: the
+# subquery (and its UNION over every target's rowids) is materialized before any
+# row is deleted, so no two-phase delete is needed. All targets must resolve to
+# the same table (differing tables are rejected; see mysql/COMPAT.md).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -42,3 +43,21 @@ query
 SELECT id FROM mt_a ORDER BY id
 ----
 4
+
+# Multiple targets on the SAME table (a self-join), as in WordPress's expired
+# transient cleanup: both the value row (a) and its timeout row (b) are deleted.
+statement ok
+CREATE TABLE IF NOT EXISTS mt_opt (id INT PRIMARY KEY, k VARCHAR(40), v INT)
+
+statement ok
+INSERT INTO mt_opt (id, k, v) VALUES (1, '_transient_x', 5), (2, '_transient_timeout_x', 100), (3, 'keep', 1), (4, '_transient_y', 9), (5, '_transient_timeout_y', 999)
+
+statement ok
+DELETE a, b FROM mt_opt a, mt_opt b WHERE a.k = '_transient_x' AND b.k = '_transient_timeout_x' AND b.v < 150
+
+query
+SELECT id, k FROM mt_opt ORDER BY id
+----
+3	keep
+4	_transient_y
+5	_transient_timeout_y
