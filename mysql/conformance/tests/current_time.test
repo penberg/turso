@@ -1,0 +1,29 @@
+# Current date/time functions: NOW / CURRENT_TIMESTAMP / UTC_TIMESTAMP /
+# CURDATE / CURTIME and friends.
+#
+# These return the current date/time. The front-end lowers them to the engine's
+# datetime('now') / date('now') / time('now'). The engine has no session time
+# zone, so the value is always UTC (a documented divergence from MySQL's
+# session-local NOW(); see mysql/COMPAT.md).
+#
+# The values are non-deterministic, so these checks assert only the
+# deterministic shape — string length and NULL-ness — which matches on both
+# turso-mysql-server and a real mysqld.
+
+# NOW() is a 19-char 'YYYY-MM-DD HH:MM:SS' string and is never NULL.
+query
+SELECT LENGTH(NOW()), NOW() IS NULL
+----
+19	0
+
+# CURRENT_TIMESTAMP() and UTC_TIMESTAMP() are also full datetimes.
+query
+SELECT LENGTH(CURRENT_TIMESTAMP()), LENGTH(UTC_TIMESTAMP())
+----
+19	19
+
+# CURDATE() is a 10-char date; CURTIME() is an 8-char time.
+query
+SELECT LENGTH(CURDATE()), LENGTH(CURTIME())
+----
+10	8

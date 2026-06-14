@@ -352,7 +352,9 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `YEAR` / `MONTH` / `DAY` / `DAYOFMONTH` / `HOUR` / `MINUTE` / `SECOND` | ✅ | Date-part extractors, lowered to `CAST(strftime(fmt, x) AS INTEGER)`; return the integer component (no zero-padding) like MySQL for the standard `YYYY-MM-DD HH:MM:SS` format. |
 | `DATE_ADD` / `DATE_SUB` (`INTERVAL n unit`) | 🚧 | Lowered to the engine's `datetime(x, '±n unit')` modifier. `unit` ∈ `DAY`/`WEEK`/`MONTH`/`YEAR`/`HOUR`/`MINUTE`/`SECOND`; the interval value must be an integer literal. Matches MySQL for DATETIME arguments. Diverges on a bare DATE (the engine keeps the `00:00:00` time) and on `MONTH`/`YEAR` arithmetic that overflows a month end (MySQL clamps, the engine rolls over). |
 | `DATE_FORMAT(x, fmt)`                   | 🚧     | Lowered to `strftime()` with the format translated: `%Y %m %d %H` pass through, `%i`→`%M` (minutes), `%s`→`%S` (seconds), `%%` literal, other characters copied. The format must be a string literal. Specifiers without a strftime equivalent (`%M` month name, `%h` 12-hour, `%p`, `%W`, `%j`, …) are rejected rather than silently mistranslated. |
-| `NOW`, `CURDATE`, other date/time functions | ❌ | **Excluded** — types and formats differ, or the value is non-deterministic. |
+| `NOW` / `CURRENT_TIMESTAMP` / `UTC_TIMESTAMP` / `LOCALTIME` / `SYSDATE` | 🚧 | Current datetime, lowered to `datetime('now')`. **Always UTC** — the engine has no session time zone, so this diverges from MySQL's session-local `NOW()`. The no-argument form only (a fractional-seconds precision arg is not supported). |
+| `CURDATE` / `CURRENT_DATE` / `CURTIME` / `CURRENT_TIME` / `UTC_DATE` / `UTC_TIME` | 🚧 | Lowered to `date('now')` / `time('now')`; UTC, as above. |
+| Other date/time functions (`UNIX_TIMESTAMP`, `FROM_UNIXTIME`, `STR_TO_DATE`, …) | ❌ | **Excluded** — session-timezone-dependent or format/type differences. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 
 ### Transactional and Locking Statements

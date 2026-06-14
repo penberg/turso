@@ -1863,6 +1863,12 @@ impl Parser {
             return self.date_format_call();
         }
 
+        // Current date/time functions (`NOW()`, `CURDATE()`, ...) lower to the
+        // engine's `datetime('now')` / `date('now')` / `time('now')`.
+        if let Some(engine_fn) = current_time_function(&upper) {
+            return self.current_time_call(engine_fn);
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -2119,6 +2125,28 @@ impl Parser {
                 )))),
                 Box::new(target),
             ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Lowers a MySQL current date/time function (`NOW()`, `CURDATE()`, ...) to
+    /// the engine's `datetime('now')` / `date('now')` / `time('now')`. The name
+    /// and `(` are already consumed; these forms take no arguments here. The
+    /// engine has no session time zone, so the result is UTC (a documented
+    /// divergence from MySQL's session-local `NOW()`; see `mysql/COMPAT.md`).
+    fn current_time_call(&mut self, engine_fn: &'static str) -> Result<ast::Expr> {
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string(engine_fn),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(requote(
+                "now",
+            ))))],
             order_by: Vec::new(),
             within_group: Vec::new(),
             filter_over: ast::FunctionTail {
@@ -2460,6 +2488,19 @@ fn translate_date_format(mysql_fmt: &str) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// The engine function (`datetime`/`date`/`time`) that a MySQL current
+/// date/time function maps to, or `None` if `upper_name` is not one. Each is
+/// applied to the `'now'` time string. `upper_name` must already be uppercased.
+fn current_time_function(upper_name: &str) -> Option<&'static str> {
+    Some(match upper_name {
+        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_TIMESTAMP"
+        | "SYSDATE" => "datetime",
+        "CURDATE" | "CURRENT_DATE" | "UTC_DATE" => "date",
+        "CURTIME" | "CURRENT_TIME" | "UTC_TIME" => "time",
+        _ => return None,
+    })
 }
 
 /// The aggregate functions, which (unlike the scalar ones) accept a `DISTINCT`
@@ -3422,6 +3463,29 @@ mod tests {
     }
 
     #[test]
+    fn current_time_functions_lower_to_now() {
+        // Each maps to the engine datetime/date/time function applied to 'now'.
+        let cases = [
+            ("NOW()", "datetime"),
+            ("CURRENT_TIMESTAMP()", "datetime"),
+            ("UTC_TIMESTAMP()", "datetime"),
+            ("CURDATE()", "date"),
+            ("CURRENT_DATE()", "date"),
+            ("CURTIME()", "time"),
+        ];
+        for (sql, engine_fn) in cases {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a function call");
+            };
+            assert_eq!(name.as_str(), engine_fn, "for `{sql}`");
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'now'"),
+                "expected a 'now' argument for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
     fn date_format_lowers_to_strftime_with_translated_codes() {
         // DATE_FORMAT(d, fmt) becomes strftime(translated_fmt, d); %i/%s map to
         // %M/%S, the rest pass through.
@@ -3728,7 +3792,7 @@ mod tests {
 
     #[test]
     fn function_call_not_in_allow_list_is_unsupported() {
-        for input in ["NOW()", "ROUND(2.7)", "RAND()", "totally_made_up(1)"] {
+        for input in ["SLEEP(1)", "ROUND(2.7)", "RAND()", "totally_made_up(1)"] {
             let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
             assert!(
                 matches!(err, ParseError::Unsupported(_)),
