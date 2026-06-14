@@ -1827,6 +1827,13 @@ impl Parser {
             return self.length_call();
         }
 
+        // MySQL date-part extractors (`YEAR`, `MONTH`, `DAY`, ...) lower to the
+        // engine's `strftime()`, cast to an integer to match MySQL's numeric
+        // return (no zero-padding).
+        if let Some(fmt) = date_part_format(&upper) {
+            return self.date_part_call(fmt);
+        }
+
         if !is_supported_function(&upper) {
             return Err(ParseError::Unsupported(format!(
                 "function {upper} is not supported yet"
@@ -1952,6 +1959,38 @@ impl Parser {
                 filter_clause: None,
                 over_clause: None,
             },
+        })
+    }
+
+    /// Parses the single argument of a date-part extractor such as `YEAR(x)`
+    /// (the name and `(` are already consumed) and lowers it to
+    /// `CAST(strftime(fmt, x) AS INTEGER)`. The cast drops `strftime`'s
+    /// zero-padding and string type so the result is an integer like MySQL's
+    /// (e.g. `MONTH('2020-03-15')` is `3`, not `'03'`). NULL propagates.
+    fn date_part_call(&mut self, fmt: &str) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let strftime = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("strftime"),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(fmt)))),
+                Box::new(arg),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        Ok(ast::Expr::Cast {
+            expr: Box::new(strftime),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
         })
     }
 
@@ -2235,6 +2274,21 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
+}
+
+/// The `strftime` format code for a MySQL date-part extractor function, or
+/// `None` if the name is not one. The extracted component is cast to an integer
+/// (see [`Parser::date_part_call`]). `upper_name` must already be uppercased.
+fn date_part_format(upper_name: &str) -> Option<&'static str> {
+    Some(match upper_name {
+        "YEAR" => "%Y",
+        "MONTH" => "%m",
+        "DAY" | "DAYOFMONTH" => "%d",
+        "HOUR" => "%H",
+        "MINUTE" => "%M",
+        "SECOND" => "%S",
+        _ => return None,
+    })
 }
 
 /// The aggregate functions, which (unlike the scalar ones) accept a `DISTINCT`
@@ -3172,6 +3226,33 @@ mod tests {
             assert!(
                 matches!(parse_expr(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn date_parts_lower_to_cast_strftime() {
+        // YEAR(d) becomes CAST(strftime('%Y', d) AS INTEGER); same shape for the
+        // other parts, differing only in the format code.
+        for (sql, fmt) in [
+            ("YEAR(d)", "'%Y'"),
+            ("MONTH(d)", "'%m'"),
+            ("DAY(d)", "'%d'"),
+            ("HOUR(d)", "'%H'"),
+            ("MINUTE(d)", "'%M'"),
+            ("SECOND(d)", "'%S'"),
+        ] {
+            let ast::Expr::Cast { expr, type_name } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a CAST");
+            };
+            assert_eq!(type_name.unwrap().name, "INTEGER");
+            let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+                panic!("expected strftime call inside the cast for `{sql}`");
+            };
+            assert_eq!(name.as_str(), "strftime");
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == fmt),
+                "wrong format code for `{sql}`"
             );
         }
     }

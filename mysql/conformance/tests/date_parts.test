@@ -1,0 +1,39 @@
+# Date-part extractors: YEAR / MONTH / DAY / HOUR / MINUTE / SECOND.
+#
+# These MySQL functions return the integer component of a date/datetime. The
+# front-end lowers each to cast(strftime(fmt, x) as integer), which matches
+# MySQL's numeric result for the 'YYYY-MM-DD HH:MM:SS' format WordPress stores
+# (post_date, transient timeouts, cron schedules). WP_Date_Query relies on these.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS date_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO date_demo (a, d) VALUES (1, '2020-03-15 09:07:42'), (2, '1999-12-31 23:59:59')
+
+# YEAR/MONTH/DAY return integers (no zero-padding).
+query
+SELECT YEAR(d), MONTH(d), DAY(d) FROM date_demo ORDER BY a
+----
+2020	3	15
+1999	12	31
+
+# HOUR/MINUTE/SECOND on the time component.
+query
+SELECT HOUR(d), MINUTE(d), SECOND(d) FROM date_demo WHERE a = 1
+----
+9	7	42
+
+# Works on a bare date literal too.
+query
+SELECT YEAR('2021-07-04')
+----
+2021
+
+# NULL propagates.
+query
+SELECT YEAR(NULL)
+----
+NULL

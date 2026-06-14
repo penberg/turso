@@ -349,7 +349,8 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `SUBSTRING` / `MID`                    | ✅     | Renamed on emit to `substr` (same behaviour). |
 | `LCASE` / `UCASE`                      | ✅     | Renamed on emit to `lower` / `upper`. |
 | `CHAR_LENGTH` / `CHARACTER_LENGTH`     | ✅     | Renamed on emit to `length` (a character count). Distinct from `LENGTH`, which counts bytes and stays excluded. |
-| `NOW`, `CURDATE`, date/time functions  | ❌     | **Excluded** — types and formats differ. |
+| `YEAR` / `MONTH` / `DAY` / `DAYOFMONTH` / `HOUR` / `MINUTE` / `SECOND` | ✅ | Date-part extractors, lowered to `CAST(strftime(fmt, x) AS INTEGER)`; return the integer component (no zero-padding) like MySQL for the standard `YYYY-MM-DD HH:MM:SS` format. |
+| `NOW`, `CURDATE`, other date/time functions | ❌ | **Excluded** — types and formats differ, or the value is non-deterministic. |
 | any other function                     | ❌     | **Not supported** — not in the clean allow-list. |
 
 ### Transactional and Locking Statements
