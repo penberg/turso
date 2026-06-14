@@ -1,0 +1,37 @@
+# COLLATE in expressions: `expr COLLATE collation_name`.
+#
+# MySQL's COLLATE overrides the collation used for comparison and sorting. The
+# engine is effectively single-collation (binary, like SQLite), so the front-end
+# parses and discards the COLLATE clause — the underlying value is unchanged.
+# This is an intentional divergence (collation is not honored); see
+# mysql/COMPAT.md.
+#
+# These cases use a binary collation and exact-case data, so the result is the
+# same whether or not COLLATE is honored — they pass against both
+# turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS collate_demo (a INT PRIMARY KEY, b VARCHAR(32))
+
+statement ok
+INSERT INTO collate_demo (a, b) VALUES (1, 'Alpha'), (2, 'beta')
+
+# COLLATE on a projected column returns the same values.
+query
+SELECT b COLLATE utf8mb4_bin FROM collate_demo ORDER BY a
+----
+Alpha
+beta
+
+# COLLATE in a WHERE comparison (exact-case match).
+query
+SELECT a FROM collate_demo WHERE b COLLATE utf8mb4_bin = 'Alpha'
+----
+1
+
+# COLLATE in ORDER BY.
+query
+SELECT b FROM collate_demo ORDER BY b COLLATE utf8mb4_bin
+----
+Alpha
+beta

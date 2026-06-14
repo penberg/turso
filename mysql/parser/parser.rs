@@ -1559,13 +1559,30 @@ impl Parser {
     /// their MySQL semantics differ from SQLite (float division, float modulo),
     /// so they produce a clean parse error rather than a wrong answer.
     fn multiplicative_expr(&mut self) -> Result<ast::Expr> {
-        let mut lhs = self.primary_expr()?;
+        let mut lhs = self.collate_expr()?;
         while self.is(&Token::Star) {
             self.advance();
-            let rhs = self.primary_expr()?;
+            let rhs = self.collate_expr()?;
             lhs = ast::Expr::binary(lhs, ast::Operator::Multiply, rhs);
         }
         Ok(lhs)
+    }
+
+    /// A primary expression optionally followed by a `COLLATE collation_name`
+    /// postfix. MySQL's `COLLATE` overrides the collation used for comparison and
+    /// sorting; the engine is effectively single-collation (binary), so the
+    /// clause is parsed and discarded and the underlying value is unchanged.
+    /// This is an intentional divergence (collation is not honored); see
+    /// `mysql/COMPAT.md`. `COLLATE` binds tighter than the arithmetic operators,
+    /// so it is applied here at the primary tier.
+    fn collate_expr(&mut self) -> Result<ast::Expr> {
+        let expr = self.primary_expr()?;
+        while self.eat_keyword("COLLATE") {
+            // The collation name is an identifier (e.g. `utf8mb4_general_ci`);
+            // consume and drop it.
+            self.name()?;
+        }
+        Ok(expr)
     }
 
     /// Allocates the next positional parameter and returns the AST node for it.
@@ -2960,6 +2977,17 @@ mod tests {
             ),
         );
         assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn collate_clause_is_parsed_and_dropped() {
+        // `expr COLLATE name` parses to just `expr` (collation is not honored).
+        assert_eq!(parse_expr("a COLLATE utf8mb4_bin").unwrap(), col("a"));
+        // COLLATE binds tighter than arithmetic: `a + b COLLATE x` is `a + b`.
+        assert_eq!(
+            parse_expr("a + b COLLATE utf8mb4_general_ci").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::Add, col("b"))
+        );
     }
 
     #[test]

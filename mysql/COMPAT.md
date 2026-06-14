@@ -311,6 +311,7 @@ diverge are deliberately excluded.
 | `[NOT] BETWEEN a AND b`                | ✅     |         |
 | `[NOT] LIKE` (ASCII patterns)          | ✅     |         |
 | `CASE` (searched and simple forms)     | ✅     | `CASE WHEN ... THEN ... [ELSE ...] END` and `CASE expr WHEN ... END`; standard SQL, identical. |
+| `expr COLLATE collation_name`          | 🚧     | The `COLLATE` postfix is parsed and **discarded** — the engine is effectively single-collation (binary), so the named collation is not honored (comparisons/sorts use the engine default). The collation name must be an identifier (`COLLATE 'string'` is rejected). |
 | `/` (division)                         | ❌     | **Excluded** — MySQL float division (`5/2=2.5`) vs SQLite integer division (`5/2=2`). |
 | `%` / `MOD`                            | ❌     | **Excluded** — float modulo differs. |
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
