@@ -243,7 +243,7 @@ incomplete.
 | DROP TRIGGER                           | ❌     |         |
 | DROP VIEW                              | ❌     |         |
 | RENAME TABLE                           | ❌     |         |
-| TRUNCATE TABLE                         | ❌     |         |
+| TRUNCATE TABLE                         | 🚧     | Translated to an unfiltered `DELETE FROM tbl` (same empty-table result). `TRUNCATE`'s implicit commit, `AUTO_INCREMENT` reset, and zero affected-row count are not reproduced. |
 
 #### CREATE TABLE column attributes
 
@@ -528,7 +528,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement   | Status | Comment |
 |-------------|--------|---------|
-| DESCRIBE / DESC | ❌ |         |
+| DESCRIBE / DESC | ✅ | Synonym for `SHOW COLUMNS FROM tbl` (non-FULL form). The `DESCRIBE tbl col_name` column-filter form is not supported. |
 | EXPLAIN     | ❌     | MySQL `EXPLAIN` output format not produced. |
 | HELP        | ❌     |         |
 | USE         | ❌     | Maps conceptually to `COM_INIT_DB`; single-schema no-op. |

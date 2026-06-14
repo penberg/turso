@@ -95,12 +95,16 @@ impl Parser {
                 self.advance();
                 self.rollback_transaction()
             }
+            "TRUNCATE" => {
+                self.advance();
+                self.truncate_table()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "REPLACE" | "ALTER" | "TRUNCATE" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE"
-            | "DESC" | "EXPLAIN" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH"
-            | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK"
-            | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD"
-            | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(format!(
+            "REPLACE" | "ALTER" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC"
+            | "EXPLAIN" | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES"
+            | "TABLE" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE"
+            | "OPTIMIZE" | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER"
+            | "IMPORT" => Err(ParseError::Unsupported(format!(
                 "{keyword} is not supported yet"
             ))),
             other => Err(ParseError::Unsupported(format!(
@@ -1274,6 +1278,31 @@ impl Parser {
     /// Parses `DELETE FROM tbl [WHERE expr]`. Multi-table deletes,
     /// `DELETE ... USING`, `ORDER BY`/`LIMIT`, and the
     /// `LOW_PRIORITY`/`QUICK`/`IGNORE` modifiers are rejected as unsupported.
+    /// Parses `TRUNCATE [TABLE] tbl`. The engine has no `TRUNCATE`, so this is
+    /// translated to an unfiltered `DELETE FROM tbl`, which leaves the table
+    /// empty just like `TRUNCATE`. The behavioral differences — `TRUNCATE`'s
+    /// implicit commit, `AUTO_INCREMENT` reset, and zero reported affected-row
+    /// count — are not reproduced; see `mysql/COMPAT.md`. `TRUNCATE` has already
+    /// been consumed.
+    fn truncate_table(&mut self) -> Result<ast::Stmt> {
+        self.eat_keyword("TABLE");
+        let tbl_name = self.qualified_name()?;
+        if self.has_trailing_tokens() {
+            return Err(ParseError::Unsupported(
+                "TRUNCATE with trailing tokens is not supported yet".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Delete {
+            with: None,
+            tbl_name,
+            indexed: None,
+            where_clause: None,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        })
+    }
+
     fn delete(&mut self) -> Result<ast::Stmt> {
         // `DELETE` has already been consumed.
         if self.is_keyword("LOW_PRIORITY") || self.is_keyword("QUICK") || self.is_keyword("IGNORE")
@@ -3202,6 +3231,23 @@ mod tests {
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn truncate_lowers_to_delete_all() {
+        // TRUNCATE [TABLE] tbl becomes an unfiltered DELETE FROM tbl.
+        for sql in ["TRUNCATE TABLE users", "TRUNCATE users"] {
+            let ast::Stmt::Delete {
+                tbl_name,
+                where_clause,
+                ..
+            } = parse(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to Delete");
+            };
+            assert_eq!(tbl_name.name.as_str(), "users");
+            assert!(where_clause.is_none(), "TRUNCATE must delete all rows");
         }
     }
 

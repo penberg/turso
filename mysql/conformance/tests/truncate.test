@@ -1,0 +1,48 @@
+# TRUNCATE TABLE conformance.
+#
+# MySQL's TRUNCATE [TABLE] tbl empties a table. The engine has no TRUNCATE, so
+# the front-end translates it to an unfiltered DELETE FROM tbl, which leaves the
+# table empty just like TRUNCATE. The differences — TRUNCATE's implicit commit,
+# AUTO_INCREMENT reset, and zero reported affected-row count — are not modeled
+# (see mysql/COMPAT.md), so this file only asserts the observable empty-table
+# result, which matches on both targets.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS trunc_demo (a INT PRIMARY KEY, b TEXT)
+
+statement ok
+INSERT INTO trunc_demo (a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+query
+SELECT COUNT(*) FROM trunc_demo
+----
+3
+
+# TRUNCATE TABLE empties the table.
+statement ok
+TRUNCATE TABLE trunc_demo
+
+query
+SELECT COUNT(*) FROM trunc_demo
+----
+0
+
+# The table is still usable afterwards.
+statement ok
+INSERT INTO trunc_demo (a, b) VALUES (10, 'again')
+
+query
+SELECT a, b FROM trunc_demo
+----
+10	again
+
+# The TABLE keyword is optional in MySQL: TRUNCATE tbl works too.
+statement ok
+TRUNCATE trunc_demo
+
+query
+SELECT COUNT(*) FROM trunc_demo
+----
+0
