@@ -389,6 +389,22 @@ impl Parser {
             ));
         }
 
+        // `ADD [CONSTRAINT [symbol]] {PRIMARY KEY | UNIQUE | FOREIGN KEY | CHECK}`:
+        // consume the optional `CONSTRAINT` keyword and its symbol name (the engine
+        // names the index itself), then fall through to the `PRIMARY KEY`/`UNIQUE`
+        // index lowering below. `FOREIGN KEY` / `CHECK` are still rejected further
+        // down (no engine equivalent).
+        if self.eat_keyword("CONSTRAINT") {
+            let names_a_symbol = !matches!(self.peek(), Some(Token::Word(w))
+                if w.eq_ignore_ascii_case("PRIMARY")
+                    || w.eq_ignore_ascii_case("UNIQUE")
+                    || w.eq_ignore_ascii_case("FOREIGN")
+                    || w.eq_ignore_ascii_case("CHECK"));
+            if names_a_symbol {
+                let _ = self.name()?;
+            }
+        }
+
         // `ADD [UNIQUE] {KEY|INDEX} [name] (cols)` becomes a CREATE INDEX. The
         // `KEY`/`INDEX` keyword is optional only after `UNIQUE`.
         let unique = self.eat_keyword("UNIQUE");
@@ -7726,6 +7742,42 @@ mod tests {
                 panic!("expected an ADD COLUMN body for `{sql}`");
             };
             assert_eq!(col.col_name.as_str(), "c", "for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn alter_add_constraint_unique_and_primary_key() {
+        // `ADD CONSTRAINT [symbol] UNIQUE (cols)` lowers to a UNIQUE CREATE INDEX.
+        for sql in [
+            "ALTER TABLE t ADD CONSTRAINT uq UNIQUE (a)",
+            "ALTER TABLE t ADD CONSTRAINT UNIQUE (a)",
+            "ALTER TABLE t ADD CONSTRAINT uq UNIQUE KEY (a)",
+        ] {
+            let ast::Stmt::CreateIndex { unique, .. } = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to CREATE INDEX");
+            };
+            assert!(unique, "expected a UNIQUE index for `{sql}`");
+        }
+
+        // `ADD CONSTRAINT [symbol] PRIMARY KEY (cols)` lowers like ADD PRIMARY KEY.
+        let ast::Stmt::CreateIndex {
+            unique, idx_name, ..
+        } = parse("ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (id)").unwrap()
+        else {
+            panic!("expected a CREATE INDEX");
+        };
+        assert!(unique);
+        assert_eq!(idx_name.name.as_str(), "t_primary");
+
+        // FOREIGN KEY / CHECK constraints are still unsupported.
+        for sql in [
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u (id)",
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0)",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
         }
     }
 

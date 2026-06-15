@@ -1,0 +1,54 @@
+# ALTER TABLE ... ADD CONSTRAINT [symbol] {UNIQUE | PRIMARY KEY}.
+#
+# MySQL's named-constraint form `ADD CONSTRAINT [symbol] UNIQUE (cols)` /
+# `... PRIMARY KEY (cols)` was rejected ("ADD CONSTRAINT is not supported"). The
+# front-end now consumes the optional CONSTRAINT keyword and symbol name and
+# reuses the existing index lowering: UNIQUE becomes a CREATE UNIQUE INDEX, and
+# PRIMARY KEY is emulated by a unique index (the engine cannot add a real rowid
+# primary key in place). The symbol name is dropped (the engine names the index).
+#
+# The conformance test asserts the uniqueness the constraint enforces, which
+# matches both turso-mysql-server and a real mysqld. (FOREIGN KEY / CHECK
+# constraints remain unsupported and diverge from a real mysqld, so they are not
+# exercised here.) Uses its own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS adc (id INT NOT NULL, code INT, title VARCHAR(50))
+
+# Named UNIQUE constraint.
+statement ok
+ALTER TABLE adc ADD CONSTRAINT uq_title UNIQUE (title)
+
+# Unnamed CONSTRAINT (the symbol is optional).
+statement ok
+ALTER TABLE adc ADD CONSTRAINT UNIQUE (code)
+
+# Named PRIMARY KEY constraint.
+statement ok
+ALTER TABLE adc ADD CONSTRAINT pk_id PRIMARY KEY (id)
+
+statement ok
+INSERT INTO adc (id, code, title) VALUES (1, 10, 'a'), (2, 20, 'b')
+
+# The UNIQUE constraint on title is enforced.
+statement error
+INSERT INTO adc (id, code, title) VALUES (3, 30, 'a')
+
+# The UNIQUE constraint on code is enforced.
+statement error
+INSERT INTO adc (id, code, title) VALUES (4, 10, 'd')
+
+# The PRIMARY KEY constraint on id is enforced.
+statement error
+INSERT INTO adc (id, code, title) VALUES (1, 40, 'e')
+
+# A non-conflicting row still inserts.
+statement ok
+INSERT INTO adc (id, code, title) VALUES (5, 50, 'c')
+
+query
+SELECT id, code, title FROM adc ORDER BY id
+----
+1	10	a
+2	20	b
+5	50	c
