@@ -203,33 +203,42 @@ impl Parser {
     /// already been consumed.
     ///
     /// MySQL allows many operations in one `ALTER TABLE` (adding/dropping keys,
-    /// changing column types, ...), most of which the engine — like SQLite —
-    /// cannot do in place. Only a single `ADD COLUMN` is supported; index and
-    /// constraint adds (`ADD KEY`, `ADD PRIMARY KEY`, `ADD UNIQUE`, ...), the
-    /// `CHANGE`/`MODIFY`/`DROP` operations, and the comma-separated
-    /// multi-operation form are all rejected as unsupported.
+    /// changing column types, ...). Two forms are supported:
+    ///   - `ADD [COLUMN] <column-def>` → the engine's single-operation
+    ///     `ALTER TABLE ... ADD COLUMN`, and
+    ///   - `ADD [UNIQUE] {KEY|INDEX} [name] (cols)` → `CREATE [UNIQUE] INDEX`
+    ///     (see [`Self::alter_add_index`]).
+    /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`FULLTEXT`/`CONSTRAINT`,
+    /// the `CHANGE`/`MODIFY`/`DROP`/`RENAME` operations, and the comma-separated
+    /// multi-operation form — is rejected as unsupported.
     fn alter(&mut self) -> Result<ast::Stmt> {
         self.expect_keyword("TABLE")?;
         let name = self.qualified_name()?;
 
         if !self.eat_keyword("ADD") {
             return Err(ParseError::Unsupported(
-                "only ALTER TABLE ... ADD COLUMN is supported yet".to_string(),
+                "only ALTER TABLE ... ADD COLUMN / ADD KEY is supported yet".to_string(),
             ));
         }
-        // `COLUMN` is optional after `ADD`. An index/constraint add starts with
-        // one of these keywords instead and has no single-statement engine
+
+        // `ADD [UNIQUE] {KEY|INDEX} [name] (cols)` becomes a CREATE INDEX. The
+        // `KEY`/`INDEX` keyword is optional only after `UNIQUE`.
+        let unique = self.eat_keyword("UNIQUE");
+        if self.eat_keyword("KEY") || self.eat_keyword("INDEX") || unique {
+            return self.alter_add_index(name, unique);
+        }
+
+        // `COLUMN` is optional after `ADD`. Any other index/constraint add starts
+        // with one of these keywords and has no single-statement engine
         // equivalent.
         self.eat_keyword("COLUMN");
         for kw in [
-            "KEY",
-            "INDEX",
             "PRIMARY",
-            "UNIQUE",
             "CONSTRAINT",
             "FULLTEXT",
             "SPATIAL",
             "FOREIGN",
+            "CHECK",
         ] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
@@ -254,6 +263,49 @@ impl Parser {
             name,
             body: ast::AlterTableBody::AddColumn(column),
         }))
+    }
+
+    /// Lowers `ADD [UNIQUE] {KEY|INDEX} [name] (cols)` (the `KEY`/`INDEX` keyword
+    /// is already consumed) to `CREATE [UNIQUE] INDEX name ON tbl (cols)`. MySQL
+    /// index-column prefix lengths (`col(191)`) are dropped — the engine indexes
+    /// the whole column, which is still correct, just less selective. The engine
+    /// requires a name, so when MySQL would auto-generate one (no name given)
+    /// it is synthesized from the table and first column. Index names live in a
+    /// per-database namespace here (unlike MySQL's per-table one), so the same
+    /// index name on two tables would collide.
+    fn alter_add_index(&mut self, tbl: ast::QualifiedName, unique: bool) -> Result<ast::Stmt> {
+        // An optional index name precedes the column list; it is absent when the
+        // next token opens the column list or an index-type clause.
+        let explicit_name = if self.is(&Token::LParen) || self.is_keyword("USING") {
+            None
+        } else {
+            Some(self.name()?)
+        };
+        // Optional `USING {BTREE|HASH}` index type, which the engine ignores.
+        if self.eat_keyword("USING") {
+            let _ = self.name()?;
+        }
+
+        let columns = self.sorted_column_list()?;
+
+        let idx_name = explicit_name.unwrap_or_else(|| {
+            let first = match columns.first().map(|c| c.expr.as_ref()) {
+                Some(ast::Expr::Id(n)) => n.as_str(),
+                _ => "idx",
+            };
+            ast::Name::from_string(&format!("{}_{}", tbl.name.as_str(), first))
+        });
+
+        Ok(ast::Stmt::CreateIndex {
+            unique,
+            if_not_exists: false,
+            idx_name: ast::QualifiedName::single(idx_name),
+            tbl_name: tbl.name,
+            using: None,
+            columns,
+            with_clause: Vec::new(),
+            where_clause: None,
+        })
     }
 
     /// Resolves MySQL `AUTO_INCREMENT` onto the engine's rowid-alias
@@ -4018,15 +4070,50 @@ mod tests {
     }
 
     #[test]
+    fn alter_table_add_index_lowers_to_create_index() {
+        // ADD KEY / ADD INDEX / ADD UNIQUE KEY become CREATE [UNIQUE] INDEX;
+        // a prefix length is dropped and an omitted name is synthesized.
+        let cases = [
+            (
+                "ALTER TABLE t ADD KEY name_idx (name)",
+                false,
+                "name_idx",
+                1,
+            ),
+            ("ALTER TABLE t ADD INDEX (name)", false, "t_name", 1),
+            ("ALTER TABLE t ADD UNIQUE KEY u (code(10))", true, "u", 1),
+            (
+                "ALTER TABLE t ADD UNIQUE INDEX combo (a, b)",
+                true,
+                "combo",
+                2,
+            ),
+        ];
+        for (sql, want_unique, want_name, want_cols) in cases {
+            let ast::Stmt::CreateIndex {
+                unique,
+                idx_name,
+                tbl_name,
+                columns,
+                ..
+            } = parse(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to CREATE INDEX");
+            };
+            assert_eq!(unique, want_unique, "{sql}");
+            assert_eq!(idx_name.name.as_str(), want_name, "{sql}");
+            assert_eq!(tbl_name.as_str(), "t", "{sql}");
+            assert_eq!(columns.len(), want_cols, "{sql}");
+        }
+    }
+
+    #[test]
     fn alter_table_unsupported_variants() {
-        // Index/constraint adds, column changes, drops, and the multi-operation
-        // comma form are all rejected (a real mysqld accepts them, but the
-        // engine has no in-place equivalent).
+        // Primary/foreign-key and other constraint adds, column changes, drops,
+        // and the multi-operation comma form are all rejected (a real mysqld
+        // accepts them, but the engine has no in-place equivalent).
         for sql in [
-            "ALTER TABLE t ADD KEY idx (c)",
-            "ALTER TABLE t ADD INDEX idx (c)",
             "ALTER TABLE t ADD PRIMARY KEY (id)",
-            "ALTER TABLE t ADD UNIQUE KEY u (c)",
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
             "ALTER TABLE t ADD FULLTEXT KEY ft (c)",
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",

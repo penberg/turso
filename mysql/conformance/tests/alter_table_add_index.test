@@ -1,0 +1,69 @@
+# ALTER TABLE ... ADD [UNIQUE] {KEY|INDEX} conformance.
+#
+# MySQL's ALTER TABLE ... ADD KEY / ADD INDEX / ADD UNIQUE KEY adds a secondary
+# index to an existing table. The front-end lowers it to the engine's
+# CREATE [UNIQUE] INDEX. Column prefix lengths (col(191)) are dropped — the
+# engine indexes the whole column — and an omitted index name is synthesized.
+# WordPress's dbDelta() adds keys this way.
+#
+# Scope: ADD PRIMARY KEY / FOREIGN KEY / FULLTEXT / CONSTRAINT and the
+# multi-operation form are rejected by the front-end and covered by a parser
+# unit test, not here, because a real mysqld accepts them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS idx_demo (id INT PRIMARY KEY, name VARCHAR(20), code VARCHAR(20))
+
+statement ok
+INSERT INTO idx_demo (id, name, code) VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')
+
+# A non-unique secondary key is transparent to queries.
+statement ok
+ALTER TABLE idx_demo ADD KEY name_idx (name)
+
+query
+SELECT id FROM idx_demo WHERE name = 'b'
+----
+2
+
+# A unique key with a prefix length: the length is dropped, uniqueness enforced.
+statement ok
+ALTER TABLE idx_demo ADD UNIQUE KEY code_uniq (code(10))
+
+# Inserting a duplicate value for the unique column now fails.
+statement error
+INSERT INTO idx_demo (id, name, code) VALUES (4, 'd', 'x')
+
+# A non-conflicting row still inserts.
+statement ok
+INSERT INTO idx_demo (id, name, code) VALUES (4, 'd', 'w')
+
+query
+SELECT id, code FROM idx_demo ORDER BY id
+----
+1	x
+2	y
+3	z
+4	w
+
+# INDEX is a synonym for KEY, and the index name may be omitted.
+statement ok
+ALTER TABLE idx_demo ADD INDEX (name)
+
+# A compound unique key enforces uniqueness over the column pair.
+statement ok
+ALTER TABLE idx_demo ADD UNIQUE KEY name_code (name, code)
+
+statement error
+INSERT INTO idx_demo (id, name, code) VALUES (5, 'a', 'x')
+
+statement ok
+INSERT INTO idx_demo (id, name, code) VALUES (5, 'a', 'q')
+
+query
+SELECT id FROM idx_demo WHERE name = 'a' ORDER BY id
+----
+1
+5
