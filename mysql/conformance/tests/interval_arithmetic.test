@@ -1,0 +1,56 @@
+# `date ± INTERVAL n unit` arithmetic conformance.
+#
+# MySQL's `expr + INTERVAL n unit` / `expr - INTERVAL n unit` is the operator
+# form of DATE_ADD / DATE_SUB, common in WordPress cron / transient queries
+# (e.g. `WHERE date < NOW() - INTERVAL 30 DAY`). The front-end lowers it to the
+# same engine datetime() modifier, sharing the DATE_ADD code: the amount may be
+# a number or a quoted numeric string, and WEEK is expanded to days.
+#
+# Operands are DATETIME values so the result is the engine's
+# 'YYYY-MM-DD HH:MM:SS'; on a bare DATE value MySQL would drop the time (the
+# same divergence noted for DATE_ADD), so those are exercised only in the
+# outcome-stable WHERE predicate below.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS iv_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO iv_demo (a, d) VALUES (1, '2000-06-01 12:00:00'), (2, '2099-06-01 12:00:00')
+
+# Add and subtract days.
+query
+SELECT '2020-01-01 10:20:30' + INTERVAL 5 DAY, '2020-01-01 10:20:30' - INTERVAL 1 DAY
+----
+2020-01-06 10:20:30	2019-12-31 10:20:30
+
+# Adding minutes can carry into the next day.
+query
+SELECT '2020-01-01 23:00:00' + INTERVAL 90 MINUTE
+----
+2020-01-02 00:30:00
+
+# A WEEK interval is seven days.
+query
+SELECT '2020-03-15 00:00:00' + INTERVAL 1 WEEK
+----
+2020-03-22 00:00:00
+
+# The amount may be a quoted numeric string, like DATE_ADD accepts.
+query
+SELECT '2020-01-01 00:00:00' - INTERVAL '5' DAY
+----
+2019-12-27 00:00:00
+
+# NULL propagates.
+query
+SELECT NULL + INTERVAL 1 DAY
+----
+NULL
+
+# In a WHERE predicate against a column: rows before a cutoff 30 days back.
+query
+SELECT a FROM iv_demo WHERE d < '2020-06-15 00:00:00' - INTERVAL 30 DAY ORDER BY a
+----
+1

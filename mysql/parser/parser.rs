@@ -2081,6 +2081,13 @@ impl Parser {
                 _ => break,
             };
             self.advance();
+            // `date ± INTERVAL n unit` is date arithmetic, the operator form of
+            // DATE_ADD/DATE_SUB; lower it to the same `datetime()` modifier.
+            if self.is_keyword("INTERVAL") {
+                self.advance();
+                lhs = self.apply_interval(lhs, op == ast::Operator::Subtract)?;
+                continue;
+            }
             let rhs = self.multiplicative_expr()?;
             lhs = ast::Expr::binary(lhs, op, rhs);
         }
@@ -3105,7 +3112,19 @@ impl Parser {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
         self.expect_keyword("INTERVAL")?;
+        let result = self.apply_interval(target, subtract)?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(result)
+    }
 
+    /// Parses an interval `[-]value unit` (the `INTERVAL` keyword already
+    /// consumed) and lowers `target ± interval` to the engine's
+    /// `datetime(target, '<signed-amount> <engine-unit>')` modifier. Shared by
+    /// `DATE_ADD`/`DATE_SUB` and the `+`/`-` `INTERVAL` arithmetic operators;
+    /// `subtract` is true for `DATE_SUB` and the `-` operator. The value may be a
+    /// number or a quoted numeric string (which MySQL coerces); `WEEK` is
+    /// expanded to days, and other units are rejected.
+    fn apply_interval(&mut self, target: ast::Expr, subtract: bool) -> Result<ast::Expr> {
         let negative = self.eat(&Token::Minus);
         // MySQL takes the interval amount either as a number or as a quoted
         // numeric string and coerces the string to an integer; accept both.
@@ -3114,9 +3133,7 @@ impl Parser {
             _ => return Err(self.unexpected("an integer interval value")),
         };
         let value: i64 = raw.trim().parse().map_err(|_| {
-            ParseError::Unsupported(
-                "DATE_ADD / DATE_SUB INTERVAL value must be an integer literal".to_string(),
-            )
+            ParseError::Unsupported("INTERVAL value must be an integer literal".to_string())
         })?;
         self.advance();
 
@@ -3125,7 +3142,6 @@ impl Parser {
         };
         let unit = u.to_ascii_uppercase();
         self.advance();
-        self.expect(&Token::RParen, "`)`")?;
 
         // Map the MySQL unit onto the engine's modifier unit; `WEEK` has no
         // engine modifier and is expanded to days.
@@ -3139,7 +3155,7 @@ impl Parser {
             "SECOND" => ("seconds", 1),
             other => {
                 return Err(ParseError::Unsupported(format!(
-                    "DATE_ADD / DATE_SUB with INTERVAL unit {other} is not supported yet"
+                    "INTERVAL unit {other} is not supported yet"
                 )))
             }
         };
@@ -5282,6 +5298,10 @@ mod tests {
             // emits `INTERVAL '30' SECOND`).
             ("DATE_ADD(d, INTERVAL '30' SECOND)", "'+30 seconds'"),
             ("DATE_SUB(d, INTERVAL '5' DAY)", "'-5 days'"),
+            // The `+`/`-` INTERVAL operators share the same lowering.
+            ("d + INTERVAL 5 DAY", "'+5 days'"),
+            ("d - INTERVAL 1 DAY", "'-1 days'"),
+            ("d - INTERVAL 3 HOUR", "'-3 hours'"),
         ];
         for (sql, modifier) in cases {
             let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
