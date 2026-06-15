@@ -1,0 +1,49 @@
+# The `/` division operator (MySQL float division).
+#
+# MySQL's `/` always divides as floats -- `5 / 2` is `2.5`, not `2` -- whereas
+# the engine truncates two integer operands. The front-end lowers `a / b` to
+# `CAST(a AS REAL) / b`, forcing float division to match MySQL. Division by zero
+# yields NULL (default sql_mode).
+#
+# Results are asserted via comparisons: the engine renders the quotient as a
+# plain double where MySQL prints a fixed-scale DECIMAL (`5 / 2` -> `2.5` vs
+# `2.5000`), and a non-terminating quotient like `10 / 3` keeps more digits than
+# MySQL's default 4-decimal scale -- so this test sticks to terminating values,
+# where the numbers are equal on both targets (see mysql/COMPAT.md). Passes
+# against both turso-mysql-server and a real mysqld. Uses its own table name.
+
+# Integer operands divide as floats, not truncated.
+query
+SELECT 5 / 2 = 2.5, 9 / 2 = 4.5, 7 / 4 = 1.75, 10 / 2 = 5, 4 / 2 = 2
+----
+1	1	1	1	1
+
+# Float operands, and composition with the other multiplicative operators
+# (same precedence, left-associative).
+query
+SELECT 5.5 / 2 = 2.75, 1 + 10 / 4 = 3.5, 10 / 2 * 3 = 15, 10 / 4 % 3 = 2.5
+----
+1	1	1	1
+
+# Division by zero and NULL operands yield NULL.
+query
+SELECT 5 / 0 IS NULL, NULL / 2 IS NULL, 2 / NULL IS NULL
+----
+1	1	1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS divop (id INT PRIMARY KEY, c INT)
+
+statement ok
+INSERT INTO divop (id, c) VALUES (1, 10), (2, 7), (3, 3)
+
+query
+SELECT id FROM divop WHERE c / 2 = 3.5
+----
+2
+
+query
+SELECT id FROM divop WHERE c / 4 > 2 ORDER BY id
+----
+1

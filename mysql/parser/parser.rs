@@ -2689,10 +2689,13 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// Multiplicative tier: `*`, the modulo operators `%` and `MOD`, and the
-    /// integer-division keyword `DIV`. The symbolic `/` is intentionally not
-    /// parsed — MySQL's `/` is float division while the engine's truncates two
-    /// integers — but `DIV`/`MOD`/`%` have a well-defined mapping:
+    /// Multiplicative tier: `*`, the float division `/`, the modulo operators `%`
+    /// and `MOD`, and the integer-division keyword `DIV`. The symbolic operators
+    /// are lowered to match MySQL's semantics, which differ from the engine's for
+    /// integer operands:
+    ///   - `a / b` → `CAST(a AS REAL) / b`: float division (`5 / 2` is `2.5`, not
+    ///     `2`), since MySQL's `/` always returns a fractional result (see
+    ///     [`float_division`]).
     ///   - `a DIV b` → `CAST(a / b AS INTEGER)`: the quotient truncated toward
     ///     zero, regardless of whether the engine divides as integer or float.
     ///   - `a MOD b` / `a % b` → `a - b * CAST(a / b AS INTEGER)`: the remainder,
@@ -2706,6 +2709,9 @@ impl Parser {
                 self.advance();
                 let rhs = self.collate_expr()?;
                 lhs = ast::Expr::binary(lhs, ast::Operator::Multiply, rhs);
+            } else if self.eat(&Token::Other('/')) {
+                let rhs = self.collate_expr()?;
+                lhs = float_division(lhs, rhs);
             } else if self.eat_keyword("DIV") {
                 let rhs = self.collate_expr()?;
                 lhs = integer_division(lhs, rhs);
@@ -5398,6 +5404,24 @@ fn modulo(a: ast::Expr, b: ast::Expr) -> ast::Expr {
     let quotient = integer_division(a.clone(), b.clone());
     let product = ast::Expr::binary(b, ast::Operator::Multiply, quotient);
     ast::Expr::binary(a, ast::Operator::Subtract, product)
+}
+
+/// Lowers MySQL's `a / b`, which is always float division (`5 / 2` is `2.5`, not
+/// `2`), by forcing the dividend to `REAL` so the engine divides as floats
+/// rather than truncating two integers. Division by zero yields NULL, as in
+/// MySQL. (The engine carries full double precision, so a non-terminating
+/// quotient like `10 / 3` keeps more digits than MySQL's DECIMAL scale — a
+/// documented edge in `mysql/COMPAT.md`.)
+fn float_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
+    let a_real = ast::Expr::Cast {
+        expr: Box::new(a),
+        type_name: Some(ast::Type {
+            name: "REAL".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    ast::Expr::binary(a_real, ast::Operator::Divide, b)
 }
 
 fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
@@ -8972,6 +8996,16 @@ mod tests {
             parse_expr("2 + a % b").unwrap(),
             parse_expr("2 + a MOD b").unwrap()
         );
+
+        // `a / b` is MySQL float division: `CAST(a AS REAL) / b`.
+        let ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) = parse_expr("a / b").unwrap() else {
+            panic!("expected `/` to lower to a division");
+        };
+        let ast::Expr::Cast { type_name, .. } = lhs.as_ref() else {
+            panic!("expected the dividend cast to REAL");
+        };
+        assert_eq!(type_name.as_ref().unwrap().name, "REAL");
+        assert_eq!(*rhs, col("b"));
     }
 
     #[test]
@@ -9150,14 +9184,12 @@ mod tests {
 
     #[test]
     fn expr_unsupported_forms_are_not_fully_parsed() {
-        // The divergent operators `/` (MySQL float division) and `||` (MySQL
-        // logical OR) are intentionally not parsed. (`%` is supported — it lowers
-        // like `MOD`.)
-        for input in ["a / b", "a || b"] {
-            let mut p = Parser::new(input.as_bytes()).unwrap();
-            let fully_parsed = p.expr().is_ok() && p.peek().is_none();
-            assert!(!fully_parsed, "expected `{input}` to be rejected");
-        }
+        // `||` (MySQL logical OR, not string concatenation) is intentionally not
+        // parsed. (`/` and `%` are supported — they lower to float division and
+        // the `MOD` remainder.)
+        let mut p = Parser::new(b"a || b").unwrap();
+        let fully_parsed = p.expr().is_ok() && p.peek().is_none();
+        assert!(!fully_parsed, "expected `a || b` to be rejected");
     }
 
     #[test]
