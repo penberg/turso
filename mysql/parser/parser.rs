@@ -2373,6 +2373,12 @@ impl Parser {
             return self.field_call();
         }
 
+        // `GROUP_CONCAT(expr [SEPARATOR 's'])` maps to the engine's
+        // `group_concat(expr[, 's'])`, which uses the same default `,` separator.
+        if upper == "GROUP_CONCAT" {
+            return self.group_concat_call();
+        }
+
         // `RAND()` lowers to a random float in `[0, 1)` built from the engine's
         // `random()`. A seed argument is accepted but not honored.
         if upper == "RAND" {
@@ -2588,6 +2594,49 @@ impl Parser {
             else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                 "0".to_string(),
             )))),
+        })
+    }
+
+    /// Parses a `GROUP_CONCAT(expr [SEPARATOR 's'])` call (the name and `(` are
+    /// already consumed) and lowers it to the engine's `group_concat(expr[, 's'])`.
+    /// MySQL's default separator is `,`, which is also the engine's default, so a
+    /// bare `GROUP_CONCAT(expr)` becomes `group_concat(expr)`. Like MySQL — and
+    /// the engine — the concatenation order is unspecified without an `ORDER BY`;
+    /// that inner `ORDER BY`, the `DISTINCT` quantifier, and the multi-expression
+    /// form are not modeled and are rejected.
+    fn group_concat_call(&mut self) -> Result<ast::Expr> {
+        if self.eat_keyword("DISTINCT") {
+            return Err(ParseError::Unsupported(
+                "GROUP_CONCAT(DISTINCT ...) is not supported yet".to_string(),
+            ));
+        }
+        self.eat_keyword("ALL");
+        let expr = self.expr()?;
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "GROUP_CONCAT with multiple expressions is not supported yet".to_string(),
+            ));
+        }
+        if self.is_keyword("ORDER") {
+            return Err(ParseError::Unsupported(
+                "GROUP_CONCAT(... ORDER BY ...) is not supported yet".to_string(),
+            ));
+        }
+        let mut args = vec![Box::new(expr)];
+        if self.eat_keyword("SEPARATOR") {
+            args.push(Box::new(self.expr()?));
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("group_concat"),
+            distinctness: None,
+            args,
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         })
     }
 
@@ -5141,6 +5190,40 @@ mod tests {
             ),
             "expected the start argument to be `0 - len`"
         );
+    }
+
+    #[test]
+    fn group_concat_lowers_to_engine_group_concat() {
+        // GROUP_CONCAT(v) -> group_concat(v); the SEPARATOR becomes a 2nd arg.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("GROUP_CONCAT(v)").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "group_concat");
+        assert_eq!(args.len(), 1);
+
+        let ast::Expr::FunctionCall { args, .. } =
+            parse_expr("GROUP_CONCAT(v SEPARATOR '-')").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            args[1].as_ref(),
+            ast::Expr::Literal(ast::Literal::String(s)) if s == "'-'"
+        ));
+
+        // DISTINCT, an inner ORDER BY, and multiple expressions are rejected.
+        for sql in [
+            "GROUP_CONCAT(DISTINCT v)",
+            "GROUP_CONCAT(v ORDER BY v)",
+            "GROUP_CONCAT(a, b)",
+        ] {
+            assert!(
+                parse_expr(sql).is_err(),
+                "expected `{sql}` to be unsupported"
+            );
+        }
     }
 
     #[test]

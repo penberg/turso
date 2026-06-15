@@ -1,0 +1,47 @@
+# GROUP_CONCAT conformance.
+#
+# MySQL's GROUP_CONCAT(expr [SEPARATOR 's']) concatenates a group's values. The
+# front-end lowers it to the engine's group_concat(expr[, 's']); MySQL's default
+# separator is ',', which is also the engine's default. WordPress uses
+# GROUP_CONCAT in taxonomy / meta roll-ups.
+#
+# Without an inner ORDER BY the concatenation order is unspecified in both MySQL
+# and the engine; in practice both follow the group's scan order, which for this
+# small primary-key table is the insertion order. The inner ORDER BY, DISTINCT,
+# and multi-expression forms are rejected by the front-end (covered by a parser
+# unit test, not here, because a real mysqld accepts them).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS gc_demo (id INT PRIMARY KEY, grp INT, v VARCHAR(10))
+
+statement ok
+INSERT INTO gc_demo (id, grp, v) VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c'), (4, 1, 'd')
+
+# Default separator is a comma; values concatenate in scan (insertion) order.
+query
+SELECT grp, GROUP_CONCAT(v) FROM gc_demo GROUP BY grp ORDER BY grp
+----
+1	a,b,d
+2	c
+
+# An explicit SEPARATOR replaces the comma.
+query
+SELECT grp, GROUP_CONCAT(v SEPARATOR '-') FROM gc_demo GROUP BY grp ORDER BY grp
+----
+1	a-b-d
+2	c
+
+# An empty separator concatenates with nothing between values.
+query
+SELECT GROUP_CONCAT(v SEPARATOR '') FROM gc_demo WHERE grp = 1
+----
+abd
+
+# Over the whole table (one implicit group).
+query
+SELECT GROUP_CONCAT(v) FROM gc_demo
+----
+a,b,c,d
