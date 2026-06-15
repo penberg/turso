@@ -4761,6 +4761,79 @@ fn name_from_date(fmt: &str, names: &[&str], start: i64, arg: ast::Expr) -> ast:
     }
 }
 
+/// Builds the `AM`/`PM` meridiem of `target`'s hour, for `DATE_FORMAT`'s `%p`:
+/// `CASE WHEN h < 12 THEN 'AM' WHEN h >= 12 THEN 'PM' END` where `h` is the
+/// 24-hour `CAST(strftime('%H', target) AS INTEGER)`. The `CASE` has no `ELSE`,
+/// so a NULL hour matches neither arm and yields NULL.
+fn meridiem_expr(target: ast::Expr) -> ast::Expr {
+    let hour = cast_strftime_int("%H", target);
+    let twelve = || ast::Expr::Literal(ast::Literal::Numeric("12".to_string()));
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (
+                Box::new(ast::Expr::binary(
+                    hour.clone(),
+                    ast::Operator::Less,
+                    twelve(),
+                )),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("AM")))),
+            ),
+            (
+                Box::new(ast::Expr::binary(
+                    hour,
+                    ast::Operator::GreaterEquals,
+                    twelve(),
+                )),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("PM")))),
+            ),
+        ],
+        else_expr: None,
+    }
+}
+
+/// Builds the 12-hour clock value of `target`'s hour, for `DATE_FORMAT`'s `%l`
+/// (no leading zero) / `%h` and `%I` (`padded`, two digits). The 24-hour `h` is
+/// mapped to 1-12 by `CASE WHEN h % 12 = 0 THEN 12 ELSE h % 12 END` (so 0→12,
+/// 13→1); when `padded`, `substr('0' || value, -2)` left-pads it to two digits.
+/// A NULL hour propagates (the `CASE` is NULL, and concatenating/`substr`-ing a
+/// NULL stays NULL).
+fn hour12_expr(target: ast::Expr, padded: bool) -> ast::Expr {
+    let hour = cast_strftime_int("%H", target);
+    let modulo12 = modulo(
+        hour,
+        ast::Expr::Literal(ast::Literal::Numeric("12".to_string())),
+    );
+    let value = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(ast::Expr::binary(
+                modulo12.clone(),
+                ast::Operator::Equals,
+                ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+            )),
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("12".to_string()))),
+        )],
+        else_expr: Some(Box::new(modulo12)),
+    };
+    if !padded {
+        return value;
+    }
+    // Two-digit pad: the last two characters of `'0' || value`.
+    let with_lead = ast::Expr::binary(
+        ast::Expr::Literal(ast::Literal::String(requote("0"))),
+        ast::Operator::Concat,
+        value,
+    );
+    call_fn(
+        "substr",
+        vec![
+            with_lead,
+            ast::Expr::Literal(ast::Literal::Numeric("-2".to_string())),
+        ],
+    )
+}
+
 /// Builds `CAST(strftime(fmt, arg) AS INTEGER)`, the lowering shared by the
 /// MySQL date-part extractor functions (`YEAR`, `MONTH`, …) and `EXTRACT`. The
 /// integer cast strips strftime's zero-padding to match MySQL's numeric result.
@@ -4954,6 +5027,8 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Fmt(String),
         Name(&'static str, &'static [&'static str], i64),
         Int(&'static str),
+        Meridiem,
+        Hour12 { padded: bool },
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut run = String::new();
@@ -5022,6 +5097,20 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
                 flush(&mut run, &mut pieces);
                 pieces.push(Piece::Int("%H"));
             }
+            // 12-hour clock and meridiem. `%p` is AM/PM; `%l` is the 12-hour hour
+            // without a leading zero; `%h`/`%I` are the two-digit padded form.
+            Some('p') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Meridiem);
+            }
+            Some('l') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Hour12 { padded: false });
+            }
+            Some('h') | Some('I') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Hour12 { padded: true });
+            }
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
                     "DATE_FORMAT specifier %{other} is not supported yet"
@@ -5040,6 +5129,8 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Piece::Fmt(fmt) => strftime_text(&fmt, target.clone()),
         Piece::Name(fmt, names, start) => name_from_date(fmt, names, start, target.clone()),
         Piece::Int(fmt) => cast_strftime_int(fmt, target.clone()),
+        Piece::Meridiem => meridiem_expr(target.clone()),
+        Piece::Hour12 { padded } => hour12_expr(target.clone(), padded),
     });
     // An empty format renders strftime('', target) — the empty string for a
     // valid target, NULL for a NULL one, matching MySQL.
@@ -6713,12 +6804,27 @@ mod tests {
             parse_expr("DATE_FORMAT(d, '%e')").unwrap(),
             ast::Expr::Cast { .. }
         ));
-        // Specifiers with neither a strftime form nor a name lowering are still
-        // rejected (12-hour `%h`, AM/PM `%p`, day-with-suffix `%D`).
+        // `%p` (AM/PM) and `%l` (12-hour) lower to a CASE; `%h` (padded 12-hour)
+        // wraps that in a `substr` for the two-digit pad.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%p')").unwrap(),
+            ast::Expr::Case { .. }
+        ));
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%l')").unwrap(),
+            ast::Expr::Case { .. }
+        ));
+        let ast::Expr::FunctionCall { name, .. } = parse_expr("DATE_FORMAT(d, '%h')").unwrap()
+        else {
+            panic!("expected %h to lower to a substr() call");
+        };
+        assert_eq!(name.as_str(), "substr");
+        // Specifiers still without a lowering are rejected (day-with-suffix `%D`,
+        // 12-hour time `%r`, microseconds `%f`).
         for fmt in [
-            "DATE_FORMAT(d, '%h')",
-            "DATE_FORMAT(d, '%p')",
             "DATE_FORMAT(d, '%D')",
+            "DATE_FORMAT(d, '%r')",
+            "DATE_FORMAT(d, '%f')",
         ] {
             assert!(matches!(
                 parse_expr(fmt).unwrap_err(),

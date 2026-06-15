@@ -6,10 +6,11 @@
 # number), %U (Sunday-first week), %v (ISO week -> %V), %T (-> %H:%M:%S), %% --
 # and expands the name specifiers (%M month name, %b abbreviated month, %W
 # weekday name, %a abbreviated weekday) to CASE lookups, and the no-leading-zero
-# numeric specifiers (%e day, %c month, %k hour) to integer casts, concatenating
-# the pieces. Literal characters pass through. The format must be a string
-# literal; specifiers without any of these forms (e.g. %h 12-hour, %p AM/PM,
-# %D day-with-suffix) are rejected. See mysql/COMPAT.md.
+# numeric specifiers (%e day, %c month, %k hour) to integer casts, the 12-hour
+# clock (%l no-pad, %h/%I padded) and meridiem (%p) to CASE expressions,
+# concatenating the pieces. Literal characters pass through. The format must be a
+# string literal; specifiers without any of these forms (e.g. %D day-with-suffix,
+# %r 12-hour time, %f microseconds) are rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -128,3 +129,28 @@ query
 SELECT DATE_FORMAT('2020-12-25 23:08:00', '%c/%e %k:%i')
 ----
 12/25 23:08
+
+# 12-hour clock with AM/PM (the common WordPress 'g:i a' time format): midnight
+# is 12 AM, 13:05 is 1:05 PM, 23:30 is 11:30 PM.
+query
+SELECT DATE_FORMAT('2020-03-15 00:05:00', '%l:%i %p'), DATE_FORMAT('2020-03-15 13:05:00', '%l:%i %p'), DATE_FORMAT('2020-03-15 23:30:00', '%l:%i %p')
+----
+12:05 AM	1:05 PM	11:30 PM
+
+# %h / %I are the two-digit padded 12-hour hour (0->12, 9->09, 13->01).
+query
+SELECT DATE_FORMAT('2020-03-15 00:00:00', '%h'), DATE_FORMAT('2020-03-15 09:00:00', '%h'), DATE_FORMAT('2020-03-15 13:00:00', '%I')
+----
+12	09	01
+
+# %p alone, at noon (PM) and just before (AM).
+query
+SELECT DATE_FORMAT('2020-03-15 12:00:00', '%p'), DATE_FORMAT('2020-03-15 11:59:59', '%p')
+----
+PM	AM
+
+# NULL propagates through the 12-hour and meridiem lowerings.
+query
+SELECT DATE_FORMAT(NULL, '%l'), DATE_FORMAT(NULL, '%h'), DATE_FORMAT(NULL, '%p')
+----
+NULL	NULL	NULL
