@@ -7,9 +7,11 @@
 #
 # Without an inner ORDER BY the concatenation order is unspecified in both MySQL
 # and the engine; in practice both follow the group's scan order, which for this
-# small primary-key table is the insertion order. The inner ORDER BY, DISTINCT,
-# and multi-expression forms are rejected by the front-end (covered by a parser
-# unit test, not here, because a real mysqld accepts them).
+# small primary-key table is the insertion order. DISTINCT concatenates only the
+# distinct values (in first-occurrence scan order on both). The inner ORDER BY,
+# the multi-expression form, and DISTINCT combined with a custom SEPARATOR are
+# rejected by the front-end (covered by a parser unit test, not here, because a
+# real mysqld accepts them).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name and ORDER BY-deterministic queries.
@@ -45,3 +47,30 @@ query
 SELECT GROUP_CONCAT(v) FROM gc_demo
 ----
 a,b,c,d
+
+# DISTINCT keeps only the distinct values, in first-occurrence scan order. The
+# table below has duplicates within each group.
+statement ok
+CREATE TABLE IF NOT EXISTS gcd_demo (id INT PRIMARY KEY, grp INT, v VARCHAR(10))
+
+statement ok
+INSERT INTO gcd_demo (id, grp, v) VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 1, 'a'), (4, 2, 'c'), (5, 2, 'c'), (6, 1, 'b')
+
+# Per group, duplicates collapse.
+query
+SELECT grp, GROUP_CONCAT(DISTINCT v) FROM gcd_demo GROUP BY grp ORDER BY grp
+----
+1	a,b
+2	c
+
+# Over the whole table, each value appears once.
+query
+SELECT GROUP_CONCAT(DISTINCT v) FROM gcd_demo
+----
+a,b,c
+
+# Without DISTINCT every row contributes (for contrast).
+query
+SELECT GROUP_CONCAT(v) FROM gcd_demo WHERE grp = 1
+----
+a,b,a,b
