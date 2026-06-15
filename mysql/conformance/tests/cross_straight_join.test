@@ -1,0 +1,45 @@
+# CROSS JOIN / STRAIGHT_JOIN conformance.
+#
+# A CROSS JOIN is the Cartesian product of two tables (the explicit form of the
+# comma join), and takes no ON condition. STRAIGHT_JOIN is an INNER JOIN that
+# forces left-to-right table order; the engine has no such optimizer hint, so it
+# lowers to a plain INNER JOIN, which produces an identical result set. The
+# engine evaluates both, so the front-end just parses them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS csj_a (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS csj_b (id INT PRIMARY KEY, w INT)
+
+statement ok
+INSERT INTO csj_a (id, v) VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO csj_b (id, w) VALUES (5, 50), (6, 60)
+
+# CROSS JOIN pairs every left row with every right row.
+query
+SELECT csj_a.id, csj_b.id FROM csj_a CROSS JOIN csj_b ORDER BY csj_a.id, csj_b.id
+----
+1	5
+1	6
+2	5
+2	6
+
+# A WHERE filter on a CROSS JOIN behaves like the comma join's join condition.
+query
+SELECT csj_a.id, csj_b.w FROM csj_a CROSS JOIN csj_b WHERE csj_a.id = csj_b.id - 4 ORDER BY csj_a.id
+----
+1	50
+2	60
+
+# STRAIGHT_JOIN is an INNER JOIN (the hint is ignored).
+query
+SELECT csj_a.id, csj_b.w FROM csj_a STRAIGHT_JOIN csj_b ON csj_a.id = csj_b.id - 4 ORDER BY csj_a.id
+----
+1	50
+2	60

@@ -1409,6 +1409,12 @@ impl Parser {
                 }
                 self.expect(&Token::RParen, "`)`")?;
                 Some(ast::JoinConstraint::Using(cols))
+            } else if matches!(
+                operator,
+                ast::JoinOperator::TypedJoin(Some(t)) if t.contains(ast::JoinType::CROSS)
+            ) {
+                // A `CROSS JOIN` is a Cartesian product and takes no condition.
+                None
             } else {
                 return Err(ParseError::Unsupported(
                     "JOIN without an ON condition is not supported yet".to_string(),
@@ -1489,12 +1495,26 @@ impl Parser {
                 ast::JoinType::RIGHT | ast::JoinType::OUTER,
             ))));
         }
+        if self.eat_keyword("CROSS") {
+            self.expect_keyword("JOIN")?;
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::INNER | ast::JoinType::CROSS,
+            ))));
+        }
+        // `STRAIGHT_JOIN` is an `INNER JOIN` that forces left-to-right table
+        // order; the engine has no such hint, so it lowers to a plain INNER join
+        // (an identical result set).
+        if self.eat_keyword("STRAIGHT_JOIN") {
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::INNER,
+            ))));
+        }
         if self.eat_keyword("JOIN") {
             return Ok(Some(ast::JoinOperator::TypedJoin(Some(
                 ast::JoinType::INNER,
             ))));
         }
-        for kw in ["FULL", "CROSS", "NATURAL", "STRAIGHT_JOIN"] {
+        for kw in ["FULL", "NATURAL"] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
                     "{kw} join is not supported yet"
@@ -4504,8 +4524,8 @@ mod tests {
     fn select_unsupported_variants() {
         for sql in [
             "SELECT DISTINCTROW a FROM t",
-            "SELECT * FROM a CROSS JOIN b",
             "SELECT * FROM a FULL JOIN b ON a.id = b.id",
+            "SELECT * FROM a NATURAL JOIN b",
             "SELECT * FROM a JOIN b",
             "SELECT * FROM (SELECT 1)",
             "SELECT a FROM t GROUP BY 1",
@@ -4536,6 +4556,42 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].as_str(), "id");
         assert_eq!(cols[1].as_str(), "ref");
+    }
+
+    #[test]
+    fn cross_and_straight_join_parse() {
+        // CROSS JOIN takes no constraint and carries the CROSS flag.
+        let ast::Stmt::Select(select) = parse("SELECT * FROM a CROSS JOIN b").unwrap() else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            panic!("expected a FROM clause");
+        };
+        let ast::JoinOperator::TypedJoin(Some(t)) = from.joins[0].operator else {
+            panic!("expected a typed join");
+        };
+        assert!(t.contains(ast::JoinType::CROSS));
+        assert!(from.joins[0].constraint.is_none());
+
+        // STRAIGHT_JOIN lowers to a plain INNER join (the hint is dropped).
+        let ast::Stmt::Select(select) =
+            parse("SELECT * FROM a STRAIGHT_JOIN b ON a.id = b.id").unwrap()
+        else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            panic!("expected a FROM clause");
+        };
+        let ast::JoinOperator::TypedJoin(Some(t)) = from.joins[0].operator else {
+            panic!("expected a typed join");
+        };
+        assert!(t.contains(ast::JoinType::INNER) && !t.contains(ast::JoinType::CROSS));
     }
 
     #[test]
