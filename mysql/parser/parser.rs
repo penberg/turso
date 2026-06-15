@@ -1556,14 +1556,24 @@ impl Parser {
         Ok(None)
     }
 
-    /// Parses an optional `GROUP BY [HAVING]` clause.
+    /// Parses an optional `GROUP BY [HAVING]` clause, or a standalone `HAVING`.
     ///
     /// GROUP BY terms must be column expressions, not integer ordinals: MySQL
     /// treats `GROUP BY 1` as "the first output column", but SQLite treats it as
     /// the constant `1` (one group) — a divergence, so ordinals are rejected.
-    /// `HAVING` is only accepted together with `GROUP BY`.
+    ///
+    /// `HAVING` without `GROUP BY` treats the whole result as a single group; it
+    /// is modeled as an empty `GROUP BY` with a `HAVING`. MySQL and the engine
+    /// both accept it for an aggregate condition (the engine rejects a
+    /// non-aggregate `HAVING`, as MySQL's filtering form is not modeled).
     fn group_by(&mut self) -> Result<Option<ast::GroupBy>> {
         if !self.eat_keyword("GROUP") {
+            if self.eat_keyword("HAVING") {
+                return Ok(Some(ast::GroupBy {
+                    exprs: Vec::new(),
+                    having: Some(Box::new(self.expr()?)),
+                }));
+            }
             return Ok(None);
         }
         self.expect_keyword("BY")?;
@@ -4588,6 +4598,26 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].as_str(), "id");
         assert_eq!(cols[1].as_str(), "ref");
+    }
+
+    #[test]
+    fn having_without_group_by_parses() {
+        // `HAVING` with no `GROUP BY` becomes an empty GROUP BY carrying the
+        // HAVING (the whole result is one group).
+        let ast::Stmt::Select(select) =
+            parse("SELECT COUNT(*) FROM t HAVING COUNT(*) > 2").unwrap()
+        else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select {
+            group_by: Some(group_by),
+            ..
+        } = select.body.select
+        else {
+            panic!("expected a GROUP BY carrying the HAVING");
+        };
+        assert!(group_by.exprs.is_empty());
+        assert!(group_by.having.is_some());
     }
 
     #[test]

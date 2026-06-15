@@ -1,0 +1,42 @@
+# HAVING without GROUP BY conformance.
+#
+# A HAVING clause with no GROUP BY treats the whole result as a single group and
+# filters it by an aggregate condition. The front-end models it as an empty
+# GROUP BY carrying the HAVING; the engine evaluates it the same as MySQL,
+# returning the aggregate row when the condition holds and no rows otherwise.
+#
+# Scope: only the aggregate form is supported. MySQL also allows a non-aggregate
+# HAVING (a post-WHERE row filter), which the engine rejects, so that is not
+# exercised here.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS hg_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO hg_demo (id, n) VALUES (1, 5), (2, 15), (3, 25)
+
+# The single aggregate group passes the condition.
+query
+SELECT COUNT(*) FROM hg_demo HAVING COUNT(*) > 2
+----
+3
+
+# The condition fails, so no row is returned.
+query
+SELECT COUNT(*) FROM hg_demo HAVING COUNT(*) > 5
+----
+
+# A non-COUNT aggregate condition.
+query
+SELECT SUM(n) FROM hg_demo HAVING SUM(n) > 40
+----
+45
+
+# HAVING composes with a WHERE that narrows the group first.
+query
+SELECT COUNT(*) FROM hg_demo WHERE n >= 15 HAVING COUNT(*) = 2
+----
+2
