@@ -3003,6 +3003,12 @@ impl Parser {
             return self.timestampdiff_call();
         }
 
+        // `TIMESTAMPADD(unit, n, datetime)` shifts the datetime by `n` units,
+        // like `DATE_ADD(datetime, INTERVAL n unit)`.
+        if upper == "TIMESTAMPADD" {
+            return self.timestampadd_call();
+        }
+
         // `TIME_TO_SEC(t)` is the seconds since midnight of the time part;
         // `SEC_TO_TIME(s)` is the inverse.
         if upper == "TIME_TO_SEC" {
@@ -3957,22 +3963,11 @@ impl Parser {
         let unit = u.to_ascii_uppercase();
         self.advance();
 
-        // Map the MySQL unit onto the engine's modifier unit; `WEEK` has no
-        // engine modifier and is expanded to days.
-        let (engine_unit, multiplier) = match unit.as_str() {
-            "DAY" => ("days", 1),
-            "WEEK" => ("days", 7),
-            "MONTH" => ("months", 1),
-            "YEAR" => ("years", 1),
-            "HOUR" => ("hours", 1),
-            "MINUTE" => ("minutes", 1),
-            "SECOND" => ("seconds", 1),
-            other => {
-                return Err(ParseError::Unsupported(format!(
-                    "INTERVAL unit {other} is not supported yet"
-                )))
-            }
-        };
+        // Map the MySQL unit onto the engine's modifier unit (`WEEK`/`QUARTER`
+        // are expanded to days/months).
+        let (engine_unit, multiplier) = interval_unit_modifier(&unit).ok_or_else(|| {
+            ParseError::Unsupported(format!("INTERVAL unit {unit} is not supported yet"))
+        })?;
 
         let mut amount = value.saturating_mul(multiplier);
         if negative {
@@ -4240,6 +4235,59 @@ impl Parser {
                 modifier("start of month"),
                 modifier("+1 month"),
                 modifier("-1 day"),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Lowers `TIMESTAMPADD(unit, value, datetime)` (the name and `(` are already
+    /// consumed) to `datetime(dt, '+<value × mult> <engine-unit>')` — the same
+    /// modifier as `DATE_ADD(dt, INTERVAL value unit)` (see
+    /// [`Self::apply_interval`]). The value must be an integer literal (optionally
+    /// signed). As with `DATE_ADD`, a bare DATE argument keeps the engine's
+    /// `00:00:00` time. `MICROSECOND` and any unit without an engine modifier are
+    /// rejected. Exactly three arguments are required.
+    fn timestampadd_call(&mut self) -> Result<ast::Expr> {
+        let Some(Token::Word(u)) = self.peek() else {
+            return Err(self.unexpected("a TIMESTAMPADD unit"));
+        };
+        let unit = u.to_ascii_uppercase();
+        self.advance();
+        self.expect(&Token::Comma, "`,`")?;
+
+        let negative = self.eat(&Token::Minus);
+        let raw = match self.peek() {
+            Some(Token::Num(n) | Token::Str(n)) => n.clone(),
+            _ => return Err(self.unexpected("an integer TIMESTAMPADD value")),
+        };
+        let value: i64 = raw.trim().parse().map_err(|_| {
+            ParseError::Unsupported("TIMESTAMPADD value must be an integer literal".to_string())
+        })?;
+        self.advance();
+        self.expect(&Token::Comma, "`,`")?;
+
+        let target = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let (engine_unit, multiplier) = interval_unit_modifier(&unit).ok_or_else(|| {
+            ParseError::Unsupported(format!("TIMESTAMPADD unit {unit} is not supported yet"))
+        })?;
+        let mut amount = value.saturating_mul(multiplier);
+        if negative {
+            amount = -amount;
+        }
+        let modifier = format!("{amount:+} {engine_unit}");
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("datetime"),
+            distinctness: None,
+            args: vec![
+                Box::new(target),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(&modifier)))),
             ],
             order_by: Vec::new(),
             within_group: Vec::new(),
@@ -4554,6 +4602,25 @@ fn coalesce_truthiness(expr: ast::Expr, op: ast::Operator, default: &str) -> ast
             over_clause: None,
         },
     }
+}
+
+/// Maps a MySQL date/time interval unit to the engine's `datetime()` modifier
+/// unit and a multiplier on the amount (`WEEK` → 7 `days`, `QUARTER` → 3
+/// `months`; the engine has no `weeks`/`quarters` modifier). Shared by `INTERVAL`
+/// arithmetic and `TIMESTAMPADD`. Returns `None` for a unit without an engine
+/// modifier (e.g. `MICROSECOND`). `unit` must already be uppercased.
+fn interval_unit_modifier(unit: &str) -> Option<(&'static str, i64)> {
+    Some(match unit {
+        "DAY" => ("days", 1),
+        "WEEK" => ("days", 7),
+        "MONTH" => ("months", 1),
+        "QUARTER" => ("months", 3),
+        "YEAR" => ("years", 1),
+        "HOUR" => ("hours", 1),
+        "MINUTE" => ("minutes", 1),
+        "SECOND" => ("seconds", 1),
+        _ => return None,
+    })
 }
 
 /// Builds `CAST(a / b AS INTEGER)` — the integer quotient (truncated toward
@@ -7326,6 +7393,37 @@ mod tests {
                 "TIMESTAMPDIFF unit {unit} should be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn timestampadd_lowers_to_datetime_modifier() {
+        // TIMESTAMPADD(unit, n, dt) -> datetime(dt, '+<n × mult> <engine-unit>'),
+        // matching DATE_ADD(dt, INTERVAL n unit). WEEK and QUARTER scale the
+        // amount (7 days, 3 months).
+        for (sql, modifier) in [
+            ("TIMESTAMPADD(DAY, 5, d)", "'+5 days'"),
+            ("TIMESTAMPADD(HOUR, 2, d)", "'+2 hours'"),
+            ("TIMESTAMPADD(WEEK, 1, d)", "'+7 days'"),
+            ("TIMESTAMPADD(QUARTER, 1, d)", "'+3 months'"),
+            ("TIMESTAMPADD(MINUTE, -30, d)", "'-30 minutes'"),
+        ] {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to datetime()");
+            };
+            assert_eq!(name.as_str(), "datetime");
+            assert!(
+                matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == modifier),
+                "wrong modifier for `{sql}`"
+            );
+        }
+        // TIMESTAMPADD matches the equivalent DATE_ADD lowering.
+        assert_eq!(
+            parse_expr("TIMESTAMPADD(DAY, 5, d)").unwrap(),
+            parse_expr("DATE_ADD(d, INTERVAL 5 DAY)").unwrap()
+        );
+        // A unit without an engine modifier and a non-literal amount are rejected.
+        assert!(parse_expr("TIMESTAMPADD(MICROSECOND, 1, d)").is_err());
+        assert!(parse_expr("TIMESTAMPADD(DAY, x, d)").is_err());
     }
 
     #[test]

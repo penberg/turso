@@ -1,0 +1,56 @@
+# TIMESTAMPADD(unit, n, datetime) conformance.
+#
+# TIMESTAMPADD shifts a datetime by n units -- the counterpart to TIMESTAMPDIFF
+# and equivalent to DATE_ADD(datetime, INTERVAL n unit). The front-end lowers it
+# to the engine's datetime(dt, '+<n × mult> <unit>') modifier (WEEK -> 7 days,
+# QUARTER -> 3 months), the same path as INTERVAL arithmetic. n must be an
+# integer literal.
+#
+# Scope: exercised on DATETIME values so both targets return 'YYYY-MM-DD
+# HH:MM:SS'. As with DATE_ADD, a bare DATE keeps the engine's 00:00:00 time, and
+# MONTH/QUARTER/YEAR arithmetic that overflows a month end clamps in MySQL but
+# rolls over in the engine -- both diverge and are avoided here.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS tsa_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO tsa_demo (a, d) VALUES (1, '2020-01-15 10:20:30')
+
+# Day and hour shifts.
+query
+SELECT TIMESTAMPADD(DAY, 5, d), TIMESTAMPADD(HOUR, 14, d) FROM tsa_demo
+----
+2020-01-20 10:20:30	2020-01-16 00:20:30
+
+# Minute and second shifts, including negative.
+query
+SELECT TIMESTAMPADD(MINUTE, -30, d), TIMESTAMPADD(SECOND, 90, d) FROM tsa_demo
+----
+2020-01-15 09:50:30	2020-01-15 10:22:00
+
+# A WEEK is seven days; a MONTH and a QUARTER advance the calendar.
+query
+SELECT TIMESTAMPADD(WEEK, 1, d), TIMESTAMPADD(MONTH, 2, d), TIMESTAMPADD(QUARTER, 1, d) FROM tsa_demo
+----
+2020-01-22 10:20:30	2020-03-15 10:20:30	2020-04-15 10:20:30
+
+# It matches DATE_ADD with the equivalent INTERVAL.
+query
+SELECT TIMESTAMPADD(DAY, 3, d) = DATE_ADD(d, INTERVAL 3 DAY) FROM tsa_demo
+----
+1
+
+# NULL propagates.
+query
+SELECT TIMESTAMPADD(DAY, 5, NULL)
+----
+NULL
+
+# Usable over a column expression for the datetime.
+query
+SELECT a, TIMESTAMPADD(YEAR, 1, '2021-06-15 00:00:00') FROM tsa_demo
+----
+1	2022-06-15 00:00:00
