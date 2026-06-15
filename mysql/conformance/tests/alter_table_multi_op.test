@@ -1,0 +1,64 @@
+# Multi-operation ALTER TABLE conformance.
+#
+# MySQL applies several operations in one ALTER TABLE: ALTER TABLE t ADD a, ADD
+# b, DROP c. The engine has no multi-operation ALTER, so the front-end expands
+# the comma list into one statement per operation (each lowered as usual: ADD
+# COLUMN, ADD KEY -> CREATE INDEX, DROP COLUMN -> DROP COLUMN), which the server
+# runs in sequence. WordPress's dbDelta() issues such ALTERs. (As with
+# multi-table DROP, the sequence is not atomic -- operations before a failing one
+# still apply.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS malt_demo (id INT PRIMARY KEY)
+
+# Add two columns in one statement.
+statement ok
+ALTER TABLE malt_demo ADD a INT, ADD b VARCHAR(10)
+
+statement ok
+INSERT INTO malt_demo (id, a, b) VALUES (1, 5, 'x')
+
+query
+SELECT id, a, b FROM malt_demo
+----
+1	5	x
+
+# Mix an ADD COLUMN (with a default), an ADD KEY, and a DROP COLUMN in one
+# statement.
+statement ok
+ALTER TABLE malt_demo ADD c INT DEFAULT 9, ADD KEY malt_a_idx (a), DROP COLUMN b
+
+# The new column has its default on the existing row; the dropped column is gone.
+query
+SELECT id, a, c FROM malt_demo
+----
+1	5	9
+
+# Querying the dropped column errors.
+statement error
+SELECT b FROM malt_demo
+
+# A new row picks up the column default.
+statement ok
+INSERT INTO malt_demo (id, a) VALUES (2, 7)
+
+query
+SELECT id, a, c FROM malt_demo ORDER BY id
+----
+1	5	9
+2	7	9
+
+# A single-operation ALTER still works after the multi-op path.
+statement ok
+ALTER TABLE malt_demo ADD d INT
+
+statement ok
+INSERT INTO malt_demo (id, d) VALUES (3, 42)
+
+query
+SELECT d FROM malt_demo WHERE id = 3
+----
+42

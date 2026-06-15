@@ -78,6 +78,22 @@ impl Parser {
                 return self.drop_table_list(temporary);
             }
         }
+
+        // `ALTER TABLE t op1, op2, ...` may list several operations; expand each
+        // into its own statement (the engine has no multi-operation ALTER).
+        if self.is_keyword("ALTER")
+            && matches!(self.peek_nth(1), Some(Token::Word(w)) if w.eq_ignore_ascii_case("TABLE"))
+        {
+            self.advance(); // ALTER
+            self.expect_keyword("TABLE")?;
+            let name = self.qualified_name()?;
+            let mut stmts = vec![self.alter_operation(name.clone())?];
+            while self.eat(&Token::Comma) {
+                stmts.push(self.alter_operation(name.clone())?);
+            }
+            return Ok(stmts);
+        }
+
         Ok(vec![self.statement()?])
     }
 
@@ -313,12 +329,27 @@ impl Parser {
     ///
     /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
     /// `DROP {INDEX|PRIMARY KEY|FOREIGN KEY}`, the type-changing `CHANGE`/`MODIFY`
-    /// operations, `RENAME INDEX`, and the comma-separated multi-operation form —
-    /// is rejected as unsupported.
+    /// operations, and `RENAME INDEX` — is rejected as unsupported. The
+    /// comma-separated multi-operation form has no single-statement engine
+    /// equivalent and is rejected here, but [`Self::parse_statement_list`] expands
+    /// it into one statement per operation.
     fn alter(&mut self) -> Result<ast::Stmt> {
         self.expect_keyword("TABLE")?;
         let name = self.qualified_name()?;
+        let stmt = self.alter_operation(name)?;
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "ALTER TABLE with multiple operations is not supported yet".to_string(),
+            ));
+        }
+        Ok(stmt)
+    }
 
+    /// Parses a single `ALTER TABLE` operation given the already-parsed table
+    /// `name` (the operation keyword — `ADD`/`DROP`/`RENAME` — has not been
+    /// consumed) and lowers it to one engine statement. Stops before any trailing
+    /// comma, so the multi-operation caller can split on it.
+    fn alter_operation(&mut self, name: ast::QualifiedName) -> Result<ast::Stmt> {
         if self.eat_keyword("DROP") {
             return self.alter_drop(name);
         }
@@ -366,11 +397,6 @@ impl Parser {
         if auto_increment {
             return Err(ParseError::Unsupported(
                 "ALTER TABLE ... ADD COLUMN with AUTO_INCREMENT is not supported yet".to_string(),
-            ));
-        }
-        if self.is(&Token::Comma) {
-            return Err(ParseError::Unsupported(
-                "ALTER TABLE with multiple operations is not supported yet".to_string(),
             ));
         }
 
@@ -9117,6 +9143,40 @@ mod tests {
 
         // RESTRICT/CASCADE on a multi-table drop is still rejected.
         assert!(parse_all("DROP TABLE a, b RESTRICT").is_err());
+    }
+
+    #[test]
+    fn multi_op_alter_expands_to_one_per_operation() {
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+
+        // Each comma-separated operation becomes its own statement, lowered as
+        // usual: ADD COLUMN and DROP COLUMN -> AlterTable, ADD KEY -> CreateIndex.
+        let stmts = parse_all("ALTER TABLE t ADD a INT, ADD KEY k (a), DROP COLUMN b").unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(
+            stmts[0],
+            ast::Stmt::AlterTable(ast::AlterTable {
+                body: ast::AlterTableBody::AddColumn(_),
+                ..
+            })
+        ));
+        assert!(matches!(stmts[1], ast::Stmt::CreateIndex { .. }));
+        assert!(matches!(
+            stmts[2],
+            ast::Stmt::AlterTable(ast::AlterTable {
+                body: ast::AlterTableBody::DropColumn(_),
+                ..
+            })
+        ));
+
+        // A single-operation ALTER yields one statement.
+        assert_eq!(parse_all("ALTER TABLE t ADD a INT").unwrap().len(), 1);
+
+        // The single-statement `parse` still rejects the multi-operation form.
+        assert!(matches!(
+            parse("ALTER TABLE t ADD a INT, ADD b INT").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]

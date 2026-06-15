@@ -208,7 +208,7 @@ incomplete.
 | ALTER LOGFILE GROUP                    | ❌     |         |
 | ALTER PROCEDURE                        | ❌     |         |
 | ALTER SERVER                           | ❌     |         |
-| ALTER TABLE                            | ⚠️     | ADD/DROP COLUMN, ADD [UNIQUE] KEY/INDEX, RENAME [COLUMN] supported. ADD FULLTEXT degrades to a plain index (no MATCH...AGAINST). ADD PRIMARY/FOREIGN KEY, SPATIAL, CHANGE/MODIFY, multi-op comma form, and clauses like ALGORITHM/partitioning are not translated. |
+| ALTER TABLE                            | ⚠️     | ADD/DROP COLUMN, ADD [UNIQUE] KEY/INDEX, RENAME [COLUMN] supported. ADD FULLTEXT degrades to a plain index (no MATCH...AGAINST). The comma-separated multi-operation form (`ADD a, ADD KEY ..., DROP b`) is expanded into one statement per operation, run in sequence (not atomic — operations before a failing one still apply). ADD PRIMARY/FOREIGN KEY, SPATIAL, CHANGE/MODIFY, and clauses like ALGORITHM/partitioning are not translated. |
 | ALTER TABLESPACE                       | ❌     |         |
 | ALTER VIEW                             | ❌     |         |
 | CREATE DATABASE                        | ❌     |         |
