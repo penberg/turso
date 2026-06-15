@@ -1,0 +1,61 @@
+# Common table expressions (WITH ... SELECT) conformance.
+#
+# The front-end parses a WITH clause -- one or more named CTEs, each an optional
+# column-rename list and a parenthesized SELECT -- and attaches it to the SELECT
+# it feeds. The engine evaluates CTEs the same as SQLite, matching MySQL for
+# non-recursive CTEs.
+#
+# Scope: non-recursive CTEs. WITH RECURSIVE parses but the engine does not yet
+# execute recursive CTEs, and the MATERIALIZED hint (parsed for robustness) is
+# not MySQL syntax; neither is exercised here. WITH before UPDATE/DELETE is not
+# supported.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS cte_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO cte_demo (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+# A single CTE filtered, then selected from.
+query
+WITH big AS (SELECT id, n FROM cte_demo WHERE n >= 20) SELECT id FROM big ORDER BY id
+----
+2
+3
+4
+
+# A column-rename list on the CTE.
+query
+WITH c(rn) AS (SELECT n FROM cte_demo) SELECT SUM(rn) FROM c
+----
+100
+
+# Multiple CTEs, combined with UNION.
+query
+WITH lo AS (SELECT id FROM cte_demo WHERE n < 20), hi AS (SELECT id FROM cte_demo WHERE n > 30) SELECT id FROM lo UNION SELECT id FROM hi ORDER BY id
+----
+1
+4
+
+# A CTE referenced more than once (here in a subquery).
+query
+WITH c AS (SELECT n FROM cte_demo) SELECT n FROM c WHERE n IN (SELECT n FROM c WHERE n > 25) ORDER BY n
+----
+30
+40
+
+# A CTE that aggregates, consumed by the outer query.
+query
+WITH s AS (SELECT COUNT(*) AS cnt FROM cte_demo) SELECT cnt FROM s
+----
+4
+
+# The CTE name shadows nothing and the outer query can still join the base table.
+query
+WITH c AS (SELECT id, n FROM cte_demo WHERE id <= 2) SELECT c.id, t.n FROM c JOIN cte_demo t ON c.id = t.id ORDER BY c.id
+----
+1	10
+2	20

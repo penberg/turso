@@ -111,9 +111,13 @@ impl Parser {
                 self.advance();
                 self.rename_table()
             }
+            "WITH" => {
+                self.advance();
+                self.with_select()
+            }
             // Recognized statement keywords that are simply not implemented yet.
             "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SAVEPOINT" | "GRANT"
-            | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE"
+            | "REVOKE" | "CALL" | "DO" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE"
             | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
             | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(
                 format!("{keyword} is not supported yet"),
@@ -1180,6 +1184,80 @@ impl Parser {
     fn select(&mut self) -> Result<ast::Stmt> {
         // `SELECT` has already been consumed.
         Ok(ast::Stmt::Select(self.parse_select()?))
+    }
+
+    /// Parses a `WITH ... SELECT ...` statement (the `WITH` keyword already
+    /// consumed): a common-table-expression clause followed by a `SELECT` that it
+    /// feeds. The engine evaluates CTEs the same as SQLite, so the clause is
+    /// attached to the resulting `Select`. Only a `SELECT` main query is
+    /// supported here (MySQL also allows `WITH` before `UPDATE`/`DELETE`).
+    fn with_select(&mut self) -> Result<ast::Stmt> {
+        let with = self.with_clause()?;
+        self.expect_keyword("SELECT")?;
+        let mut select = self.parse_select()?;
+        select.with = Some(with);
+        Ok(ast::Stmt::Select(select))
+    }
+
+    /// Parses the body of a `WITH [RECURSIVE] cte [, cte]...` clause (the `WITH`
+    /// keyword already consumed). Each CTE is `name [(col, ...)] AS [[NOT]
+    /// MATERIALIZED] (select)`; the optional materialization hint is preserved and
+    /// the column-rename list, if present, is recorded.
+    fn with_clause(&mut self) -> Result<ast::With> {
+        let recursive = self.eat_keyword("RECURSIVE");
+        let mut ctes = Vec::new();
+        loop {
+            let tbl_name = self.name()?;
+
+            // Optional `(col, ...)` rename list for the CTE's output columns.
+            let mut columns = Vec::new();
+            if self.eat(&Token::LParen) {
+                loop {
+                    columns.push(ast::IndexedColumn {
+                        col_name: self.name()?,
+                        collation_name: None,
+                        order: None,
+                    });
+                    if self.eat(&Token::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(&Token::RParen, "`)`")?;
+            }
+
+            self.expect_keyword("AS")?;
+
+            // Optional `MATERIALIZED` / `NOT MATERIALIZED` hint.
+            let materialized = if self.eat_keyword("MATERIALIZED") {
+                ast::Materialized::Yes
+            } else if self.is_keyword("NOT")
+                && matches!(self.peek_nth(1), Some(Token::Word(w)) if w.eq_ignore_ascii_case("MATERIALIZED"))
+            {
+                self.advance();
+                self.advance();
+                ast::Materialized::No
+            } else {
+                ast::Materialized::Any
+            };
+
+            self.expect(&Token::LParen, "`(`")?;
+            self.expect_keyword("SELECT")?;
+            let select = self.parse_select()?;
+            self.expect(&Token::RParen, "`)`")?;
+
+            ctes.push(ast::CommonTableExpr {
+                tbl_name,
+                columns,
+                materialized,
+                select,
+            });
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(ast::With { recursive, ctes })
     }
 
     /// Parses a `SELECT` body (everything after the `SELECT` keyword), including
@@ -6769,6 +6847,43 @@ mod tests {
             parse_expr("a <> b").unwrap(),
             ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
         );
+    }
+
+    #[test]
+    fn with_clause_parses_into_select() {
+        // A single non-recursive CTE attaches to the SELECT.
+        let ast::Stmt::Select(select) =
+            parse("WITH c AS (SELECT id FROM t) SELECT id FROM c").unwrap()
+        else {
+            panic!("expected WITH ... SELECT to parse as a Select");
+        };
+        let with = select.with.expect("the WITH clause should be attached");
+        assert!(!with.recursive);
+        assert_eq!(with.ctes.len(), 1);
+        assert_eq!(with.ctes[0].tbl_name.as_str(), "c");
+        assert!(with.ctes[0].columns.is_empty());
+
+        // A column-rename list is recorded.
+        let ast::Stmt::Select(select) =
+            parse("WITH c(x, y) AS (SELECT a, b FROM t) SELECT x FROM c").unwrap()
+        else {
+            unreachable!()
+        };
+        let cols = &select.with.unwrap().ctes[0].columns;
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].col_name.as_str(), "x");
+        assert_eq!(cols[1].col_name.as_str(), "y");
+
+        // RECURSIVE and multiple CTEs.
+        let ast::Stmt::Select(select) = parse(
+            "WITH RECURSIVE a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a UNION SELECT * FROM b",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let with = select.with.unwrap();
+        assert!(with.recursive);
+        assert_eq!(with.ctes.len(), 2);
     }
 
     #[test]

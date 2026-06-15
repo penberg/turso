@@ -290,6 +290,7 @@ incomplete.
 | UNION / UNION ALL                      | ✅     | `UNION` deduplicates, `UNION ALL` does not; a trailing `ORDER BY`/`LIMIT` applies to the whole result. Identical to MySQL 8.x. |
 | INTERSECT / EXCEPT set operations      | ✅     | Deduplicating set operations, identical to MySQL 8.x. Mixed-operator precedence is not exercised. |
 | Subqueries                             | ✅     | `IN (SELECT ...)`, `[NOT] EXISTS (SELECT ...)`, scalar `(SELECT ...)` in expressions, and derived tables in `FROM` — including correlated forms. See the Expressions section. |
+| `WITH ... SELECT` (CTEs)               | 🚧     | A `WITH` clause of one or more named CTEs (each with an optional `(col, ...)` rename list) feeding a `SELECT`; evaluated like SQLite, matching MySQL for non-recursive CTEs. `WITH RECURSIVE` parses but the engine does not yet execute recursive CTEs; the SQLite `MATERIALIZED` hint is accepted but is not MySQL syntax; `WITH` before `UPDATE`/`DELETE` is not supported. |
 | Derived / lateral derived tables       | ❌     |         |
 | TABLE statement                        | ❌     |         |
 | UPDATE tbl SET ... [WHERE] (single table) | ✅  |         |
