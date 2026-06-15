@@ -74,6 +74,9 @@ impl<'a> Lexer<'a> {
                 Some(b'=') => self.double(Token::Ne),
                 _ => self.single(Token::Other('!')),
             },
+            // `&&` is logical AND; a single `&` is the bitwise operator, which
+            // lexes as `Other('&')` like the other bitwise characters.
+            b'&' if self.peek_at(1) == Some(b'&') => self.double(Token::AmpAmp),
             b'-' => self.single(Token::Minus),
             b'+' => self.single(Token::Plus),
             b'?' => self.single(Token::Param),

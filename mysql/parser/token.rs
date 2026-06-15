@@ -43,6 +43,8 @@ pub enum Token {
     ShiftRight,
     /// `<=>` — the NULL-safe equality operator.
     Spaceship,
+    /// `&&` — the logical-AND operator (a synonym for `AND`).
+    AmpAmp,
     /// `*`
     Star,
     /// `-`
@@ -79,6 +81,7 @@ impl Token {
             Token::ShiftLeft => "`<<`".to_string(),
             Token::ShiftRight => "`>>`".to_string(),
             Token::Spaceship => "`<=>`".to_string(),
+            Token::AmpAmp => "`&&`".to_string(),
             Token::Star => "`*`".to_string(),
             Token::Minus => "`-`".to_string(),
             Token::Plus => "`+`".to_string(),

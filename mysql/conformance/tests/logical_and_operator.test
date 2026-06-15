@@ -1,0 +1,51 @@
+# Logical AND operator (&&) conformance.
+#
+# MySQL's `&&` is a synonym for the `AND` keyword, at the same precedence. The
+# front-end lexes `&&` as a distinct token (a single `&` stays the bitwise
+# operator) and treats it like `AND`.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# `&&` combines boolean conditions, exactly like AND.
+query
+SELECT 1 = 1 && 2 = 2, 1 = 1 && 1 = 2, 0 = 1 && 1 = 1
+----
+1	0	0
+
+# Truthy/falsey operands.
+query
+SELECT 1 && 1, 1 && 0, 0 && 0
+----
+1	0	0
+
+# `&&` and the AND keyword agree.
+query
+SELECT (5 > 3 && 2 < 4) = (5 > 3 AND 2 < 4)
+----
+1
+
+# A single `&` is still the bitwise AND operator (unchanged by `&&` lexing).
+query
+SELECT 5 & 3, 12 & 10, 6 & 4
+----
+1	8	4
+
+# Usable in WHERE, combining two column predicates.
+statement ok
+CREATE TABLE IF NOT EXISTS land_demo (id INT PRIMARY KEY, a INT, b INT)
+
+statement ok
+INSERT INTO land_demo (id, a, b) VALUES (1, 1, 1), (2, 1, 0), (3, 0, 1), (4, 2, 2)
+
+query
+SELECT id FROM land_demo WHERE a = 1 && b = 1 ORDER BY id
+----
+1
+
+# Chained `&&`, and mixed with the AND keyword (same precedence).
+query
+SELECT id FROM land_demo WHERE a > 0 && b > 0 AND id < 5 ORDER BY id
+----
+1
+4

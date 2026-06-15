@@ -2066,7 +2066,8 @@ impl Parser {
 
     fn and_expr(&mut self) -> Result<ast::Expr> {
         let mut lhs = self.not_expr()?;
-        while self.eat_keyword("AND") {
+        // `&&` is a MySQL synonym for the `AND` keyword, at the same precedence.
+        while self.eat_keyword("AND") || self.eat(&Token::AmpAmp) {
             let rhs = self.not_expr()?;
             lhs = ast::Expr::binary(lhs, ast::Operator::And, rhs);
         }
@@ -7052,6 +7053,25 @@ mod tests {
             parse_expr("ELT(1)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn logical_and_operator_is_a_synonym_for_and() {
+        // `a && b` lowers to the same AND as the keyword.
+        assert_eq!(
+            parse_expr("a && b").unwrap(),
+            parse_expr("a AND b").unwrap()
+        );
+        assert_eq!(
+            parse_expr("a && b").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::And, col("b"))
+        );
+
+        // A single `&` is still bitwise AND, unaffected by the `&&` lexing.
+        assert_eq!(
+            parse_expr("a & b").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::BitwiseAnd, col("b"))
+        );
     }
 
     #[test]
