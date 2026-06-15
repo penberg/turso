@@ -3060,6 +3060,12 @@ impl Parser {
             return self.truncate_call();
         }
 
+        // `STRCMP(a, b)` compares two strings, returning -1 / 0 / 1 (see
+        // `strcmp_call`).
+        if upper == "STRCMP" {
+            return self.strcmp_call();
+        }
+
         // `LOG(x)` is the natural log in MySQL (the engine's 1-arg `log` is
         // base-10), while `LOG(b, x)` is the base-`b` log on both (see `log_call`).
         if upper == "LOG" {
@@ -3876,6 +3882,38 @@ impl Parser {
         let scaled = ast::Expr::binary(x, ast::Operator::Multiply, scale_num);
         let truncated = unary_fn("trunc", scaled);
         Ok(float_division(truncated, scale_den))
+    }
+
+    /// Parses MySQL `STRCMP(a, b)` (the name and `(` are already consumed),
+    /// lowering it to a `CASE` that yields `-1` / `0` / `1` for `a < b` / `a = b`
+    /// / `a > b`, and NULL when either argument is NULL. The comparison uses the
+    /// engine's (binary, case-sensitive) collation, so it diverges from MySQL's
+    /// case-insensitive default for strings that differ only in case — the same
+    /// collation divergence noted in `mysql/COMPAT.md`.
+    fn strcmp_call(&mut self) -> Result<ast::Expr> {
+        let a = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let b = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let either_null = ast::Expr::binary(
+            ast::Expr::is_null(a.clone()),
+            ast::Operator::Or,
+            ast::Expr::is_null(b.clone()),
+        );
+        let less = ast::Expr::binary(a.clone(), ast::Operator::Less, b.clone());
+        let greater = ast::Expr::binary(a, ast::Operator::Greater, b);
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![
+                (
+                    Box::new(either_null),
+                    Box::new(ast::Expr::Literal(ast::Literal::Null)),
+                ),
+                (Box::new(less), numeric_expr("-1")),
+                (Box::new(greater), numeric_expr("1")),
+            ],
+            else_expr: Some(numeric_expr("0")),
+        })
     }
 
     /// Parses MySQL `LOG(x)` or `LOG(b, x)` (the name and `(` are already
@@ -9497,6 +9535,35 @@ mod tests {
         };
         assert_eq!(name.as_str(), "atan2");
         assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn strcmp_lowers_to_comparison_case() {
+        // STRCMP(a, b) -> CASE WHEN a IS NULL OR b IS NULL THEN NULL
+        //                      WHEN a < b THEN -1 WHEN a > b THEN 1 ELSE 0 END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("STRCMP(a, b)").unwrap()
+        else {
+            panic!("expected STRCMP to lower to a CASE");
+        };
+        assert!(base.is_none());
+        assert_eq!(when_then_pairs.len(), 3);
+        // First branch handles NULL -> NULL.
+        assert!(matches!(
+            *when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        // The `<` and `>` branches yield -1 and 1; the else is 0.
+        assert_eq!(*when_then_pairs[1].1, num("-1"));
+        assert_eq!(*when_then_pairs[2].1, num("1"));
+        assert_eq!(*else_expr.unwrap(), num("0"));
+        assert!(matches!(
+            *when_then_pairs[1].0,
+            ast::Expr::Binary(_, ast::Operator::Less, _)
+        ));
     }
 
     #[test]
