@@ -1,0 +1,52 @@
+# ENUM and SET column types.
+#
+# MySQL's ENUM(...) and SET(...) store their value as a string. The engine has no
+# such types -- and SET is a reserved keyword there, so a SET column was a syntax
+# error ("near SET"). The front-end now lowers both ENUM and SET to TEXT, so the
+# column is created and stores/retrieves string values. The allowed-values
+# constraint is not enforced (any string is accepted), and SHOW COLUMNS reports
+# the type as `text` rather than `enum(...)`/`set(...)`.
+#
+# The test uses valid values (and single-element SET values, since MySQL
+# reorders/deduplicates multi-element SET values while the engine stores them
+# verbatim), so it passes against both turso-mysql-server and a real mysqld.
+# Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS es (id INT PRIMARY KEY, kind ENUM('a', 'b', 'c'), flag SET('x', 'y', 'z'))
+
+statement ok
+INSERT INTO es (id, kind, flag) VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')
+
+# Values round-trip as strings.
+query
+SELECT id, kind, flag FROM es ORDER BY id
+----
+1	a	x
+2	b	y
+3	c	z
+
+# Filtering on an ENUM/SET value works like any text column.
+query
+SELECT id FROM es WHERE kind = 'b'
+----
+2
+
+query
+SELECT id FROM es WHERE flag IN ('x', 'z') ORDER BY id
+----
+1
+3
+
+# ENUM/SET columns participate in ordinary string functions and ordering.
+query
+SELECT id FROM es ORDER BY kind DESC
+----
+3
+2
+1
+
+query
+SELECT UPPER(kind), LENGTH(flag) FROM es WHERE id = 1
+----
+A	1

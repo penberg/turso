@@ -748,7 +748,7 @@ impl Parser {
     /// Parses an optional column type: a name, an optional `(size[, scale])`,
     /// and trailing `UNSIGNED` / `ZEROFILL` / `SIGNED` modifiers (folded into
     /// the type name). `ENUM(...)`/`SET(...)` value lists are accepted but the
-    /// size is dropped.
+    /// size is dropped, and the type itself is lowered to `TEXT`.
     fn column_type(&mut self) -> Result<Option<ast::Type>> {
         let Some(Token::Word(w)) = self.peek() else {
             return Ok(None);
@@ -762,6 +762,16 @@ impl Parser {
         let mut size = None;
         if self.is(&Token::LParen) {
             size = self.type_size()?;
+        }
+
+        // MySQL's `ENUM(...)` and `SET(...)` store their value as a string, so
+        // lower both to `TEXT`. The engine has no such types -- and `SET` is a
+        // reserved keyword there, so it cannot even appear as a column type name.
+        // The value list was already dropped by `type_size`; the allowed-values
+        // constraint is not enforced (any string is accepted, as `TEXT`).
+        if name.eq_ignore_ascii_case("ENUM") || name.eq_ignore_ascii_case("SET") {
+            name = "TEXT".to_string();
+            size = None;
         }
 
         loop {
@@ -6343,6 +6353,25 @@ mod tests {
             default_of("e"),
             Some(ast::Expr::Literal(ast::Literal::Numeric("7".to_string())))
         );
+    }
+
+    #[test]
+    fn enum_and_set_columns_lower_to_text() {
+        // ENUM(...) and SET(...) are stored as strings; both lower to TEXT (and
+        // SET, a reserved keyword in the engine, could not otherwise be a type
+        // name). The value list is dropped.
+        let stmt = parse("CREATE TABLE t (k ENUM('a', 'b'), f SET('x', 'y', 'z'))").unwrap();
+        let ast::Stmt::CreateTable { body, .. } = stmt else {
+            panic!("expected CreateTable");
+        };
+        let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+            panic!("expected columns");
+        };
+        for col in &columns {
+            let ty = col.col_type.as_ref().unwrap();
+            assert_eq!(ty.name, "TEXT", "column `{}`", col.col_name.as_str());
+            assert!(ty.size.is_none());
+        }
     }
 
     #[test]
