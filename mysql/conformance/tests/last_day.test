@@ -1,0 +1,48 @@
+# LAST_DAY(date) conformance.
+#
+# MySQL's LAST_DAY(d) returns the last day of d's month as a DATE. The front-end
+# lowers it to the engine's date(d, 'start of month', '+1 month', '-1 day'),
+# whose modifiers compute the same date, including the correct 28/29 for
+# February in common and leap years. A datetime argument drops its time part,
+# and NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ld_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO ld_demo (a, d) VALUES
+  (1, '2020-02-15'),
+  (2, '2021-02-10'),
+  (3, '2020-12-01'),
+  (4, '2020-04-30')
+
+# February is 29 in a leap year (2020) and 28 in a common year (2021); other
+# months end on their own last day.
+query
+SELECT a, LAST_DAY(d) FROM ld_demo ORDER BY a
+----
+1	2020-02-29
+2	2021-02-28
+3	2020-12-31
+4	2020-04-30
+
+# A datetime argument keeps only the date part.
+query
+SELECT LAST_DAY('2020-02-15 10:30:00')
+----
+2020-02-29
+
+# NULL propagates.
+query
+SELECT LAST_DAY(NULL)
+----
+NULL
+
+# Usable in a WHERE predicate (which rows fall in a 29-day month?).
+query
+SELECT a FROM ld_demo WHERE LAST_DAY(d) = '2020-02-29' ORDER BY a
+----
+1

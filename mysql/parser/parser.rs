@@ -2435,6 +2435,12 @@ impl Parser {
             return self.timestampdiff_call();
         }
 
+        // `LAST_DAY(d)` is the last day of `d`'s month, which the engine's date
+        // modifiers compute as `date(d, 'start of month', '+1 month', '-1 day')`.
+        if upper == "LAST_DAY" {
+            return self.last_day_call();
+        }
+
         // Current date/time functions (`NOW()`, `CURDATE()`, ...) lower to the
         // engine's `datetime('now')` / `date('now')` / `time('now')`.
         if let Some(engine_fn) = current_time_function(&upper) {
@@ -3094,6 +3100,34 @@ impl Parser {
                 size: None,
                 array_dimensions: 0,
             }),
+        })
+    }
+
+    /// Lowers `LAST_DAY(d)` (the name and `(` are already consumed) to
+    /// `date(d, 'start of month', '+1 month', '-1 day')`, which the engine's
+    /// date modifiers evaluate to the last day of `d`'s month — matching MySQL,
+    /// including the correct 28/29 for February in common and leap years. The
+    /// result is a `'YYYY-MM-DD'` date (the time part, if any, is dropped) and
+    /// NULL propagates. Exactly one argument is required.
+    fn last_day_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let modifier = |m: &str| Box::new(ast::Expr::Literal(ast::Literal::String(requote(m))));
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("date"),
+            distinctness: None,
+            args: vec![
+                Box::new(arg),
+                modifier("start of month"),
+                modifier("+1 month"),
+                modifier("-1 day"),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         })
     }
 
@@ -5110,6 +5144,23 @@ mod tests {
                 ast::Expr::FunctionCall { name, .. } if name.as_str() == "date"
             ));
         }
+    }
+
+    #[test]
+    fn last_day_lowers_to_date_modifiers() {
+        // LAST_DAY(d) -> date(d, 'start of month', '+1 month', '-1 day').
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("LAST_DAY(d)").unwrap() else {
+            panic!("expected LAST_DAY to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "date");
+        let modifiers: Vec<&str> = args[1..]
+            .iter()
+            .map(|a| match a.as_ref() {
+                ast::Expr::Literal(ast::Literal::String(s)) => s.as_str(),
+                _ => panic!("expected string modifiers"),
+            })
+            .collect();
+        assert_eq!(modifiers, ["'start of month'", "'+1 month'", "'-1 day'"]);
     }
 
     #[test]
