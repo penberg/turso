@@ -1,0 +1,71 @@
+# Implicit type default for NOT NULL columns (MySQL non-strict sql_mode).
+#
+# In its default non-strict sql_mode -- the mode WordPress's test harness runs
+# under -- MySQL supplies an implicit type default for a NOT NULL column that has
+# no explicit DEFAULT, so a row that omits the column still inserts: 0 for
+# numeric types and '' for string types. The engine enforces NOT NULL strictly,
+# so the front-end materializes that implicit default as an explicit DEFAULT when
+# parsing CREATE TABLE. WordPress relies on this for bare inserts such as
+# `INSERT INTO wptests_comments (comment_ID) VALUES (1)` and the Tests_DB
+# null-insert tests.
+#
+# AUTO_INCREMENT and PRIMARY KEY columns are excluded (they generate their own
+# values / are handled by the engine's rowid). An explicit DEFAULT is kept as
+# written, and a nullable column without a value still takes NULL.
+#
+# Uses its own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS nnd_demo (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  i INT NOT NULL,
+  v VARCHAR(20) NOT NULL,
+  t TEXT NOT NULL,
+  n INT,
+  e VARCHAR(10) NOT NULL DEFAULT 'set'
+)
+
+# A row that omits every NOT NULL column still inserts: numerics default to 0,
+# strings to '', the nullable column to NULL, and the explicit DEFAULT is kept.
+statement ok
+INSERT INTO nnd_demo (id) VALUES (1)
+
+query
+SELECT i, v, t, n, e FROM nnd_demo WHERE id = 1
+----
+0			NULL	set
+
+# Explicit values are used as given (the implicit default does not override).
+statement ok
+INSERT INTO nnd_demo (id, i, v, t, n, e) VALUES (2, 7, 'hi', 'body', 9, 'x')
+
+query
+SELECT i, v, t, n, e FROM nnd_demo WHERE id = 2
+----
+7	hi	body	9	x
+
+# A partial insert defaults only the omitted NOT NULL columns.
+statement ok
+INSERT INTO nnd_demo (id, v) VALUES (3, 'only-v')
+
+query
+SELECT i, v, t, n FROM nnd_demo WHERE id = 3
+----
+0	only-v		NULL
+
+# The classic WordPress shape: insert only the autoincrement key.
+statement ok
+CREATE TABLE IF NOT EXISTS nnd_comments (
+  comment_ID BIGINT PRIMARY KEY AUTO_INCREMENT,
+  comment_author TEXT NOT NULL,
+  comment_content TEXT NOT NULL,
+  comment_karma INT NOT NULL
+)
+
+statement ok
+INSERT INTO nnd_comments (comment_ID) VALUES (1)
+
+query
+SELECT comment_ID, comment_author, comment_content, comment_karma FROM nnd_comments
+----
+1			0

@@ -249,8 +249,8 @@ incomplete.
 
 | Attribute | Status | Comment |
 |-----------|--------|---------|
-| `NOT NULL` / `NULL`         | ✅ | |
-| `DEFAULT <literal>`         | ✅ | Literal defaults; function/expression defaults are dropped to NULL. |
+| `NOT NULL` / `NULL`         | ✅ | A `NOT NULL` column with no explicit `DEFAULT` is given MySQL's implicit type default (`0` for numeric types, `''` for string/binary types) so a row that omits it still inserts — matching MySQL's default non-strict `sql_mode`, the mode WordPress runs under (a strict `sql_mode` would instead reject the row). `AUTO_INCREMENT` and `PRIMARY KEY` columns are excluded (the engine generates / rowid-handles their values). Date/time, `ENUM`/`SET`, `JSON`, and unrecognized types stay strictly `NOT NULL` (their MySQL defaults — the zero date, the first enum member, … — don't map cleanly). The synthesized default surfaces as the column's `Default` in `SHOW COLUMNS`/`DESCRIBE` (`0`/`''`), whereas MySQL reports `NULL` there — a minor introspection divergence. |
+| `DEFAULT <literal>`         | ✅ | Literal defaults; function/expression defaults are dropped to NULL. An explicit `DEFAULT` is kept as written (it suppresses the implicit `NOT NULL` default above). |
 | `PRIMARY KEY` (inline / table-level, single column) | ✅ | |
 | `PRIMARY KEY` (composite)   | ✅ | Parsed and forwarded; not valid with `AUTO_INCREMENT` (below). |
 | `AUTO_INCREMENT`            | ✅ | Only on a single-column `PRIMARY KEY` (inline or table-level). The key column is retyped to `INTEGER` so the engine treats it as a rowid alias that auto-assigns sequential ids and never reuses them — identical to MySQL. MySQL's int width (`bigint(20)`, `int(11)`) is display-only and dropped. |

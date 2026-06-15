@@ -632,7 +632,41 @@ impl Parser {
     fn column_def(&mut self) -> Result<(ast::ColumnDefinition, bool)> {
         let col_name = self.name()?;
         let col_type = self.column_type()?;
-        let (constraints, auto_increment) = self.column_constraints()?;
+        let (mut constraints, auto_increment) = self.column_constraints()?;
+
+        // MySQL (in its default non-strict `sql_mode`, which WordPress's test
+        // harness uses) supplies an implicit type default for a `NOT NULL` column
+        // that has no explicit `DEFAULT`, so a row that omits the column still
+        // inserts -- `0` for numeric types and `''` for string types. The engine
+        // enforces `NOT NULL` strictly and would reject the row, so materialize
+        // that implicit default as an explicit `DEFAULT` (see
+        // `implicit_not_null_default`). Skip `AUTO_INCREMENT` and `PRIMARY KEY`
+        // columns: the former generates its own values and the latter is left to
+        // the engine's rowid handling (and so keeps its `NULL` `SHOW COLUMNS`
+        // default).
+        if !auto_increment {
+            let is_not_null = constraints.iter().any(|c| {
+                matches!(
+                    &c.constraint,
+                    ast::ColumnConstraint::NotNull {
+                        nullable: false,
+                        ..
+                    }
+                )
+            });
+            let has_default = constraints
+                .iter()
+                .any(|c| matches!(&c.constraint, ast::ColumnConstraint::Default(_)));
+            let is_primary_key = constraints
+                .iter()
+                .any(|c| matches!(&c.constraint, ast::ColumnConstraint::PrimaryKey { .. }));
+            if is_not_null && !has_default && !is_primary_key {
+                if let Some(default) = col_type.as_ref().and_then(implicit_not_null_default) {
+                    constraints.push(named(ast::ColumnConstraint::Default(default)));
+                }
+            }
+        }
+
         Ok((
             ast::ColumnDefinition {
                 col_name,
@@ -4910,6 +4944,64 @@ fn numeric_expr(value: &str) -> Box<ast::Expr> {
     Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())))
 }
 
+/// MySQL's implicit type default for a `NOT NULL` column with no explicit
+/// `DEFAULT` (see [`Parser::column_def`]): `0` for numeric types and `''` for
+/// string/binary types. Date/time types (whose MySQL implicit default is the
+/// zero date `'0000-00-00'`), `ENUM`/`SET` (the first member), `JSON`, and
+/// unrecognized types return `None` -- their defaults do not map cleanly onto
+/// the engine, so those columns stay strictly `NOT NULL`.
+fn implicit_not_null_default(col_type: &ast::Type) -> Option<Box<ast::Expr>> {
+    let base = col_type
+        .name
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let numeric = matches!(
+        base.as_str(),
+        "INT"
+            | "INTEGER"
+            | "TINYINT"
+            | "SMALLINT"
+            | "MEDIUMINT"
+            | "BIGINT"
+            | "DECIMAL"
+            | "DEC"
+            | "NUMERIC"
+            | "FIXED"
+            | "FLOAT"
+            | "DOUBLE"
+            | "REAL"
+            | "BIT"
+            | "BOOL"
+            | "BOOLEAN"
+    );
+    let string = matches!(
+        base.as_str(),
+        "CHAR"
+            | "VARCHAR"
+            | "TEXT"
+            | "TINYTEXT"
+            | "MEDIUMTEXT"
+            | "LONGTEXT"
+            | "BLOB"
+            | "TINYBLOB"
+            | "MEDIUMBLOB"
+            | "LONGBLOB"
+            | "BINARY"
+            | "VARBINARY"
+    );
+    if numeric {
+        Some(numeric_expr("0"))
+    } else if string {
+        Some(Box::new(ast::Expr::Literal(ast::Literal::String(
+            "''".to_string(),
+        ))))
+    } else {
+        None
+    }
+}
+
 /// Builds a single-argument engine function call, e.g. `julianday(arg)`.
 /// Builds `coalesce(expr <op> 0, default)`, the lowering for the MySQL boolean
 /// tests `IS [NOT] TRUE/FALSE`: the comparison yields 1/0 (or NULL when `expr`
@@ -5843,6 +5935,52 @@ mod tests {
         assert_eq!(columns[0].col_name.as_str(), "id");
         assert_eq!(columns[0].col_type.as_ref().unwrap().name, "INT");
         assert_eq!(columns[1].col_name.as_str(), "name");
+    }
+
+    #[test]
+    fn not_null_columns_get_implicit_type_default() {
+        let stmt = parse(
+            "CREATE TABLE t (\
+                id INT PRIMARY KEY AUTO_INCREMENT, \
+                i INT NOT NULL, \
+                v VARCHAR(10) NOT NULL, \
+                n INT, \
+                e INT NOT NULL DEFAULT 7, \
+                dt DATETIME NOT NULL)",
+        )
+        .expect("should parse");
+        let ast::Stmt::CreateTable { body, .. } = stmt else {
+            panic!("expected CreateTable");
+        };
+        let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+            panic!("expected columns");
+        };
+        let default_of = |name: &str| -> Option<ast::Expr> {
+            let col = columns.iter().find(|c| c.col_name.as_str() == name).unwrap();
+            col.constraints.iter().find_map(|c| match &c.constraint {
+                ast::ColumnConstraint::Default(e) => Some((**e).clone()),
+                _ => None,
+            })
+        };
+        // A NOT NULL numeric column defaults to 0, a string column to ''.
+        assert_eq!(
+            default_of("i"),
+            Some(ast::Expr::Literal(ast::Literal::Numeric("0".to_string())))
+        );
+        assert_eq!(
+            default_of("v"),
+            Some(ast::Expr::Literal(ast::Literal::String("''".to_string())))
+        );
+        // The AUTO_INCREMENT PRIMARY KEY column, a nullable column, and a
+        // DATETIME column (no clean engine default) get no synthesized default.
+        for name in ["id", "n", "dt"] {
+            assert_eq!(default_of(name), None, "column `{name}` should have no default");
+        }
+        // An explicit DEFAULT is preserved unchanged.
+        assert_eq!(
+            default_of("e"),
+            Some(ast::Expr::Literal(ast::Literal::Numeric("7".to_string())))
+        );
     }
 
     #[test]
