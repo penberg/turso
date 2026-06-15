@@ -2452,6 +2452,12 @@ impl Parser {
             return self.last_day_call();
         }
 
+        // `EXTRACT(unit FROM d)` is the SQL-standard date-part extractor; the
+        // single calendar units share the date-part `strftime` lowering.
+        if upper == "EXTRACT" {
+            return self.extract_call();
+        }
+
         // Current date/time functions (`NOW()`, `CURDATE()`, ...) lower to the
         // engine's `datetime('now')` / `date('now')` / `time('now')`.
         if let Some(engine_fn) = current_time_function(&upper) {
@@ -2860,28 +2866,39 @@ impl Parser {
     fn date_part_call(&mut self, fmt: &str) -> Result<ast::Expr> {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        let strftime = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("strftime"),
-            distinctness: None,
-            args: vec![
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote(fmt)))),
-                Box::new(arg),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+        Ok(cast_strftime_int(fmt, arg))
+    }
+
+    /// Parses a SQL-standard `EXTRACT(unit FROM expr)` call (the name and `(` are
+    /// already consumed) and lowers it to the same `CAST(strftime(fmt, expr) AS
+    /// INTEGER)` as the date-part extractor functions. Only the single calendar
+    /// units that map to an engine `strftime` code are supported; `QUARTER`,
+    /// `WEEK`, `MICROSECOND`, and the compound units (`YEAR_MONTH`, `DAY_HOUR`,
+    /// …) are rejected.
+    fn extract_call(&mut self) -> Result<ast::Expr> {
+        let Some(Token::Word(u)) = self.peek() else {
+            return Err(self.unexpected("an EXTRACT unit"));
         };
-        Ok(ast::Expr::Cast {
-            expr: Box::new(strftime),
-            type_name: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-                array_dimensions: 0,
-            }),
-        })
+        let unit = u.to_ascii_uppercase();
+        self.advance();
+        self.expect_keyword("FROM")?;
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let fmt = match unit.as_str() {
+            "YEAR" => "%Y",
+            "MONTH" => "%m",
+            "DAY" => "%d",
+            "HOUR" => "%H",
+            "MINUTE" => "%M",
+            "SECOND" => "%S",
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "EXTRACT({other} FROM ...) is not supported yet"
+                )))
+            }
+        };
+        Ok(cast_strftime_int(fmt, arg))
     }
 
     /// Parses a `DAYOFWEEK(d)` / `WEEKDAY(d)` call (the name and `(` are already
@@ -3468,6 +3485,34 @@ fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
             filter_clause: None,
             over_clause: None,
         },
+    }
+}
+
+/// Builds `CAST(strftime(fmt, arg) AS INTEGER)`, the lowering shared by the
+/// MySQL date-part extractor functions (`YEAR`, `MONTH`, …) and `EXTRACT`. The
+/// integer cast strips strftime's zero-padding to match MySQL's numeric result.
+fn cast_strftime_int(fmt: &str, arg: ast::Expr) -> ast::Expr {
+    let strftime = ast::Expr::FunctionCall {
+        name: ast::Name::from_string("strftime"),
+        distinctness: None,
+        args: vec![
+            Box::new(ast::Expr::Literal(ast::Literal::String(requote(fmt)))),
+            Box::new(arg),
+        ],
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    };
+    ast::Expr::Cast {
+        expr: Box::new(strftime),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 
@@ -5102,6 +5147,10 @@ mod tests {
             ("HOUR(d)", "'%H'"),
             ("MINUTE(d)", "'%M'"),
             ("SECOND(d)", "'%S'"),
+            // EXTRACT(unit FROM d) shares the same lowering.
+            ("EXTRACT(YEAR FROM d)", "'%Y'"),
+            ("EXTRACT(MONTH FROM d)", "'%m'"),
+            ("EXTRACT(SECOND FROM d)", "'%S'"),
         ] {
             let ast::Expr::Cast { expr, type_name } = parse_expr(sql).unwrap() else {
                 panic!("expected `{sql}` to lower to a CAST");
@@ -5114,6 +5163,17 @@ mod tests {
             assert!(
                 matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == fmt),
                 "wrong format code for `{sql}`"
+            );
+        }
+        // EXTRACT units with no engine strftime code are rejected.
+        for sql in [
+            "EXTRACT(QUARTER FROM d)",
+            "EXTRACT(WEEK FROM d)",
+            "EXTRACT(YEAR_MONTH FROM d)",
+        ] {
+            assert!(
+                parse_expr(sql).is_err(),
+                "expected `{sql}` to be unsupported"
             );
         }
     }

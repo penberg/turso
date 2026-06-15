@@ -1,0 +1,51 @@
+# EXTRACT(unit FROM date) conformance.
+#
+# The SQL-standard EXTRACT(unit FROM d) returns the integer value of a
+# date/time component, like the MySQL YEAR()/MONTH()/... functions. The
+# front-end lowers the single calendar units to the same
+# CAST(strftime(fmt, d) AS INTEGER) those functions use.
+#
+# Scope: only YEAR, MONTH, DAY, HOUR, MINUTE, and SECOND map to an engine
+# strftime code. QUARTER, WEEK, MICROSECOND, and the compound units
+# (YEAR_MONTH, DAY_HOUR, …) are rejected by the front-end and covered by a
+# parser unit test, not here, because a real mysqld accepts them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ex_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO ex_demo (a, d) VALUES (1, '2020-03-15 09:07:42'), (2, '1999-12-31 23:59:59')
+
+# The date components are returned as integers (no zero-padding).
+query
+SELECT a, EXTRACT(YEAR FROM d), EXTRACT(MONTH FROM d), EXTRACT(DAY FROM d) FROM ex_demo ORDER BY a
+----
+1	2020	3	15
+2	1999	12	31
+
+# The time components.
+query
+SELECT EXTRACT(HOUR FROM d), EXTRACT(MINUTE FROM d), EXTRACT(SECOND FROM d) FROM ex_demo WHERE a = 1
+----
+9	7	42
+
+# Works on a bare date literal.
+query
+SELECT EXTRACT(YEAR FROM '2021-07-04')
+----
+2021
+
+# NULL propagates.
+query
+SELECT EXTRACT(MONTH FROM NULL)
+----
+NULL
+
+# Usable in a WHERE predicate.
+query
+SELECT a FROM ex_demo WHERE EXTRACT(YEAR FROM d) = 2020 ORDER BY a
+----
+1
