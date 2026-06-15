@@ -3,9 +3,10 @@
 # MySQL's DATE_FORMAT formats a datetime with format specifiers. The front-end
 # lowers it to the engine's strftime(), translating the MySQL specifiers that
 # have a direct strftime equivalent: %Y %m %d %H, %i (minutes -> %M),
-# %s (seconds -> %S), and %%. Literal characters pass through. The format must
-# be a string literal; specifiers without a strftime equivalent (e.g. %M month
-# name, %p, %W, %h) are rejected. See mysql/COMPAT.md.
+# %s (seconds -> %S), %j (day of year), %w (weekday number), and %%. Literal
+# characters pass through. The format must be a string literal; specifiers
+# without a strftime equivalent (e.g. %M month name, %p, %W weekday name, %h)
+# are rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -32,3 +33,32 @@ query
 SELECT DATE_FORMAT(d, '%H%%') FROM df_demo
 ----
 09%
+
+# %j is the day of year, 3-digit zero-padded (2020-03-15 is day 075).
+query
+SELECT DATE_FORMAT(d, '%j') FROM df_demo
+----
+075
+
+# %j at the year boundaries.
+query
+SELECT DATE_FORMAT('2021-01-01', '%j'), DATE_FORMAT('2021-12-31', '%j')
+----
+001	365
+
+# %w is the weekday number, 0=Sunday..6=Saturday (2020-03-15 is a Sunday).
+query
+SELECT DATE_FORMAT(d, '%w') FROM df_demo
+----
+0
+
+query
+SELECT DATE_FORMAT('2020-03-16', '%w'), DATE_FORMAT('2020-03-21', '%w')
+----
+1	6
+
+# %j and %w compose with literal text and other specifiers.
+query
+SELECT DATE_FORMAT(d, 'day %j (wday %w) of %Y') FROM df_demo
+----
+day 075 (wday 0) of 2020

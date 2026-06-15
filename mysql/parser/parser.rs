@@ -4955,6 +4955,11 @@ fn translate_date_format(mysql_fmt: &str) -> Result<String> {
             Some('H') => out.push_str("%H"),
             Some('i') => out.push_str("%M"),
             Some('s') => out.push_str("%S"),
+            // `%j` (day of year, 001-366) and `%w` (weekday, 0=Sunday..6) have
+            // the same name, range, and zero-padding in MySQL and strftime, so
+            // they pass straight through.
+            Some('j') => out.push_str("%j"),
+            Some('w') => out.push_str("%w"),
             Some('%') => out.push_str("%%"),
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
@@ -6586,7 +6591,17 @@ mod tests {
             matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%Y-%m-%d %H:%M:%S'"),
             "format was not translated correctly"
         );
-        // A specifier without a strftime equivalent is rejected.
+        // `%j` (day of year) and `%w` (weekday number) pass straight through.
+        let ast::Expr::FunctionCall { args, .. } = parse_expr("DATE_FORMAT(d, '%j-%w')").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%j-%w'")
+        );
+        // A specifier without a strftime equivalent is rejected (`%W` is the
+        // weekday *name* in MySQL but the *week number* in strftime, so it is not
+        // silently mistranslated).
         assert!(matches!(
             parse_expr("DATE_FORMAT(d, '%W')").unwrap_err(),
             ParseError::Unsupported(_)
