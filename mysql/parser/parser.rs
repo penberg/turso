@@ -3666,11 +3666,11 @@ impl Parser {
     }
 
     /// Parses a SQL-standard `EXTRACT(unit FROM expr)` call (the name and `(` are
-    /// already consumed) and lowers it to the same `CAST(strftime(fmt, expr) AS
-    /// INTEGER)` as the date-part extractor functions. Only the single calendar
-    /// units that map to an engine `strftime` code are supported; `QUARTER`,
-    /// `WEEK`, `MICROSECOND`, and the compound units (`YEAR_MONTH`, `DAY_HOUR`,
-    /// …) are rejected.
+    /// already consumed) and lowers it like the matching date-part function. The
+    /// single calendar units map to a `CAST(strftime(code, expr) AS INTEGER)`;
+    /// `WEEK` uses the default Sunday-first mode (`strftime('%U')`, like `WEEK(d)`)
+    /// and `QUARTER` is `(month + 2) / 3` (like `QUARTER(d)`). `MICROSECOND` and
+    /// the compound units (`YEAR_MONTH`, `DAY_HOUR`, …) are rejected.
     fn extract_call(&mut self) -> Result<ast::Expr> {
         let Some(Token::Word(u)) = self.peek() else {
             return Err(self.unexpected("an EXTRACT unit"));
@@ -3688,6 +3688,21 @@ impl Parser {
             "HOUR" => "%H",
             "MINUTE" => "%M",
             "SECOND" => "%S",
+            // The default week mode (0, Sunday-first) is strftime `%U`.
+            "WEEK" => "%U",
+            // `QUARTER` is `(month + 2) / 3`, like `QUARTER(d)`.
+            "QUARTER" => {
+                let month_plus_two = ast::Expr::binary(
+                    cast_strftime_int("%m", arg),
+                    ast::Operator::Add,
+                    ast::Expr::Literal(ast::Literal::Numeric("2".to_string())),
+                );
+                return Ok(ast::Expr::binary(
+                    month_plus_two,
+                    ast::Operator::Divide,
+                    ast::Expr::Literal(ast::Literal::Numeric("3".to_string())),
+                ));
+            }
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "EXTRACT({other} FROM ...) is not supported yet"
@@ -7226,12 +7241,23 @@ mod tests {
                 "wrong format code for `{sql}`"
             );
         }
-        // EXTRACT units with no engine strftime code are rejected.
-        for sql in [
-            "EXTRACT(QUARTER FROM d)",
-            "EXTRACT(WEEK FROM d)",
-            "EXTRACT(YEAR_MONTH FROM d)",
-        ] {
+        // EXTRACT(WEEK) maps to strftime %U; EXTRACT(QUARTER) to (month + 2) / 3.
+        let ast::Expr::Cast { expr, .. } = parse_expr("EXTRACT(WEEK FROM d)").unwrap() else {
+            panic!("expected EXTRACT(WEEK) to be a CAST of strftime");
+        };
+        let ast::Expr::FunctionCall { args, .. } = expr.as_ref() else {
+            unreachable!()
+        };
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%U'")
+        );
+        assert_eq!(
+            parse_expr("EXTRACT(QUARTER FROM d)").unwrap(),
+            parse_expr("QUARTER(d)").unwrap()
+        );
+
+        // MICROSECOND and the compound units remain rejected.
+        for sql in ["EXTRACT(MICROSECOND FROM d)", "EXTRACT(YEAR_MONTH FROM d)"] {
             assert!(
                 parse_expr(sql).is_err(),
                 "expected `{sql}` to be unsupported"

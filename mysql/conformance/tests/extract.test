@@ -5,10 +5,11 @@
 # front-end lowers the single calendar units to the same
 # CAST(strftime(fmt, d) AS INTEGER) those functions use.
 #
-# Scope: only YEAR, MONTH, DAY, HOUR, MINUTE, and SECOND map to an engine
-# strftime code. QUARTER, WEEK, MICROSECOND, and the compound units
-# (YEAR_MONTH, DAY_HOUR, …) are rejected by the front-end and covered by a
-# parser unit test, not here, because a real mysqld accepts them.
+# YEAR/MONTH/DAY/HOUR/MINUTE/SECOND map to a strftime code; WEEK uses the default
+# Sunday-first mode (like WEEK(d)) and QUARTER is (month + 2) / 3 (like
+# QUARTER(d)). MICROSECOND and the compound units (YEAR_MONTH, DAY_HOUR, …) are
+# rejected by the front-end and covered by a parser unit test, not here, because
+# a real mysqld accepts them.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name and ORDER BY-deterministic queries.
@@ -49,3 +50,20 @@ query
 SELECT a FROM ex_demo WHERE EXTRACT(YEAR FROM d) = 2020 ORDER BY a
 ----
 1
+
+# QUARTER (1-4) and WEEK (Sunday-first, default mode) are also extractable.
+query
+SELECT EXTRACT(QUARTER FROM '2020-01-15'), EXTRACT(QUARTER FROM '2020-05-01'), EXTRACT(QUARTER FROM '2020-12-31')
+----
+1	2	4
+
+query
+SELECT EXTRACT(WEEK FROM '2020-01-08'), EXTRACT(WEEK FROM '2020-01-04')
+----
+1	0
+
+# They agree with the QUARTER() / WEEK() functions.
+query
+SELECT EXTRACT(QUARTER FROM d) = QUARTER(d), EXTRACT(WEEK FROM d) = WEEK(d) FROM ex_demo WHERE a = 1
+----
+1	1
