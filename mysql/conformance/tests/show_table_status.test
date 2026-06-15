@@ -1,0 +1,32 @@
+# SHOW TABLE STATUS [LIKE 'pattern'] conformance.
+#
+# WordPress reads SHOW TABLE STATUS in two places: maybe_convert_table_to_utf8mb4
+# (`SHOW TABLE STATUS LIKE '<table>'`, an existence check plus the table's
+# Collation) and Site Health (sums Data_length + Index_length). The front-end
+# answers it server-side, one row per table, with MySQL's 18-column shape. Most
+# columns the engine does not track (sizes, timestamps, auto-increment) are 0 or
+# NULL; Engine/Row_format/Collation are fixed front-end values and Rows is the
+# table's real COUNT(*). An unknown table (via LIKE) yields an empty result set.
+#
+# The size/timestamp columns are front-end constants, so those values differ
+# from a real mysqld; this test asserts the deterministic front-end output.
+# Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS tstat_demo (id INT PRIMARY KEY, v TEXT)
+
+statement ok
+INSERT INTO tstat_demo (id, v) VALUES (1, 'a'), (2, 'b')
+
+# One row, the full 18-column shape; Rows is the real count and Collation is
+# populated (WordPress splits it on '_' to recover the charset).
+query
+SHOW TABLE STATUS LIKE 'tstat_demo'
+----
+tstat_demo	InnoDB	10	Dynamic	2	0	0	0	0	0	NULL	NULL	NULL	NULL	utf8mb4_general_ci	NULL		
+
+# An unknown table name yields an empty result set (WordPress treats the missing
+# row as "table does not exist").
+query
+SHOW TABLE STATUS LIKE 'no_such_tstat_table'
+----

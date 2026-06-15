@@ -58,6 +58,9 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     if let Some(parsed) = parse_show_index(sql) {
         return Some(build_index(conn, &parsed));
     }
+    if let Some(parsed) = parse_show_table_status(sql) {
+        return Some(build_table_status(conn, &parsed).map(ShowOutcome::Columns));
+    }
     if let Some(parsed) = parse_show_variables(sql) {
         return Some(Ok(ShowOutcome::Columns(build_variables(&parsed))));
     }
@@ -749,6 +752,153 @@ fn parse_show_tables(sql: &str) -> Option<ShowTables> {
     Some(ShowTables { full, like })
 }
 
+/// The 18 columns of MySQL 8's `SHOW TABLE STATUS` result set, in order.
+const TABLE_STATUS_COLUMNS: &[&str] = &[
+    "Name",
+    "Engine",
+    "Version",
+    "Row_format",
+    "Rows",
+    "Avg_row_length",
+    "Data_length",
+    "Max_data_length",
+    "Index_length",
+    "Data_free",
+    "Auto_increment",
+    "Create_time",
+    "Update_time",
+    "Check_time",
+    "Collation",
+    "Checksum",
+    "Create_options",
+    "Comment",
+];
+
+/// The parsed form of a `SHOW TABLE STATUS [{FROM|IN} db] [LIKE 'pattern']`
+/// statement: the optional `LIKE` pattern (`None` lists every table).
+struct ShowTableStatus {
+    like: Option<String>,
+}
+
+/// Parses `SHOW TABLE STATUS [{FROM|IN} db] [LIKE 'pattern']`, returning `None`
+/// for any other statement (including the `WHERE` form, which falls through).
+fn parse_show_table_status(sql: &str) -> Option<ShowTableStatus> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let mut k = 0;
+    let kw = |t: &str, kw: &str| t.eq_ignore_ascii_case(kw);
+
+    if !toks.get(k).is_some_and(|t| kw(t, "SHOW")) {
+        return None;
+    }
+    k += 1;
+    if !toks.get(k).is_some_and(|t| kw(t, "TABLE")) {
+        return None;
+    }
+    k += 1;
+    if !toks.get(k).is_some_and(|t| kw(t, "STATUS")) {
+        return None;
+    }
+    k += 1;
+
+    // Optional `{FROM|IN} db` qualifier; consumed and ignored.
+    if toks.get(k).is_some_and(|t| kw(t, "FROM") || kw(t, "IN")) {
+        k += 1;
+        toks.get(k)?;
+        k += 1;
+    }
+
+    // Optional `LIKE 'pattern'`.
+    let like = if toks.get(k).is_some_and(|t| kw(t, "LIKE")) {
+        k += 1;
+        let pat = toks.get(k)?;
+        let unquoted = pat
+            .strip_prefix('\'')
+            .and_then(|p| p.strip_suffix('\''))
+            .or_else(|| pat.strip_prefix('"').and_then(|p| p.strip_suffix('"')))?;
+        k += 1;
+        Some(unquoted.to_string())
+    } else {
+        None
+    };
+
+    if k != toks.len() {
+        return None;
+    }
+    Some(ShowTableStatus { like })
+}
+
+/// Builds the `SHOW TABLE STATUS` result set from the schema. Most columns the
+/// engine does not track (sizes, timestamps, auto-increment) are reported as `0`
+/// or NULL; `Engine`/`Row_format`/`Collation` are the front-end's fixed values,
+/// and `Rows` is the table's real `COUNT(*)`. WordPress reads `Collation` (to
+/// derive a table's charset) and sums `Data_length`/`Index_length`.
+fn build_table_status(
+    conn: &Arc<Connection>,
+    show: &ShowTableStatus,
+) -> Result<ColumnsResult, LimboError> {
+    let mut query =
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            .to_string();
+    if let Some(pat) = &show.like {
+        query.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
+    }
+    query.push_str(" ORDER BY name");
+
+    let mut names: Vec<String> = Vec::new();
+    if let Some(mut stmt) = conn.query(&query)? {
+        stmt.run_with_row_callback(|row| {
+            names.push(value_to_string(row.get_value(0)).unwrap_or_default());
+            Ok(())
+        })?;
+    }
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    for name in names {
+        let count = table_row_count(conn, &name)?;
+        rows.push(vec![
+            Some(name),
+            Some("InnoDB".to_string()),
+            Some("10".to_string()),
+            Some("Dynamic".to_string()),
+            Some(count.to_string()),
+            Some("0".to_string()), // Avg_row_length
+            Some("0".to_string()), // Data_length
+            Some("0".to_string()), // Max_data_length
+            Some("0".to_string()), // Index_length
+            Some("0".to_string()), // Data_free
+            None,                  // Auto_increment
+            None,                  // Create_time
+            None,                  // Update_time
+            None,                  // Check_time
+            Some(COLLATION.to_string()),
+            None,                // Checksum
+            Some(String::new()), // Create_options
+            Some(String::new()), // Comment
+        ]);
+    }
+
+    Ok(ColumnsResult {
+        columns: TABLE_STATUS_COLUMNS.to_vec(),
+        rows,
+    })
+}
+
+/// Counts the rows of `table` (for the `Rows` column of `SHOW TABLE STATUS`).
+fn table_row_count(conn: &Arc<Connection>, table: &str) -> Result<i64, LimboError> {
+    let query = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
+    let mut count = 0i64;
+    if let Some(mut stmt) = conn.query(&query)? {
+        stmt.run_with_row_callback(|row| {
+            count = value_to_string(row.get_value(0))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            Ok(())
+        })?;
+    }
+    Ok(count)
+}
+
 /// The parsed form of a `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern']`
 /// statement: the optional `LIKE` pattern (`None` for the bare form).
 struct ShowVariables {
@@ -932,6 +1082,28 @@ mod tests {
         // Not SHOW TABLES, or an unhandled WHERE form.
         assert!(parse_show_tables("SHOW COLUMNS FROM t").is_none());
         assert!(parse_show_tables("SHOW TABLES WHERE 1").is_none());
+    }
+
+    #[test]
+    fn parses_show_table_status() {
+        assert!(parse_show_table_status("SHOW TABLE STATUS").unwrap().like.is_none());
+        assert_eq!(
+            parse_show_table_status("SHOW TABLE STATUS LIKE 'wp_posts'")
+                .unwrap()
+                .like
+                .as_deref(),
+            Some("wp_posts")
+        );
+        // The `{FROM|IN} db` qualifier is accepted and ignored.
+        assert!(parse_show_table_status("SHOW TABLE STATUS FROM mydb LIKE 't'").is_some());
+        // Unrelated statements and the WHERE form fall through.
+        assert!(parse_show_table_status("SHOW TABLES").is_none());
+        assert!(parse_show_table_status("SHOW TABLE STATUS WHERE Name = 't'").is_none());
+        // The 18-column MySQL shape is reported in order.
+        assert_eq!(TABLE_STATUS_COLUMNS.len(), 18);
+        assert_eq!(TABLE_STATUS_COLUMNS[0], "Name");
+        assert_eq!(TABLE_STATUS_COLUMNS[14], "Collation");
+        assert_eq!(TABLE_STATUS_COLUMNS[17], "Comment");
     }
 
     #[test]
