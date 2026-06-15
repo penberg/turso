@@ -272,7 +272,7 @@ incomplete.
 | INSERT ... VALUES (basic)              | ✅     | Multi-row `VALUES` supported. The empty form `INSERT INTO t () VALUES ()` (and the column-list-less `INSERT INTO t VALUES ()`) inserts one all-defaults row, lowered to the engine's `DEFAULT VALUES`. |
 | INSERT ... SET                         | ✅     | The `INSERT [INTO] t SET col = expr, ...` assignment form, built as the equivalent `(cols) VALUES (exprs)`. |
 | INSERT ... SELECT                      | ✅     | `INSERT [INTO] t [(cols)] SELECT ...`; the query runs through the same SELECT subset, evaluated by the engine. |
-| INSERT ... ON DUPLICATE KEY UPDATE     | ✅     | Lowered to the engine's target-less upsert (`ON CONFLICT DO UPDATE SET ...`), which fires on any unique/primary-key conflict like MySQL. `VALUES(col)` is mapped to `excluded.col`; `VALUES(...)` nested inside a larger expression is not modeled (parse error). |
+| INSERT ... ON DUPLICATE KEY UPDATE     | ✅     | Lowered to the engine's target-less upsert (`ON CONFLICT DO UPDATE SET ...`), which fires on any unique/primary-key conflict like MySQL. The `VALUES(col)` pseudo-function (the would-be-inserted value) is mapped to `excluded.col` anywhere in the assignment expression (e.g. `c = c + VALUES(c)`, `GREATEST(c, VALUES(c))`); a bare column on the right refers to the existing row. |
 | INSERT IGNORE / DELAYED / priority     | ❌     | **Not supported.** |
 | INTERSECT clause                       | ❌     |         |
 | LOAD DATA                              | ❌     |         |

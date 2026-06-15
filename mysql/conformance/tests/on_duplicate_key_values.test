@@ -1,0 +1,54 @@
+# VALUES(col) inside an ON DUPLICATE KEY UPDATE expression.
+#
+# In INSERT ... ON DUPLICATE KEY UPDATE, the VALUES(col) pseudo-function is the
+# value that would have been inserted for `col`; the front-end lowers it to the
+# engine's upsert `excluded.col`. It is now recognized anywhere in the assignment
+# expression (e.g. `c = c + VALUES(c)`, `GREATEST(c, VALUES(c))`), not only as a
+# bare right-hand side. A bare column on the right refers to the existing row.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS odkv (id INT PRIMARY KEY, c INT, hits INT DEFAULT 0)
+
+statement ok
+INSERT INTO odkv (id, c) VALUES (1, 10)
+
+# VALUES(col) in an arithmetic expression, plus a bare-column reference to the
+# existing row: c becomes 10 + 5 = 15 and hits 0 + 1 = 1.
+statement ok
+INSERT INTO odkv (id, c) VALUES (1, 5) ON DUPLICATE KEY UPDATE c = c + VALUES(c), hits = hits + 1
+
+query
+SELECT id, c, hits FROM odkv WHERE id = 1
+----
+1	15	1
+
+# VALUES(col) nested inside a function call: GREATEST(15, 50) = 50.
+statement ok
+INSERT INTO odkv (id, c) VALUES (1, 50) ON DUPLICATE KEY UPDATE c = GREATEST(c, VALUES(c))
+
+query
+SELECT c FROM odkv WHERE id = 1
+----
+50
+
+# The bare VALUES(col) right-hand side still works.
+statement ok
+INSERT INTO odkv (id, c) VALUES (1, 99) ON DUPLICATE KEY UPDATE c = VALUES(c)
+
+query
+SELECT c FROM odkv WHERE id = 1
+----
+99
+
+# No conflict: the row is inserted and the UPDATE clause (with VALUES) is not run.
+statement ok
+INSERT INTO odkv (id, c) VALUES (2, 7) ON DUPLICATE KEY UPDATE c = c + VALUES(c)
+
+query
+SELECT id, c FROM odkv ORDER BY id
+----
+1	99
+2	7

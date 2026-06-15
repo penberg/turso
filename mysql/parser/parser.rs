@@ -23,6 +23,10 @@ pub struct Parser {
     /// Number of positional `?` placeholders seen so far. MySQL parameters are
     /// purely positional, so each `?` takes the next index in appearance order.
     params: u32,
+    /// Whether the parser is inside an `ON DUPLICATE KEY UPDATE` assignment
+    /// right-hand side, where the `VALUES(col)` pseudo-function refers to the
+    /// would-be-inserted value and lowers to the engine's `excluded.col`.
+    in_upsert_assignment: bool,
 }
 
 impl Parser {
@@ -36,6 +40,7 @@ impl Parser {
             pos: 0,
             eof: input.len(),
             params: 0,
+            in_upsert_assignment: false,
         })
     }
 
@@ -1359,23 +1364,16 @@ impl Parser {
         })
     }
 
-    /// Parses the right-hand side of an `ON DUPLICATE KEY UPDATE` assignment. A
-    /// leading `VALUES(col)` is lowered to `excluded.col`; anything else is an
-    /// ordinary expression (a bare column refers to the existing row's value, as
-    /// in MySQL). `VALUES(...)` nested inside a larger expression is not modeled
-    /// and falls out as a parse error.
+    /// Parses the right-hand side of an `ON DUPLICATE KEY UPDATE` assignment as an
+    /// ordinary expression, with `VALUES(col)` understood (anywhere in the
+    /// expression) as the would-be-inserted value, lowered to `excluded.col` (see
+    /// [`Self::function_call`]). A bare column refers to the existing row's value,
+    /// as in MySQL.
     fn upsert_assignment_value(&mut self) -> Result<ast::Expr> {
-        if self.is_keyword("VALUES") {
-            self.advance();
-            self.expect(&Token::LParen, "`(`")?;
-            let col = self.name()?;
-            self.expect(&Token::RParen, "`)`")?;
-            return Ok(ast::Expr::Qualified(
-                ast::Name::from_string("excluded"),
-                col,
-            ));
-        }
-        self.expr()
+        self.in_upsert_assignment = true;
+        let result = self.expr();
+        self.in_upsert_assignment = false;
+        result
     }
 
     // === SELECT ===
@@ -3017,6 +3015,16 @@ impl Parser {
         let name = self.name()?;
         let upper = name.as_str().to_ascii_uppercase();
         self.expect(&Token::LParen, "`(`")?;
+
+        // Inside an `ON DUPLICATE KEY UPDATE` assignment, `VALUES(col)` is the
+        // would-be-inserted value; it lowers to the engine's `excluded.col`. This
+        // is recognized anywhere in the assignment expression (e.g. `c =
+        // c + VALUES(c)`), not only as the bare right-hand side.
+        if upper == "VALUES" && self.in_upsert_assignment {
+            let col = self.name()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(ast::Expr::Qualified(ast::Name::from_string("excluded"), col));
+        }
 
         // `CONCAT(a, b, ...)` lowers to the engine's `||` concatenation, which —
         // like MySQL's CONCAT — yields NULL if any argument is NULL. (The
@@ -7162,13 +7170,33 @@ mod tests {
     }
 
     #[test]
-    fn insert_on_duplicate_values_inside_expression_is_rejected() {
-        // `VALUES(...)` is only modeled as a whole RHS; nested in an expression
-        // it hits the function allow-list and is rejected.
-        assert!(
-            parse("INSERT INTO t (n) VALUES (1) ON DUPLICATE KEY UPDATE n = n + VALUES(n)")
-                .is_err()
-        );
+    fn insert_on_duplicate_values_inside_expression_lowers_to_excluded() {
+        // `VALUES(col)` is recognized anywhere in the assignment expression (not
+        // only as a whole RHS) and lowers to `excluded.col`.
+        let stmt =
+            parse("INSERT INTO t (n) VALUES (1) ON DUPLICATE KEY UPDATE n = n + VALUES(n)").unwrap();
+        let ast::Stmt::Insert {
+            body: ast::InsertBody::Select(_, Some(upsert)),
+            ..
+        } = stmt
+        else {
+            panic!("expected an upsert");
+        };
+        let ast::UpsertDo::Set { sets, .. } = &upsert.do_clause else {
+            panic!("expected DO UPDATE SET");
+        };
+        // `n + VALUES(n)` -> `n + excluded.n`.
+        let ast::Expr::Binary(_, ast::Operator::Add, rhs) = sets[0].expr.as_ref() else {
+            panic!("expected an addition");
+        };
+        assert!(matches!(
+            rhs.as_ref(),
+            ast::Expr::Qualified(tbl, col) if tbl.as_str() == "excluded" && col.as_str() == "n"
+        ));
+
+        // `VALUES(col)` outside an upsert assignment is still rejected (the flag
+        // is scoped to the assignment RHS).
+        assert!(parse("SELECT VALUES(n) FROM t").is_err());
     }
 
     #[test]
