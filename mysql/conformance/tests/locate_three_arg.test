@@ -1,0 +1,58 @@
+# LOCATE(substr, str, pos) -- the three-argument form -- conformance.
+#
+# LOCATE(substr, str, pos) returns the 1-based position of substr in str at or
+# after pos, or 0 if not found. The front-end lowers it to a search in the tail
+# substr(str, pos), shifting the relative position back to absolute:
+#   CASE WHEN instr(lower(substr(str,pos)), lower(substr)) = 0
+#        THEN 0 ELSE pos - 1 + that_instr END.
+# Like the two-argument form the match is case-insensitive (ASCII, via lower).
+# NULL propagates.
+#
+# Scope: pos >= 1 (a non-positive pos is a documented edge). INSTR stays
+# two-argument only.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Searching from a later position skips earlier matches.
+query
+SELECT LOCATE('o', 'hello world', 6), LOCATE('o', 'hello world')
+----
+8	5
+
+# A match exactly at pos is found.
+query
+SELECT LOCATE('l', 'hello', 4), LOCATE('l', 'hello', 3)
+----
+4	3
+
+# No match at or after pos gives 0.
+query
+SELECT LOCATE('x', 'hello', 2), LOCATE('h', 'hello', 2)
+----
+0	0
+
+# The search is case-insensitive, like the two-argument form.
+query
+SELECT LOCATE('O', 'HELLO', 3), LOCATE('L', 'hello', 1)
+----
+5	3
+
+# NULL in any argument propagates.
+query
+SELECT LOCATE('l', 'hello', NULL), LOCATE(NULL, 'hello', 2), LOCATE('l', NULL, 2)
+----
+NULL	NULL	NULL
+
+# Usable over a column to find the second occurrence of a delimiter.
+statement ok
+CREATE TABLE IF NOT EXISTS loc_demo (id INT PRIMARY KEY, path VARCHAR(40))
+
+statement ok
+INSERT INTO loc_demo (id, path) VALUES (1, 'a/b/c'), (2, 'x/y')
+
+query
+SELECT id, LOCATE('/', path, LOCATE('/', path) + 1) FROM loc_demo ORDER BY id
+----
+1	4
+2	0

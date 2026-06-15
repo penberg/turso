@@ -3108,42 +3108,74 @@ impl Parser {
         Ok(ast::Expr::is_null(arg))
     }
 
-    /// Parses an `INSTR(str, substr)` or `LOCATE(substr, str)` call (the name and
-    /// `(` are already consumed) and lowers it to `instr(lower(str), lower(substr))`
-    /// — the 1-based position of the substring, or 0 if absent. `swap_args` is
-    /// true for `LOCATE`, whose operands are the reverse of `INSTR`. Wrapping both
-    /// operands in `lower()` makes the search case-insensitive, matching MySQL's
-    /// default-collation behaviour (ASCII case folding; positions are unchanged so
-    /// the result matches). The three-argument `LOCATE(substr, str, pos)` form has
-    /// no engine equivalent and is rejected. NULL propagates.
+    /// Parses an `INSTR(str, substr)` or `LOCATE(substr, str[, pos])` call (the
+    /// name and `(` are already consumed) and lowers it to `instr(lower(str),
+    /// lower(substr))` — the 1-based position of the substring, or 0 if absent.
+    /// `swap_args` is true for `LOCATE`, whose operands are the reverse of
+    /// `INSTR`. Wrapping both operands in `lower()` makes the search
+    /// case-insensitive, matching MySQL's default-collation behaviour (ASCII case
+    /// folding; positions are unchanged so the result matches). NULL propagates.
+    ///
+    /// `LOCATE(substr, str, pos)` searches from the 1-based `pos`: it lowers to
+    /// `CASE WHEN instr(lower(substr(str, pos)), lower(substr)) = 0 THEN 0 ELSE
+    /// pos - 1 + that_instr END` — the position relative to `pos`, shifted back to
+    /// an absolute position, or 0 when not found. Only the normal `pos >= 1` range
+    /// matches MySQL (a non-positive `pos` is a documented edge). The three-arg
+    /// form is `LOCATE`-only; an `INSTR` with three arguments is rejected.
     fn instr_call(&mut self, swap_args: bool) -> Result<ast::Expr> {
         let first = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
         let second = self.expr()?;
-        if self.is(&Token::Comma) {
-            return Err(ParseError::Unsupported(
-                "LOCATE with a start position is not supported yet".to_string(),
-            ));
-        }
+        let pos = if self.eat(&Token::Comma) {
+            if !swap_args {
+                return Err(ParseError::Unsupported(
+                    "INSTR takes exactly two arguments".to_string(),
+                ));
+            }
+            Some(self.expr()?)
+        } else {
+            None
+        };
         self.expect(&Token::RParen, "`)`")?;
         let (haystack, needle) = if swap_args {
             (second, first)
         } else {
             (first, second)
         };
-        Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("instr"),
-            distinctness: None,
-            args: vec![
-                Box::new(unary_fn("lower", haystack)),
-                Box::new(unary_fn("lower", needle)),
+
+        let Some(pos) = pos else {
+            return Ok(call_fn(
+                "instr",
+                vec![unary_fn("lower", haystack), unary_fn("lower", needle)],
+            ));
+        };
+
+        // Search from `pos`: find the needle in the tail `substr(haystack, pos)`,
+        // then shift the relative position back to absolute (`pos - 1 + rel`).
+        let relative = call_fn(
+            "instr",
+            vec![
+                unary_fn("lower", call_fn("substr", vec![haystack, pos.clone()])),
+                unary_fn("lower", needle),
             ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+        );
+        let zero = || ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+        let absolute = ast::Expr::binary(
+            ast::Expr::binary(
+                pos,
+                ast::Operator::Subtract,
+                ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+            ),
+            ast::Operator::Add,
+            relative.clone(),
+        );
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::binary(relative, ast::Operator::Equals, zero())),
+                Box::new(zero()),
+            )],
+            else_expr: Some(Box::new(absolute)),
         })
     }
 
@@ -6676,8 +6708,13 @@ mod tests {
         assert_eq!(inner(args[0].as_ref()), "'Haystack'");
         assert_eq!(inner(args[1].as_ref()), "'NEEDLE'");
 
-        // The 3-argument LOCATE form is rejected.
-        assert!(parse_expr("LOCATE('a', 'banana', 3)").is_err());
+        // The 3-argument LOCATE(substr, str, pos) form searches from `pos`,
+        // lowering to a guarded CASE over an offset instr(); INSTR stays 2-arg.
+        assert!(matches!(
+            parse_expr("LOCATE('a', 'banana', 3)").unwrap(),
+            ast::Expr::Case { .. }
+        ));
+        assert!(parse_expr("INSTR('banana', 'a', 3)").is_err());
     }
 
     #[test]
