@@ -3039,6 +3039,11 @@ impl Parser {
             return self.makedate_call();
         }
 
+        // `MAKETIME(hour, minute, second)` builds a time string from components.
+        if upper == "MAKETIME" {
+            return self.maketime_call();
+        }
+
         // `EXTRACT(unit FROM d)` is the SQL-standard date-part extractor; the
         // single calendar units share the date-part `strftime` lowering.
         if upper == "EXTRACT" {
@@ -4364,6 +4369,66 @@ impl Parser {
             ],
         );
         let made = call_fn("date", vec![jan_first, day_offset]);
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(guard),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(made)),
+        })
+    }
+
+    /// Lowers `MAKETIME(hour, minute, second)` (the name and `(` are already
+    /// consumed) to `printf('%02d:%02d:%02d', hour, minute, second)`, guarded by a
+    /// `CASE` that returns NULL when any argument is NULL or `minute`/`second` is
+    /// outside `0..=59` (which MySQL also rejects to NULL). The hour may exceed 23
+    /// (MySQL `TIME` spans to 838 hours). Divergences not modeled: a negative hour
+    /// renders as `-1:..` rather than MySQL's `-01:..`, and an hour past 838 is
+    /// not clamped — documented in `mysql/COMPAT.md`. Exactly three arguments are
+    /// required.
+    fn maketime_call(&mut self) -> Result<ast::Expr> {
+        let hour = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let minute = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let second = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let num = |n: &str| ast::Expr::Literal(ast::Literal::Numeric(n.to_string()));
+        // `v < 0 OR v > 59`
+        let out_of_range = |v: ast::Expr| {
+            ast::Expr::binary(
+                ast::Expr::binary(v.clone(), ast::Operator::Less, num("0")),
+                ast::Operator::Or,
+                ast::Expr::binary(v, ast::Operator::Greater, num("59")),
+            )
+        };
+        let any_null = ast::Expr::binary(
+            ast::Expr::binary(
+                ast::Expr::is_null(hour.clone()),
+                ast::Operator::Or,
+                ast::Expr::is_null(minute.clone()),
+            ),
+            ast::Operator::Or,
+            ast::Expr::is_null(second.clone()),
+        );
+        let bad_range = ast::Expr::binary(
+            out_of_range(minute.clone()),
+            ast::Operator::Or,
+            out_of_range(second.clone()),
+        );
+        let guard = ast::Expr::binary(any_null, ast::Operator::Or, bad_range);
+
+        let made = call_fn(
+            "printf",
+            vec![
+                ast::Expr::Literal(ast::Literal::String(requote("%02d:%02d:%02d"))),
+                hour,
+                minute,
+                second,
+            ],
+        );
         Ok(ast::Expr::Case {
             base: None,
             when_then_pairs: vec![(
@@ -7564,6 +7629,27 @@ mod tests {
         // A unit without an engine modifier and a non-literal amount are rejected.
         assert!(parse_expr("TIMESTAMPADD(MICROSECOND, 1, d)").is_err());
         assert!(parse_expr("TIMESTAMPADD(DAY, x, d)").is_err());
+    }
+
+    #[test]
+    fn maketime_lowers_to_guarded_printf() {
+        // MAKETIME(h, m, s) -> CASE WHEN <null/range guard> THEN NULL ELSE
+        // printf('%02d:%02d:%02d', h, m, s).
+        let ast::Expr::Case {
+            base, else_expr, ..
+        } = parse_expr("MAKETIME(h, m, s)").unwrap()
+        else {
+            panic!("expected MAKETIME to lower to a guarded CASE");
+        };
+        assert!(base.is_none());
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE to be a printf() call");
+        };
+        assert_eq!(name.as_str(), "printf");
+        assert_eq!(args.len(), 4);
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%02d:%02d:%02d'")
+        );
     }
 
     #[test]

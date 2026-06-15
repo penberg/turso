@@ -1,0 +1,56 @@
+# MAKETIME(hour, minute, second) conformance.
+#
+# MAKETIME builds a time string from hour/minute/second components. The front-end
+# lowers it to printf('%02d:%02d:%02d', hour, minute, second), guarded by a CASE
+# that returns NULL when any argument is NULL or minute/second is outside 0..59
+# (which MySQL also rejects to NULL). The hour may exceed 23 (a MySQL TIME spans
+# many hours).
+#
+# Scope: a negative hour (MySQL pads to -01:..; printf gives -1:..) and an hour
+# past 838 (MySQL clamps) diverge and are not exercised.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Components are zero-padded to two digits.
+query
+SELECT MAKETIME(12, 30, 45), MAKETIME(1, 2, 3), MAKETIME(0, 0, 0)
+----
+12:30:45	01:02:03	00:00:00
+
+# The hour may exceed 23 (TIME is not clamped to a clock).
+query
+SELECT MAKETIME(25, 0, 0), MAKETIME(100, 30, 5)
+----
+25:00:00	100:30:05
+
+# An out-of-range minute or second yields NULL.
+query
+SELECT MAKETIME(12, 60, 0), MAKETIME(12, 0, 60), MAKETIME(12, -1, 0)
+----
+NULL	NULL	NULL
+
+# NULL in any argument yields NULL.
+query
+SELECT MAKETIME(NULL, 0, 0), MAKETIME(12, NULL, 0), MAKETIME(12, 0, NULL)
+----
+NULL	NULL	NULL
+
+# It round-trips through TIME_TO_SEC (1h 1m 1s = 3661 seconds).
+query
+SELECT TIME_TO_SEC(MAKETIME(1, 1, 1))
+----
+3661
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS mt_demo (id INT PRIMARY KEY, h INT, m INT, s INT)
+
+statement ok
+INSERT INTO mt_demo (id, h, m, s) VALUES (1, 9, 5, 0), (2, 23, 59, 59)
+
+query
+SELECT id, MAKETIME(h, m, s) FROM mt_demo ORDER BY id
+----
+1	09:05:00
+2	23:59:59
