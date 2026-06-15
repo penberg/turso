@@ -5769,8 +5769,9 @@ fn is_supported_function(upper_name: &str) -> bool {
         // square root, exponential, and natural log. `CEILING`/`POWER` are MySQL
         // synonyms renamed to `ceil`/`pow` below.
         | "ROUND" | "FLOOR" | "CEIL" | "CEILING" | "POW" | "POWER" | "SQRT" | "EXP" | "LN"
-        // Aggregate functions.
-        | "COUNT" | "SUM" | "MIN" | "MAX"
+        // Aggregate functions. `AVG` (the mean, ignoring NULLs — and `AVG(DISTINCT
+        // x)`) maps to the engine's `avg`, which behaves identically.
+        | "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
     )
 }
 
@@ -5986,7 +5987,7 @@ fn current_time_function(upper_name: &str) -> Option<&'static str> {
 /// The aggregate functions, which (unlike the scalar ones) accept a `DISTINCT`
 /// quantifier. `upper_name` must already be uppercased.
 fn is_aggregate_function(upper_name: &str) -> bool {
-    matches!(upper_name, "COUNT" | "SUM" | "MIN" | "MAX")
+    matches!(upper_name, "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
 }
 
 /// The engine's name for a MySQL function that shares its behaviour but not its
@@ -6978,12 +6979,10 @@ mod tests {
     }
 
     #[test]
-    fn avg_and_group_by_ordinal_are_unsupported() {
-        // AVG diverges (DECIMAL formatting); GROUP BY ordinal diverges.
-        assert!(matches!(
-            parse("SELECT AVG(a) FROM t").unwrap_err(),
-            ParseError::Unsupported(_)
-        ));
+    fn group_by_ordinal_is_unsupported() {
+        // `GROUP BY 1` (group by output-column position) is not modeled. (`AVG`
+        // is supported — see `aggregate_distinct`; its result is a plain double
+        // rather than MySQL's fixed-scale DECIMAL, but the value matches.)
         assert!(matches!(
             parse("SELECT a FROM t GROUP BY 1").unwrap_err(),
             ParseError::Unsupported(_)
@@ -9276,8 +9275,13 @@ mod tests {
         assert!(matches!(distinctness, Some(ast::Distinctness::Distinct)));
         assert_eq!(args.len(), 1);
 
-        // SUM/MIN/MAX also accept DISTINCT; ALL is the default and elided.
-        for input in ["SUM(DISTINCT v)", "MIN(DISTINCT v)", "MAX(DISTINCT v)"] {
+        // SUM/MIN/MAX/AVG also accept DISTINCT; ALL is the default and elided.
+        for input in [
+            "SUM(DISTINCT v)",
+            "MIN(DISTINCT v)",
+            "MAX(DISTINCT v)",
+            "AVG(DISTINCT v)",
+        ] {
             assert!(matches!(
                 parse_expr(input).unwrap(),
                 ast::Expr::FunctionCall {

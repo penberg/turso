@@ -1,0 +1,53 @@
+# The AVG aggregate function.
+#
+# AVG(expr) is the mean of the non-NULL values, and AVG(DISTINCT expr) averages
+# the distinct values; both ignore NULLs and yield NULL over an empty/all-NULL
+# group, exactly like the engine's avg(). The front-end now accepts AVG (it had
+# been missing from the aggregate allow-list alongside COUNT/SUM/MIN/MAX).
+#
+# Results are asserted via comparisons: the engine renders the mean as a plain
+# double where MySQL prints a fixed-scale DECIMAL (`22.5` vs `22.5000`), but the
+# numeric value is equal on both targets. Passes against both turso-mysql-server
+# and a real mysqld. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS avgt (id INT PRIMARY KEY, grp INT, c INT)
+
+statement ok
+INSERT INTO avgt (id, grp, c) VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 30), (5, 2, NULL)
+
+# Overall mean ignores the NULL row: (10 + 20 + 30 + 30) / 4 = 22.5.
+query
+SELECT AVG(c) = 22.5 FROM avgt
+----
+1
+
+# Per group via GROUP BY / HAVING.
+query
+SELECT grp FROM avgt GROUP BY grp HAVING AVG(c) = 15
+----
+1
+
+query
+SELECT grp FROM avgt GROUP BY grp HAVING AVG(c) = 30
+----
+2
+
+# AVG(DISTINCT) averages the distinct values: group 2 has {30, 30, NULL}, so the
+# distinct mean is 30 (not 30 weighted by the duplicate).
+query
+SELECT AVG(DISTINCT c) = 30 FROM avgt WHERE grp = 2
+----
+1
+
+# An all-NULL group averages to NULL.
+query
+SELECT AVG(c) IS NULL FROM avgt WHERE c IS NULL
+----
+1
+
+# Composes with other aggregates in one query.
+query
+SELECT COUNT(c), AVG(c) = 30 FROM avgt WHERE grp = 2
+----
+2	1
