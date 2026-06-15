@@ -2716,6 +2716,15 @@ impl Parser {
             return self.date_add_call(true);
         }
 
+        // `ADDDATE`/`SUBDATE` are `DATE_ADD`/`DATE_SUB` for the INTERVAL form, and
+        // also take an integer number of days directly.
+        if upper == "ADDDATE" {
+            return self.adddate_call(false);
+        }
+        if upper == "SUBDATE" {
+            return self.adddate_call(true);
+        }
+
         // `DATE_FORMAT(x, fmt)` lowers to the engine's `strftime()` with the
         // format specifiers translated from MySQL to strftime spelling.
         if upper == "DATE_FORMAT" {
@@ -3457,6 +3466,79 @@ impl Parser {
         let result = self.apply_interval(target, subtract)?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(result)
+    }
+
+    /// Lowers `ADDDATE`/`SUBDATE` (the name and `(` are already consumed);
+    /// `subtract` is true for `SUBDATE`. Two forms:
+    ///
+    ///   - `ADDDATE(d, INTERVAL n unit)` is exactly `DATE_ADD`/`DATE_SUB`, so it
+    ///     reuses [`Self::apply_interval`].
+    ///   - `ADDDATE(d, n)` adds (or subtracts) `n` whole days, lowered to
+    ///     `datetime(d, printf('%+d days', ±n))`. The `printf` gives the modifier
+    ///     its explicit sign so a negative amount stays valid.
+    ///
+    /// As with `DATE_ADD`, on a bare DATE value MySQL returns a DATE while the
+    /// engine keeps the time part — a documented divergence (see `mysql/COMPAT.md`).
+    fn adddate_call(&mut self, subtract: bool) -> Result<ast::Expr> {
+        let target = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+
+        if self.eat_keyword("INTERVAL") {
+            let result = self.apply_interval(target, subtract)?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(result);
+        }
+
+        let days = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        // SUBDATE negates the amount so the shared `+n days` modifier subtracts.
+        let amount = if subtract {
+            ast::Expr::binary(
+                ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+                ast::Operator::Subtract,
+                days,
+            )
+        } else {
+            days
+        };
+        let modifier = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("printf"),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(
+                    "%+d days",
+                )))),
+                Box::new(amount.clone()),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let shifted = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("datetime"),
+            distinctness: None,
+            args: vec![Box::new(target), Box::new(modifier)],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        // `printf` treats a NULL amount as 0, so guard a NULL days count back to
+        // NULL (MySQL propagates it); a NULL target is already handled by
+        // `datetime` returning NULL.
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(amount)),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(shifted)),
+        })
     }
 
     /// Parses an interval `[-]value unit` (the `INTERVAL` keyword already
@@ -5992,6 +6074,42 @@ mod tests {
         // A non-literal interval value, or a non-numeric string, is rejected.
         assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
         assert!(parse_expr("DATE_ADD(d, INTERVAL 'abc' DAY)").is_err());
+    }
+
+    #[test]
+    fn adddate_subdate_forms() {
+        // The INTERVAL form is exactly DATE_ADD / DATE_SUB.
+        assert_eq!(
+            parse_expr("ADDDATE(d, INTERVAL 5 DAY)").unwrap(),
+            parse_expr("DATE_ADD(d, INTERVAL 5 DAY)").unwrap()
+        );
+        assert_eq!(
+            parse_expr("SUBDATE(d, INTERVAL 1 DAY)").unwrap(),
+            parse_expr("DATE_SUB(d, INTERVAL 1 DAY)").unwrap()
+        );
+
+        // The integer-days form lowers to a NULL-guarded datetime(printf(...))
+        // shift; the ELSE branch is the datetime() call.
+        let ast::Expr::Case { else_expr, .. } = parse_expr("ADDDATE(d, 5)").unwrap() else {
+            panic!("expected ADDDATE(d, n) to lower to a guarded CASE");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE branch to be a datetime() call");
+        };
+        assert_eq!(name.as_str(), "datetime");
+        // datetime(target, printf('%+d days', n)).
+        let ast::Expr::FunctionCall {
+            name: pf_name,
+            args: pf_args,
+            ..
+        } = args[1].as_ref()
+        else {
+            panic!("expected the modifier to be a printf() call");
+        };
+        assert_eq!(pf_name.as_str(), "printf");
+        assert!(
+            matches!(pf_args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%+d days'")
+        );
     }
 
     #[test]

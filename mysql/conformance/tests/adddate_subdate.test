@@ -1,0 +1,62 @@
+# ADDDATE / SUBDATE conformance.
+#
+# ADDDATE/SUBDATE have two forms. The INTERVAL form is identical to
+# DATE_ADD/DATE_SUB: ADDDATE(d, INTERVAL n unit) == DATE_ADD(d, INTERVAL n unit).
+# The integer form adds/subtracts whole days: ADDDATE(d, n) shifts d by n days.
+# The front-end reuses the DATE_ADD interval lowering for the first form and
+# datetime(d, printf('%+d days', +/-n)) for the second.
+#
+# As with DATE_ADD, these are exercised on DATETIME values so both targets return
+# 'YYYY-MM-DD HH:MM:SS' (on a bare DATE, MySQL returns a DATE while the engine
+# keeps the time -- a documented divergence, avoided here).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS adddate_demo (a INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO adddate_demo (a, d) VALUES (1, '2020-01-31 10:20:30')
+
+# The INTERVAL form matches DATE_ADD / DATE_SUB exactly.
+query
+SELECT ADDDATE(d, INTERVAL 5 DAY), SUBDATE(d, INTERVAL 1 DAY) FROM adddate_demo
+----
+2020-02-05 10:20:30	2020-01-30 10:20:30
+
+# The INTERVAL form also handles a time unit.
+query
+SELECT ADDDATE(d, INTERVAL 2 HOUR) FROM adddate_demo
+----
+2020-01-31 12:20:30
+
+# The integer-days form adds / subtracts whole days, keeping the time part.
+query
+SELECT ADDDATE(d, 5), SUBDATE(d, 5) FROM adddate_demo
+----
+2020-02-05 10:20:30	2020-01-26 10:20:30
+
+# A negative count in the integer form shifts the other way.
+query
+SELECT ADDDATE('2020-01-01 00:00:00', -3)
+----
+2019-12-29 00:00:00
+
+# Crossing a month boundary.
+query
+SELECT ADDDATE('2020-02-27 23:00:00', 3)
+----
+2020-03-01 23:00:00
+
+# NULL propagates in both forms (a NULL day count, and a NULL date).
+query
+SELECT ADDDATE(d, NULL), SUBDATE(NULL, 5) FROM adddate_demo
+----
+NULL	NULL
+
+# The integer form is usable over a column.
+query
+SELECT a, ADDDATE(d, a) FROM adddate_demo ORDER BY a
+----
+1	2020-02-01 10:20:30
