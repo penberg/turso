@@ -6301,6 +6301,12 @@ fn is_supported_function(upper_name: &str) -> bool {
         // two-argument `ATAN(y, x)` = `ATAN2` form in MySQL, is handled by
         // `atan_call`.)
         | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN2" | "DEGREES" | "RADIANS"
+        // `JSON_VALID(x)` returns 1 if `x` parses as valid JSON, 0 if not, and
+        // NULL if `x` is NULL — exactly the engine's `json_valid` (renamed on
+        // emit). Note the engine's other JSON builders (`json_object`,
+        // `json_array`) are *not* exposed here: their serialization omits the
+        // spaces MySQL emits (`{"k": 1}` vs `{"k":1}`), so they would diverge.
+        | "JSON_VALID"
         // Aggregate functions. `AVG` (the mean, ignoring NULLs — and `AVG(DISTINCT
         // x)`) maps to the engine's `avg`, which behaves identically.
         | "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
@@ -6541,6 +6547,7 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "TIME" => "time",
         "TIMESTAMP" => "datetime",
         "LAST_INSERT_ID" => "last_insert_rowid",
+        "JSON_VALID" => "json_valid",
         _ => return None,
     })
 }
@@ -10342,6 +10349,22 @@ mod tests {
         // A single bound is allowed; a missing bound is rejected.
         assert!(parse_expr("INTERVAL(5, 3)").is_ok());
         assert!(parse_expr("INTERVAL(5)").is_err());
+    }
+
+    #[test]
+    fn json_valid_lowers_to_engine_json_valid() {
+        // JSON_VALID(x) -> json_valid(x): same single argument, renamed.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("JSON_VALID(doc)").unwrap()
+        else {
+            panic!("expected JSON_VALID to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "json_valid");
+        assert_eq!(args.len(), 1);
+
+        // The non-matching JSON builders stay unsupported (their output spacing
+        // diverges from MySQL).
+        assert!(parse_expr("JSON_OBJECT('k', 1)").is_err());
+        assert!(parse_expr("JSON_ARRAY(1, 2)").is_err());
     }
 
     #[test]

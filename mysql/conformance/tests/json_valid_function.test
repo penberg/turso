@@ -1,0 +1,39 @@
+# The JSON_VALID() function.
+#
+# JSON_VALID(x) returns 1 if x is a valid JSON document, 0 if not, and NULL if
+# x is NULL. It maps straight onto the engine's identical json_valid().
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Valid JSON: object, array, number, quoted string.
+query
+SELECT JSON_VALID('{}'), JSON_VALID('[1,2,3]'), JSON_VALID('123'), JSON_VALID('"x"')
+----
+1	1	1	1
+
+# Invalid JSON: plain text, malformed object, empty string.
+query
+SELECT JSON_VALID('not json'), JSON_VALID('{bad}'), JSON_VALID('')
+----
+0	0	0
+
+# A NULL argument yields NULL.
+query
+SELECT JSON_VALID(NULL) IS NULL
+----
+1
+
+# Usable over a column, including a NULL row.
+statement ok
+CREATE TABLE IF NOT EXISTS jvdoc (id INT PRIMARY KEY, doc TEXT)
+
+statement ok
+INSERT INTO jvdoc (id, doc) VALUES (1, '{"a":1}'), (2, 'oops'), (3, NULL)
+
+query
+SELECT id, JSON_VALID(doc) FROM jvdoc ORDER BY id
+----
+1	1
+2	0
+3	NULL
