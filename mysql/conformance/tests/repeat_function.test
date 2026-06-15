@@ -1,0 +1,62 @@
+# REPEAT(s, n) conformance.
+#
+# MySQL's REPEAT(s, n) returns the string s concatenated n times. The engine has
+# no repeat(), so the front-end synthesizes it: zeroblob(n) is n zero bytes whose
+# hex() is the text '00' repeated n times, and replacing every '00' with s yields
+# s repeated n times. A non-positive n gives the empty string; NULL in either
+# argument gives NULL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name; results are bracketed with CONCAT so trailing spaces and empty
+# strings are visible.
+
+# Basic repetition.
+query
+SELECT CONCAT('[', REPEAT('ab', 3), ']')
+----
+[ababab]
+
+# A count of one returns the string unchanged.
+query
+SELECT REPEAT('x', 1)
+----
+x
+
+# A zero or negative count gives the empty string.
+query
+SELECT CONCAT('[', REPEAT('x', 0), ']'), CONCAT('[', REPEAT('x', -2), ']')
+----
+[]	[]
+
+# REPEAT builds runs of spaces (bracketed so they are visible).
+query
+SELECT CONCAT('[', REPEAT(' ', 4), ']')
+----
+[    ]
+
+# A string whose characters overlap the '00' scaffolding still repeats exactly.
+query
+SELECT REPEAT('0', 3)
+----
+000
+
+# NULL in either argument propagates (the count guard is why a NULL count is
+# NULL rather than the empty string).
+query
+SELECT REPEAT(NULL, 3), REPEAT('a', NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS repeatfn_demo (id INT PRIMARY KEY, w VARCHAR(10), n INT)
+
+statement ok
+INSERT INTO repeatfn_demo (id, w, n) VALUES (1, 'ab', 2), (2, '-', 5), (3, 'x', 0)
+
+query
+SELECT id, CONCAT('[', REPEAT(w, n), ']') FROM repeatfn_demo ORDER BY id
+----
+1	[abab]
+2	[-----]
+3	[]

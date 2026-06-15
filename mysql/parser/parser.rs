@@ -2562,6 +2562,12 @@ impl Parser {
             return self.mod_call();
         }
 
+        // `REPEAT(s, n)` builds `n` copies of `s`; the engine has no `repeat()`,
+        // so synthesize one from `zeroblob`/`hex`/`replace`.
+        if upper == "REPEAT" {
+            return self.repeat_call();
+        }
+
         // `INSTR(str, substr)` and `LOCATE(substr, str)` (note the swapped
         // operand order) find the 1-based position of a substring. MySQL's are
         // case-insensitive under the default collation, so both lower to
@@ -3411,6 +3417,48 @@ impl Parser {
         let b = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(modulo(a, b))
+    }
+
+    /// Lowers `REPEAT(s, n)` (the name and `(` are already consumed) to
+    /// `CASE WHEN n IS NULL THEN NULL ELSE replace(hex(zeroblob(n)), '00', s) END`.
+    ///
+    /// The engine has no `repeat()`. But `zeroblob(n)` is `n` zero bytes, whose
+    /// `hex()` is the text `'00'` repeated `n` times, so replacing every `'00'`
+    /// with `s` yields `s` repeated `n` times. A non-positive `n` makes an empty
+    /// blob and thus the empty string (matching MySQL), and a NULL `s` propagates
+    /// through `replace`. The `CASE` guard is needed only because `zeroblob(NULL)`
+    /// is an empty blob rather than NULL, so without it a NULL count would wrongly
+    /// yield `''` instead of NULL. Exactly two arguments are required.
+    fn repeat_call(&mut self) -> Result<ast::Expr> {
+        let s = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let blob_hex = unary_fn("hex", unary_fn("zeroblob", n.clone()));
+        let repeated = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("replace"),
+            distinctness: None,
+            args: vec![
+                Box::new(blob_hex),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("00")))),
+                Box::new(s),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(n)),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(repeated)),
+        })
     }
 
     /// Lowers `LAST_DAY(d)` (the name and `(` are already consumed) to
@@ -6068,6 +6116,40 @@ mod tests {
         assert_eq!(
             parse_expr("MOD(a, b)").unwrap(),
             parse_expr("a MOD b").unwrap()
+        );
+    }
+
+    #[test]
+    fn repeat_lowers_to_zeroblob_replace_with_null_guard() {
+        // REPEAT(s, n) -> CASE WHEN n IS NULL THEN NULL
+        //                      ELSE replace(hex(zeroblob(n)), '00', s) END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("REPEAT('ab', n)").unwrap()
+        else {
+            panic!("expected REPEAT to lower to a CASE");
+        };
+        assert!(base.is_none(), "searched CASE, no base expression");
+
+        // The single WHEN guards a NULL count: `n IS NULL` -> NULL.
+        assert_eq!(when_then_pairs.len(), 1);
+        assert_eq!(*when_then_pairs[0].0, ast::Expr::is_null(col("n")));
+        assert_eq!(
+            *when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::Null)
+        );
+
+        // The ELSE branch is replace(hex(zeroblob(n)), '00', s).
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE branch to be a function call");
+        };
+        assert_eq!(name.as_str(), "replace");
+        assert_eq!(args.len(), 3);
+        assert_eq!(
+            *args[1],
+            ast::Expr::Literal(ast::Literal::String("'00'".to_string()))
         );
     }
 
