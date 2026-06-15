@@ -1,0 +1,52 @@
+# Logical NOT prefix operator (!) conformance.
+#
+# MySQL's `!expr` is logical NOT in its high-precedence prefix form (distinct
+# from the low-precedence `NOT` keyword): it binds tighter than the comparison
+# operators, so `!a = b` is `(!a) = b`. The front-end maps it to the engine's
+# NOT, whose truthiness matches MySQL: !0 = 1, any non-zero is 0, !NULL is NULL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# !0 is 1, any non-zero value is 0, !NULL is NULL.
+query
+SELECT !0, !1, !5, !NULL
+----
+1	0	0	NULL
+
+# Negating boolean conditions.
+query
+SELECT !(1 = 1), !(2 > 3)
+----
+0	1
+
+# High precedence: `!0 = 1` parses as `(!0) = 1`, which is true.
+query
+SELECT !0 = 1, !1 AND 1 = 1
+----
+1	0
+
+# Double negation.
+query
+SELECT !!5, !!0
+----
+1	0
+
+# `!=` (not-equal) is unaffected by the `!` prefix lexing.
+query
+SELECT 1 != 2, 1 != 1
+----
+1	0
+
+# Usable in WHERE to select rows where a predicate is false.
+statement ok
+CREATE TABLE IF NOT EXISTS lnot_demo (id INT PRIMARY KEY, active INT)
+
+statement ok
+INSERT INTO lnot_demo (id, active) VALUES (1, 1), (2, 0), (3, 1), (4, 0)
+
+query
+SELECT id FROM lnot_demo WHERE !active ORDER BY id
+----
+2
+4

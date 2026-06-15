@@ -2444,6 +2444,16 @@ impl Parser {
     /// divergence (see `mysql/COMPAT.md`). Both bind tighter than the arithmetic
     /// operators, so they are applied here at the primary tier.
     fn collate_expr(&mut self) -> Result<ast::Expr> {
+        // `!expr` — logical NOT, MySQL's high-precedence prefix form (distinct
+        // from the low-precedence `NOT` keyword). It maps to the same engine
+        // `NOT`, whose truthiness matches MySQL (`!0` = 1, `!5` = 0, `!NULL` is
+        // NULL); binding it here makes it tighter than the comparison operators,
+        // as in MySQL (`!a = b` is `(!a) = b`).
+        if matches!(self.peek(), Some(Token::Other('!'))) {
+            self.advance();
+            let inner = self.collate_expr()?;
+            return Ok(ast::Expr::unary(ast::UnaryOperator::Not, inner));
+        }
         // `BINARY expr` — drop the operator; the engine compares binary already.
         if self.is_keyword("BINARY") {
             self.advance();
@@ -7132,6 +7142,27 @@ mod tests {
             parse_expr("ELT(1)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn logical_not_prefix_lowers_to_unary_not() {
+        // !a -> NOT a (unary), at high precedence.
+        assert_eq!(
+            parse_expr("!a").unwrap(),
+            ast::Expr::unary(ast::UnaryOperator::Not, col("a"))
+        );
+
+        // `!a = b` is `(!a) = b` (the `!` binds tighter than `=`).
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, _) = parse_expr("!a = b").unwrap() else {
+            panic!("expected the top operator to be `=`");
+        };
+        assert_eq!(*lhs, ast::Expr::unary(ast::UnaryOperator::Not, col("a")));
+
+        // `!=` (not-equal) is unaffected by the `!` prefix.
+        assert_eq!(
+            parse_expr("a != b").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
+        );
     }
 
     #[test]

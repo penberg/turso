@@ -312,6 +312,7 @@ diverge are deliberately excluded.
 | `AND` / `OR` / `NOT`, parentheses      | ✅     |         |
 | `&&` (logical AND)                      | ✅     | A MySQL synonym for the `AND` keyword, at the same precedence. A single `&` remains the bitwise operator. (`\|\|` is **not** treated as logical OR — it stays excluded, since the engine uses it for string concatenation.) |
 | `XOR` (logical)                         | 🚧     | Lowered to `(a <> 0) <> (b <> 0)` — 1 when exactly one operand is truthy, NULL if either is NULL; between `OR` and `AND` in precedence. Matches MySQL for numeric / boolean operands; a non-numeric string's truthiness diverges (the engine does not coerce it to 0). |
+| `!` (logical NOT prefix)                | ✅     | The high-precedence prefix form of NOT (binds tighter than the comparison operators, unlike the `NOT` keyword). Maps to the engine's unary `NOT`, whose truthiness matches MySQL (`!0`=1, non-zero→0, `!NULL`=NULL). `!=` is unaffected. |
 | `IS [NOT] NULL`                        | ✅     |         |
 | Arithmetic `+` `-` `*`                 | ✅     |         |
 | `[NOT] IN (value list)`                | ✅     | Includes the empty list: `x IN ()` folds to `0` and `x NOT IN ()` to `1` (MySQL semantics), since the engine has no empty-list `IN`. |
