@@ -1,0 +1,60 @@
+# OCTET_LENGTH(x) and BIT_LENGTH(x) conformance.
+#
+# In MySQL OCTET_LENGTH is a synonym for LENGTH (the byte count), and BIT_LENGTH
+# is that count times eight. The front-end lowers both through the same byte
+# count the engine's LENGTH uses -- length(CAST(x AS BLOB)) -- so they count
+# bytes, not characters, and stay distinct from CHAR_LENGTH. NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# ASCII: one byte per character; BIT_LENGTH is OCTET_LENGTH * 8.
+query
+SELECT OCTET_LENGTH('abc'), BIT_LENGTH('abc')
+----
+3	24
+
+# The empty string is zero bytes / zero bits.
+query
+SELECT OCTET_LENGTH(''), BIT_LENGTH('')
+----
+0	0
+
+# A multi-byte UTF-8 character counts its bytes (the pound sign is two bytes),
+# so OCTET_LENGTH/BIT_LENGTH exceed CHAR_LENGTH.
+query
+SELECT OCTET_LENGTH('£'), BIT_LENGTH('£'), CHAR_LENGTH('£')
+----
+2	16	1
+
+# OCTET_LENGTH agrees with LENGTH (both are the byte count).
+query
+SELECT OCTET_LENGTH('hello') = LENGTH('hello')
+----
+1
+
+# A number is measured as its string form.
+query
+SELECT OCTET_LENGTH(12345), BIT_LENGTH(12345)
+----
+5	40
+
+# NULL propagates through both.
+query
+SELECT OCTET_LENGTH(NULL), BIT_LENGTH(NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS oblen_demo (id INT PRIMARY KEY, w VARCHAR(20))
+
+statement ok
+INSERT INTO oblen_demo (id, w) VALUES (1, 'a'), (2, 'abcd'), (3, '')
+
+query
+SELECT id, OCTET_LENGTH(w), BIT_LENGTH(w) FROM oblen_demo ORDER BY id
+----
+1	1	8
+2	4	32
+3	0	0

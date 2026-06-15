@@ -2526,6 +2526,15 @@ impl Parser {
             return self.length_call();
         }
 
+        // `OCTET_LENGTH` is a MySQL synonym for `LENGTH` (byte count); `BIT_LENGTH`
+        // is that times eight. Both reuse the byte-length lowering.
+        if upper == "OCTET_LENGTH" {
+            return self.octet_length_call();
+        }
+        if upper == "BIT_LENGTH" {
+            return self.bit_length_call();
+        }
+
         // MySQL date-part extractors (`YEAR`, `MONTH`, `DAY`, ...) lower to the
         // engine's `strftime()`, cast to an integer to match MySQL's numeric
         // return (no zero-padding).
@@ -3050,25 +3059,30 @@ impl Parser {
     fn length_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        let blob = ast::Expr::Cast {
-            expr: Box::new(arg),
-            type_name: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-                array_dimensions: 0,
-            }),
-        };
-        Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("length"),
-            distinctness: None,
-            args: vec![Box::new(blob)],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        })
+        Ok(byte_length_expr(arg))
+    }
+
+    /// Lowers `OCTET_LENGTH(x)` (the name and `(` are already consumed). In MySQL
+    /// `OCTET_LENGTH` is a synonym for `LENGTH` — the byte count — so it shares
+    /// the exact lowering. Exactly one argument is required.
+    fn octet_length_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(byte_length_expr(arg))
+    }
+
+    /// Lowers `BIT_LENGTH(x)` (the name and `(` are already consumed) to
+    /// `8 * length(CAST(x AS BLOB))` — MySQL's `BIT_LENGTH` is the byte length
+    /// times eight. NULL propagates through the multiplication. Exactly one
+    /// argument is required.
+    fn bit_length_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::binary(
+            ast::Expr::Literal(ast::Literal::Numeric("8".to_string())),
+            ast::Operator::Multiply,
+            byte_length_expr(arg),
+        ))
     }
 
     /// Parses the single argument of a date-part extractor such as `YEAR(x)`
@@ -3790,6 +3804,22 @@ fn integer_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
             array_dimensions: 0,
         }),
     }
+}
+
+/// Builds `length(CAST(x AS BLOB))` — a byte count. The engine's `length()`
+/// counts characters, but `length()` of a BLOB counts bytes, so casting first
+/// gives MySQL's byte semantics. Shared by `LENGTH`, `OCTET_LENGTH`, and (times
+/// eight) `BIT_LENGTH`.
+fn byte_length_expr(arg: ast::Expr) -> ast::Expr {
+    let blob = ast::Expr::Cast {
+        expr: Box::new(arg),
+        type_name: Some(ast::Type {
+            name: "BLOB".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    unary_fn("length", blob)
 }
 
 /// Builds the lowering that repeats string `s` `n` times:
@@ -5929,6 +5959,24 @@ mod tests {
             panic!("expected the argument to be a CAST");
         };
         assert_eq!(type_name.as_ref().unwrap().name, "BLOB");
+
+        // OCTET_LENGTH is a synonym for LENGTH and lowers identically.
+        assert_eq!(
+            parse_expr("OCTET_LENGTH(b)").unwrap(),
+            parse_expr("LENGTH(b)").unwrap()
+        );
+
+        // BIT_LENGTH(b) is 8 * length(CAST(b AS BLOB)).
+        let ast::Expr::Binary(lhs, ast::Operator::Multiply, rhs) =
+            parse_expr("BIT_LENGTH(b)").unwrap()
+        else {
+            panic!("expected BIT_LENGTH to lower to a multiplication");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "8"
+        ));
+        assert_eq!(*rhs, parse_expr("LENGTH(b)").unwrap());
     }
 
     #[test]
