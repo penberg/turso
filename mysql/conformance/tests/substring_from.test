@@ -1,0 +1,59 @@
+# SQL-standard SUBSTRING(str FROM pos [FOR len]) conformance.
+#
+# Besides the comma form SUBSTRING(str, pos[, len]) / SUBSTR(...), MySQL accepts
+# the SQL-standard SUBSTRING(str FROM pos) and SUBSTRING(str FROM pos FOR len).
+# The front-end parses both forms and lowers them to the engine's
+# substr(str, pos[, len]) -- 1-indexed, with a negative position counting from
+# the end. FROM/FOR are keywords, not operators. SUBSTR is an exact synonym.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# FROM pos (to the end) and FROM pos FOR len.
+query
+SELECT SUBSTRING('hello world' FROM 7), SUBSTRING('hello' FROM 2 FOR 3)
+----
+world	ell
+
+# SUBSTR accepts the same FROM/FOR forms.
+query
+SELECT SUBSTR('hello' FROM 2), SUBSTR('hello' FROM 2 FOR 2)
+----
+ello	el
+
+# A negative position counts from the end.
+query
+SELECT SUBSTRING('hello' FROM -2), SUBSTRING('hello' FROM -3 FOR 2)
+----
+lo	ll
+
+# The comma forms (and MID) still work unchanged.
+query
+SELECT SUBSTRING('hello', 2), SUBSTRING('hello', 2, 3), MID('hello', 2, 2)
+----
+ello	ell	el
+
+# The FROM form agrees with the comma form.
+query
+SELECT SUBSTRING('hello' FROM 2 FOR 3) = SUBSTRING('hello', 2, 3)
+----
+1
+
+# NULL in any operand propagates.
+query
+SELECT SUBSTRING(NULL FROM 2), SUBSTRING('hello' FROM NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS sf_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO sf_demo (id, s) VALUES (1, 'wordpress'), (2, 'database')
+
+query
+SELECT id, SUBSTRING(s FROM 1 FOR 4) FROM sf_demo ORDER BY id
+----
+1	word
+2	data

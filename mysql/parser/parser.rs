@@ -3011,6 +3011,14 @@ impl Parser {
             return self.position_call();
         }
 
+        // `SUBSTRING`/`SUBSTR` accept both the comma form `(str, pos[, len])` and
+        // the SQL-standard `(str FROM pos [FOR len])`; both lower to the engine's
+        // `substr`. (`MID`, the 3-argument synonym, keeps the comma form and is
+        // renamed via the generic path.)
+        if upper == "SUBSTRING" || upper == "SUBSTR" {
+            return self.substring_call();
+        }
+
         // `GROUP_CONCAT(expr [SEPARATOR 's'])` maps to the engine's
         // `group_concat(expr[, 's'])`, which uses the same default `,` separator.
         if upper == "GROUP_CONCAT" {
@@ -3498,6 +3506,41 @@ impl Parser {
             "instr",
             vec![unary_fn("lower", haystack), unary_fn("lower", needle)],
         ))
+    }
+
+    /// Parses `SUBSTRING`/`SUBSTR` (the name and `(` are already consumed) in both
+    /// the comma form `(str, pos[, len])` and the SQL-standard form
+    /// `(str FROM pos [FOR len])`, lowering either to the engine's
+    /// `substr(str, pos[, len])` (1-indexed, negative position from the end, like
+    /// MySQL). `FROM`/`FOR` are keywords, not operators, so the operands parse as
+    /// ordinary expressions.
+    fn substring_call(&mut self) -> Result<ast::Expr> {
+        let target = self.expr()?;
+        let (pos, len) = if self.eat_keyword("FROM") {
+            let pos = self.expr()?;
+            let len = if self.eat_keyword("FOR") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            (pos, len)
+        } else {
+            self.expect(&Token::Comma, "`,` or `FROM`")?;
+            let pos = self.expr()?;
+            let len = if self.eat(&Token::Comma) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            (pos, len)
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        let mut args = vec![target, pos];
+        if let Some(len) = len {
+            args.push(len);
+        }
+        Ok(call_fn("substr", args))
     }
 
     /// Parses a `GROUP_CONCAT([DISTINCT] expr [SEPARATOR 's'])` call (the name and
@@ -5446,10 +5489,10 @@ fn is_supported_function(upper_name: &str) -> bool {
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
         // `LTRIM`/`RTRIM` strip leading/trailing spaces (their one-argument
-        // MySQL form), like the engine's same-named functions. (`TRIM` is handled
-        // separately by `trim_call`, which also parses the `TRIM(... FROM ...)`
-        // forms.)
-        | "REPLACE" | "SUBSTR" | "LTRIM" | "RTRIM"
+        // MySQL form), like the engine's same-named functions. (`TRIM` and
+        // `SUBSTR`/`SUBSTRING` are handled separately by `trim_call` /
+        // `substring_call`, which also parse their SQL-standard `FROM` forms.)
+        | "REPLACE" | "LTRIM" | "RTRIM"
         // `CONCAT_WS(sep, ...)` joins the non-NULL arguments with `sep`, skipping
         // NULLs (and yielding NULL only for a NULL separator) — exactly the
         // engine's `concat_ws`. (Distinct from `CONCAT`, which is lowered to `||`
@@ -5458,7 +5501,7 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Functions sharing behaviour with the engine under a different name;
         // renamed on emit (see `engine_function_name`).
         | "IF"
-        | "SUBSTRING" | "MID" | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
+        | "MID" | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
         // The scalar `GREATEST` / `LEAST` map to the engine's multi-argument
         // `max` / `min`, which — like MySQL — return NULL if any argument is NULL.
         | "GREATEST" | "LEAST"
@@ -5698,7 +5741,7 @@ fn is_aggregate_function(upper_name: &str) -> bool {
 fn engine_function_name(upper_name: &str) -> Option<&'static str> {
     Some(match upper_name {
         "IF" => "iif",
-        "SUBSTRING" | "MID" => "substr",
+        "MID" => "substr",
         "LCASE" => "lower",
         "UCASE" => "upper",
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
@@ -7985,6 +8028,29 @@ mod tests {
             ast::Expr::Case { .. }
         ));
         assert!(parse_expr("INSTR('banana', 'a', 3)").is_err());
+    }
+
+    #[test]
+    fn substring_from_for_lowers_like_comma_form() {
+        // The SQL-standard SUBSTRING(str FROM pos FOR len) lowers identically to
+        // the comma form SUBSTRING(str, pos, len) -> substr(str, pos, len).
+        let from_for = parse_expr("SUBSTRING('hello' FROM 2 FOR 3)").unwrap();
+        assert_eq!(from_for, parse_expr("SUBSTRING('hello', 2, 3)").unwrap());
+        let ast::Expr::FunctionCall { name, args, .. } = &from_for else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "substr");
+        assert_eq!(args.len(), 3);
+
+        // FROM without FOR is the two-argument substr(str, pos).
+        let from_only = parse_expr("SUBSTRING('hello' FROM 2)").unwrap();
+        assert_eq!(from_only, parse_expr("SUBSTRING('hello', 2)").unwrap());
+
+        // SUBSTR accepts the same FROM/FOR syntax (an exact synonym).
+        assert_eq!(
+            parse_expr("SUBSTR('hello' FROM 2 FOR 3)").unwrap(),
+            parse_expr("SUBSTRING('hello', 2, 3)").unwrap()
+        );
     }
 
     #[test]
