@@ -1,0 +1,54 @@
+# MAKEDATE(year, dayofyear) conformance.
+#
+# MAKEDATE builds a date from a year and a 1-based day of year: day 1 is January
+# 1st. A dayofyear past the year's length rolls into the following year. The
+# front-end lowers it to date(printf('%04d-01-01', year), printf('%+d days',
+# dayofyear - 1)), with a CASE guarding the NULL cases (a NULL argument or a
+# dayofyear below 1, which MySQL returns NULL for).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Day of year maps to the calendar date (2020 is a leap year, so day 60 is
+# Feb 29).
+query
+SELECT MAKEDATE(2020, 1), MAKEDATE(2020, 60), MAKEDATE(2020, 366)
+----
+2020-01-01	2020-02-29	2020-12-31
+
+# A dayofyear past the year length rolls into the next year.
+query
+SELECT MAKEDATE(2020, 367), MAKEDATE(2021, 32)
+----
+2021-01-01	2021-02-01
+
+# A dayofyear below 1 yields NULL.
+query
+SELECT MAKEDATE(2020, 0), MAKEDATE(2020, -5)
+----
+NULL	NULL
+
+# NULL in either argument yields NULL.
+query
+SELECT MAKEDATE(NULL, 60), MAKEDATE(2020, NULL)
+----
+NULL	NULL
+
+# It round-trips with DAYOFYEAR.
+query
+SELECT MAKEDATE(2020, DAYOFYEAR('2020-02-29'))
+----
+2020-02-29
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS md_demo (id INT PRIMARY KEY, y INT, doy INT)
+
+statement ok
+INSERT INTO md_demo (id, y, doy) VALUES (1, 2020, 100), (2, 2021, 200)
+
+query
+SELECT id, MAKEDATE(y, doy) FROM md_demo ORDER BY id
+----
+1	2020-04-09
+2	2021-07-19

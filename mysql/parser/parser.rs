@@ -3033,6 +3033,12 @@ impl Parser {
             return self.last_day_call();
         }
 
+        // `MAKEDATE(year, dayofyear)` builds a date from a year and a 1-based day
+        // of year.
+        if upper == "MAKEDATE" {
+            return self.makedate_call();
+        }
+
         // `EXTRACT(unit FROM d)` is the SQL-standard date-part extractor; the
         // single calendar units share the date-part `strftime` lowering.
         if upper == "EXTRACT" {
@@ -4309,6 +4315,62 @@ impl Parser {
                 filter_clause: None,
                 over_clause: None,
             },
+        })
+    }
+
+    /// Lowers `MAKEDATE(year, dayofyear)` (the name and `(` are already consumed)
+    /// to `date(printf('%04d-01-01', year), printf('%+d days', dayofyear - 1))` —
+    /// the year's January 1st advanced by `dayofyear - 1` days, so day 1 is
+    /// Jan 1 and a `dayofyear` past the year's length rolls into the next year,
+    /// like MySQL. A `CASE` guards the cases MySQL returns NULL for: a NULL
+    /// argument or a `dayofyear` below 1 (`printf` would otherwise coerce them).
+    /// Exactly two arguments are required.
+    fn makedate_call(&mut self) -> Result<ast::Expr> {
+        let year = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let dayofyear = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        // year IS NULL OR dayofyear IS NULL OR dayofyear < 1
+        let guard = ast::Expr::binary(
+            ast::Expr::binary(
+                ast::Expr::is_null(year.clone()),
+                ast::Operator::Or,
+                ast::Expr::is_null(dayofyear.clone()),
+            ),
+            ast::Operator::Or,
+            ast::Expr::binary(
+                dayofyear.clone(),
+                ast::Operator::Less,
+                ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+            ),
+        );
+        let jan_first = call_fn(
+            "printf",
+            vec![
+                ast::Expr::Literal(ast::Literal::String(requote("%04d-01-01"))),
+                year,
+            ],
+        );
+        let day_offset = call_fn(
+            "printf",
+            vec![
+                ast::Expr::Literal(ast::Literal::String(requote("%+d days"))),
+                ast::Expr::binary(
+                    dayofyear,
+                    ast::Operator::Subtract,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+                ),
+            ],
+        );
+        let made = call_fn("date", vec![jan_first, day_offset]);
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(guard),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(made)),
         })
     }
 
@@ -7502,6 +7564,29 @@ mod tests {
         // A unit without an engine modifier and a non-literal amount are rejected.
         assert!(parse_expr("TIMESTAMPADD(MICROSECOND, 1, d)").is_err());
         assert!(parse_expr("TIMESTAMPADD(DAY, x, d)").is_err());
+    }
+
+    #[test]
+    fn makedate_lowers_to_guarded_date() {
+        // MAKEDATE(y, doy) -> CASE WHEN <null/<1 guard> THEN NULL ELSE date(...).
+        let ast::Expr::Case {
+            base, else_expr, ..
+        } = parse_expr("MAKEDATE(y, doy)").unwrap()
+        else {
+            panic!("expected MAKEDATE to lower to a guarded CASE");
+        };
+        assert!(base.is_none());
+        // The ELSE is date(printf('%04d-01-01', y), printf('%+d days', doy - 1)).
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE to be a date() call");
+        };
+        assert_eq!(name.as_str(), "date");
+        assert_eq!(args.len(), 2);
+        for arg in &args {
+            assert!(
+                matches!(arg.as_ref(), ast::Expr::FunctionCall { name, .. } if name.as_str() == "printf")
+            );
+        }
     }
 
     #[test]
