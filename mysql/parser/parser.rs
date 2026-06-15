@@ -3042,6 +3042,13 @@ impl Parser {
             return self.concat_call();
         }
 
+        // `TRUNCATE(x, d)` truncates `x` to `d` decimal places toward zero. The
+        // engine's `trunc` only truncates to an integer, so scale by `10^d` first
+        // (see `truncate_call`).
+        if upper == "TRUNCATE" {
+            return self.truncate_call();
+        }
+
         // `CHAR(n, ...)` builds a string from character codes, mapping to the
         // engine's `char()` (see `char_call`).
         if upper == "CHAR" {
@@ -3829,6 +3836,23 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
         Ok(ast::Expr::Literal(ast::Literal::Numeric("1".to_string())))
+    }
+
+    /// Parses `TRUNCATE(x, d)` (the name and `(` are already consumed) and lowers
+    /// it to `trunc(x * pow(10, d)) / pow(10, d)`: truncate `x` to `d` decimal
+    /// places toward zero, using the engine's integer-truncating `trunc` after
+    /// scaling by `10^d`. A negative `d` truncates left of the decimal point
+    /// (`TRUNCATE(1234.5, -2)` = 1200), and NULL in either argument propagates.
+    fn truncate_call(&mut self) -> Result<ast::Expr> {
+        let x = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let d = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let scale_num = call_fn("pow", vec![*numeric_expr("10"), d.clone()]);
+        let scale_den = call_fn("pow", vec![*numeric_expr("10"), d]);
+        let scaled = ast::Expr::binary(x, ast::Operator::Multiply, scale_num);
+        let truncated = unary_fn("trunc", scaled);
+        Ok(float_division(truncated, scale_den))
     }
 
     /// Parses a `LEFT(str, len)` call (the name and `(` are already consumed)
@@ -9264,6 +9288,30 @@ mod tests {
     }
 
     #[test]
+    fn truncate_lowers_to_scaled_trunc() {
+        // TRUNCATE(x, d) -> trunc(x * pow(10, d)) / pow(10, d), built as
+        // `CAST(trunc(...) AS REAL) / pow(10, d)`.
+        let ast::Expr::Binary(num, ast::Operator::Divide, den) =
+            parse_expr("TRUNCATE(x, 2)").unwrap()
+        else {
+            panic!("expected TRUNCATE to lower to a division");
+        };
+        // The denominator is pow(10, 2).
+        let ast::Expr::FunctionCall { name, .. } = den.as_ref() else {
+            panic!("expected the denominator to be pow(10, d)");
+        };
+        assert_eq!(name.as_str(), "pow");
+        // The numerator is CAST(trunc(x * pow(10, 2)) AS REAL).
+        let ast::Expr::Cast { expr, .. } = num.as_ref() else {
+            panic!("expected the numerator cast to REAL");
+        };
+        let ast::Expr::FunctionCall { name, .. } = expr.as_ref() else {
+            panic!("expected trunc(...)");
+        };
+        assert_eq!(name.as_str(), "trunc");
+    }
+
+    #[test]
     fn aggregate_distinct() {
         let expr = parse_expr("COUNT(DISTINCT v)").unwrap();
         let ast::Expr::FunctionCall {
@@ -9354,7 +9402,7 @@ mod tests {
     fn function_call_not_in_allow_list_is_unsupported() {
         for input in [
             "SLEEP(1)",
-            "TRUNCATE(2.7, 1)",
+            "REVERSE('x')",
             "SOUNDEX('x')",
             "totally_made_up(1)",
         ] {
