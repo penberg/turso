@@ -1,0 +1,64 @@
+# TIMESTAMPDIFF(unit, a, b) conformance.
+#
+# MySQL's TIMESTAMPDIFF(unit, a, b) is b - a expressed in whole `unit`s -- note
+# the operand order is the reverse of DATEDIFF. The front-end supports the
+# fixed-duration units (SECOND, MINUTE, HOUR, DAY, WEEK) by dividing the
+# epoch-second difference unixepoch(b) - unixepoch(a) by the unit length;
+# SQLite's integer division truncates toward zero, matching MySQL's
+# "complete units" result for both signs. NULL propagates.
+#
+# Scope: the calendar units (MICROSECOND, MONTH, QUARTER, YEAR) have no fixed
+# length and are rejected by the front-end; that is covered by a parser unit
+# test, not here, because a real mysqld accepts them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS tsd_demo (a INT PRIMARY KEY, d1 DATETIME, d2 DATETIME)
+
+statement ok
+INSERT INTO tsd_demo (a, d1, d2) VALUES
+  (1, '2020-01-01 00:00:00', '2020-01-03 00:00:00'),
+  (2, '2020-01-01 13:30:00', '2020-01-01 00:00:00'),
+  (3, '2020-01-01 00:00:00', '2020-01-01 00:00:00')
+
+# DAY differences, including a negative one (b is before a).
+query
+SELECT a, TIMESTAMPDIFF(DAY, d1, d2) FROM tsd_demo ORDER BY a
+----
+1	2
+2	0
+3	0
+
+# Whole units truncate toward zero for both signs (13h30m -> 13, -13h30m -> -13).
+query
+SELECT TIMESTAMPDIFF(HOUR, '2020-01-01 00:00:00', '2020-01-01 13:30:00'),
+       TIMESTAMPDIFF(HOUR, '2020-01-01 13:30:00', '2020-01-01 00:00:00')
+----
+13	-13
+
+# A sub-unit remainder is dropped (1 minute 59 seconds is 1 whole minute).
+query
+SELECT TIMESTAMPDIFF(MINUTE, '2020-01-01 00:00:00', '2020-01-01 00:01:59'),
+       TIMESTAMPDIFF(SECOND, '2020-01-01 00:00:00', '2020-01-01 00:00:05')
+----
+1	5
+
+# WEEK is seven days; 19 days is 2 whole weeks.
+query
+SELECT TIMESTAMPDIFF(WEEK, '2020-01-01', '2020-01-20')
+----
+2
+
+# NULL in either datetime yields NULL.
+query
+SELECT TIMESTAMPDIFF(DAY, NULL, '2020-01-03'), TIMESTAMPDIFF(DAY, '2020-01-01', NULL)
+----
+NULL	NULL
+
+# Usable in a WHERE predicate.
+query
+SELECT a FROM tsd_demo WHERE TIMESTAMPDIFF(DAY, d1, d2) > 0 ORDER BY a
+----
+1

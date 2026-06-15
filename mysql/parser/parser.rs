@@ -2239,6 +2239,13 @@ impl Parser {
             return self.datediff_call();
         }
 
+        // `TIMESTAMPDIFF(unit, a, b)` is `b - a` in whole `unit`s. The
+        // fixed-duration units lower to integer division of the epoch-second
+        // difference.
+        if upper == "TIMESTAMPDIFF" {
+            return self.timestampdiff_call();
+        }
+
         // Current date/time functions (`NOW()`, `CURDATE()`, ...) lower to the
         // engine's `datetime('now')` / `date('now')` / `time('now')`.
         if let Some(engine_fn) = current_time_function(&upper) {
@@ -2807,6 +2814,57 @@ impl Parser {
                 array_dimensions: 0,
             }),
         })
+    }
+
+    /// Lowers `TIMESTAMPDIFF(unit, a, b)` (the name and `(` are already
+    /// consumed) to the whole-`unit` count of `b - a` — note the operand order
+    /// is the reverse of `DATEDIFF`. The fixed-duration units divide the
+    /// epoch-second difference `unixepoch(b) - unixepoch(a)` by the unit's length
+    /// in seconds; SQLite's integer division truncates toward zero, matching
+    /// MySQL's "complete units" semantics for both signs. The calendar units
+    /// (`MICROSECOND`, `MONTH`, `QUARTER`, `YEAR`) have no fixed length and are
+    /// rejected. NULL propagates.
+    fn timestampdiff_call(&mut self) -> Result<ast::Expr> {
+        let Some(Token::Word(u)) = self.peek() else {
+            return Err(self.unexpected("a TIMESTAMPDIFF unit"));
+        };
+        let unit = u.to_ascii_uppercase();
+        self.advance();
+        self.expect(&Token::Comma, "`,`")?;
+        let a = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let b = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let seconds_per_unit: i64 = match unit.as_str() {
+            "SECOND" => 1,
+            "MINUTE" => 60,
+            "HOUR" => 3600,
+            "DAY" => 86400,
+            "WEEK" => 604800,
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "TIMESTAMPDIFF unit {other} is not supported yet \
+                     (only SECOND, MINUTE, HOUR, DAY, and WEEK have a fixed length)"
+                )))
+            }
+        };
+
+        // unixepoch returns integer seconds, so `b - a` is an integer and the
+        // division below is an integer (truncating) division.
+        let diff = ast::Expr::binary(
+            unary_fn("unixepoch", b),
+            ast::Operator::Subtract,
+            unary_fn("unixepoch", a),
+        );
+        if seconds_per_unit == 1 {
+            return Ok(diff);
+        }
+        Ok(ast::Expr::binary(
+            diff,
+            ast::Operator::Divide,
+            ast::Expr::Literal(ast::Literal::Numeric(seconds_per_unit.to_string())),
+        ))
     }
 
     /// Lowers `UNIX_TIMESTAMP([d])` to the engine's `unixepoch(...)`: with an
@@ -4636,6 +4694,40 @@ mod tests {
                 args[0].as_ref(),
                 ast::Expr::FunctionCall { name, .. } if name.as_str() == "date"
             ));
+        }
+    }
+
+    #[test]
+    fn timestampdiff_lowers_to_epoch_division() {
+        // A fixed-duration unit divides the epoch-second difference (b - a).
+        let ast::Expr::Binary(diff, ast::Operator::Divide, divisor) =
+            parse_expr("TIMESTAMPDIFF(HOUR, a, b)").unwrap()
+        else {
+            panic!("expected a division");
+        };
+        assert!(
+            matches!(divisor.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "3600")
+        );
+        let ast::Expr::Binary(left, ast::Operator::Subtract, _) = diff.as_ref() else {
+            panic!("expected unixepoch(b) - unixepoch(a)");
+        };
+        assert!(matches!(
+            left.as_ref(),
+            ast::Expr::FunctionCall { name, .. } if name.as_str() == "unixepoch"
+        ));
+
+        // SECOND needs no division — just the epoch-second difference.
+        assert!(matches!(
+            parse_expr("TIMESTAMPDIFF(SECOND, a, b)").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Subtract, _)
+        ));
+
+        // Calendar units have no fixed length and are rejected.
+        for unit in ["MICROSECOND", "MONTH", "QUARTER", "YEAR"] {
+            assert!(
+                parse_expr(&format!("TIMESTAMPDIFF({unit}, a, b)")).is_err(),
+                "TIMESTAMPDIFF unit {unit} should be unsupported"
+            );
         }
     }
 
