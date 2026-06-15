@@ -1766,14 +1766,19 @@ impl Parser {
             } else if matches!(
                 operator,
                 ast::JoinOperator::TypedJoin(Some(t))
-                    if t.contains(ast::JoinType::CROSS) || t.contains(ast::JoinType::NATURAL)
+                    if t.contains(ast::JoinType::NATURAL) || !t.contains(ast::JoinType::OUTER)
             ) {
-                // A `CROSS JOIN` (Cartesian product) and a `NATURAL JOIN` (joins
-                // on the common columns) both take no explicit condition.
+                // A join may omit the condition when it is a `NATURAL` join (which
+                // joins on the common columns, including its `LEFT`/`RIGHT` forms)
+                // or any inner join: MySQL treats a plain `JOIN` / `INNER JOIN` /
+                // `STRAIGHT_JOIN` with no `ON`/`USING` as a `CROSS JOIN` (Cartesian
+                // product), often with the predicate moved to `WHERE` instead. The
+                // engine evaluates all of these identically. Only a non-NATURAL
+                // OUTER (`LEFT`/`RIGHT`) join requires an explicit condition.
                 None
             } else {
                 return Err(ParseError::Unsupported(
-                    "JOIN without an ON condition is not supported yet".to_string(),
+                    "OUTER JOIN without an ON or USING condition is not supported yet".to_string(),
                 ));
             };
             joins.push(ast::JoinedSelectTable {
@@ -6552,7 +6557,7 @@ mod tests {
             "SELECT DISTINCTROW a FROM t",
             "SELECT * FROM a FULL JOIN b ON a.id = b.id",
             "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
-            "SELECT * FROM a JOIN b",
+            "SELECT * FROM a LEFT JOIN b",
             "SELECT * FROM (SELECT 1)",
             "SELECT a FROM t GROUP BY 1",
         ] {
@@ -6683,6 +6688,41 @@ mod tests {
             panic!("expected a typed join");
         };
         assert!(t.contains(ast::JoinType::INNER) && !t.contains(ast::JoinType::CROSS));
+    }
+
+    #[test]
+    fn inner_join_without_condition_is_a_cross_join() {
+        // A plain `JOIN` / `INNER JOIN` / `STRAIGHT_JOIN` with no ON/USING is a
+        // cross join (no constraint), like an explicit CROSS JOIN. MySQL allows
+        // this (the predicate usually lives in WHERE).
+        for sql in [
+            "SELECT * FROM a JOIN b",
+            "SELECT * FROM a INNER JOIN b",
+            "SELECT * FROM a STRAIGHT_JOIN b",
+            "SELECT * FROM a JOIN b WHERE a.id = b.id",
+        ] {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select {
+                from: Some(from), ..
+            } = &select.body.select
+            else {
+                panic!("expected a FROM clause for `{sql}`");
+            };
+            assert!(
+                from.joins[0].constraint.is_none(),
+                "expected no join constraint for `{sql}`"
+            );
+        }
+
+        // An OUTER (LEFT/RIGHT) join still requires a condition.
+        for sql in ["SELECT * FROM a LEFT JOIN b", "SELECT * FROM a RIGHT JOIN b"] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to require a condition"
+            );
+        }
     }
 
     #[test]

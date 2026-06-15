@@ -1,0 +1,59 @@
+# INNER / plain JOIN without an ON condition conformance.
+#
+# In MySQL `JOIN`, `INNER JOIN`, and `CROSS JOIN` are syntactic equivalents: an
+# inner/plain JOIN with no ON/USING is a CROSS JOIN (Cartesian product), and the
+# join predicate is often written in WHERE instead. The front-end previously
+# accepted only `CROSS JOIN` without a condition and rejected the `JOIN` /
+# `INNER JOIN` spellings; it now treats them all as a cross join (the engine
+# evaluates them identically). Only an OUTER (LEFT/RIGHT) join still requires an
+# explicit condition. This mirrors the old-style comma join (FROM a, b WHERE …).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ijn_a (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS ijn_b (id INT PRIMARY KEY, w INT)
+
+statement ok
+INSERT INTO ijn_a (id, v) VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO ijn_b (id, w) VALUES (1, 100), (3, 300)
+
+# Plain JOIN with the predicate in WHERE behaves like an inner join.
+query
+SELECT ijn_a.id, w FROM ijn_a JOIN ijn_b WHERE ijn_a.id = ijn_b.id ORDER BY ijn_a.id
+----
+1	100
+3	300
+
+# INNER JOIN spelling, same result.
+query
+SELECT ijn_a.id, w FROM ijn_a INNER JOIN ijn_b WHERE ijn_a.id = ijn_b.id ORDER BY ijn_a.id
+----
+1	100
+3	300
+
+# With no predicate it is a full Cartesian product (3 x 2 = 6 rows).
+query
+SELECT COUNT(*) FROM ijn_a JOIN ijn_b
+----
+6
+
+# It agrees with the explicit CROSS JOIN and the comma join.
+query
+SELECT (SELECT COUNT(*) FROM ijn_a JOIN ijn_b) = (SELECT COUNT(*) FROM ijn_a CROSS JOIN ijn_b)
+----
+1
+
+query
+SELECT (SELECT COUNT(*) FROM ijn_a JOIN ijn_b) = (SELECT COUNT(*) FROM ijn_a, ijn_b)
+----
+1
+
+# An OUTER join still requires a condition (rejected, as on MySQL).
+statement error
+SELECT * FROM ijn_a LEFT JOIN ijn_b
