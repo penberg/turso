@@ -3892,6 +3892,11 @@ fn is_supported_function(upper_name: &str) -> bool {
         // onto the engine's `date`/`time`/`datetime` (renamed below). They return
         // the date, time, or full datetime of the value, like MySQL.
         | "DATE" | "TIME" | "TIMESTAMP"
+        // `SIGN(x)` returns -1/0/1 (an integer on both). `LAST_INSERT_ID()`
+        // returns the connection's last auto-increment id — the engine's
+        // `last_insert_rowid()` (renamed below), which matches because MySQL
+        // `AUTO_INCREMENT` is lowered to the rowid-alias integer primary key.
+        | "SIGN" | "LAST_INSERT_ID"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -4003,6 +4008,7 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP" => "datetime",
+        "LAST_INSERT_ID" => "last_insert_rowid",
         _ => return None,
     })
 }
@@ -6278,6 +6284,7 @@ mod tests {
             ("DATE('2020-01-01 10:00')", "date"),
             ("TIME('2020-01-01 10:00')", "time"),
             ("TIMESTAMP('2020-01-01')", "datetime"),
+            ("LAST_INSERT_ID()", "last_insert_rowid"),
         ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");

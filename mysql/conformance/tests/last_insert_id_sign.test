@@ -1,0 +1,50 @@
+# LAST_INSERT_ID() and SIGN() conformance.
+#
+# SIGN(x) returns -1, 0, or 1 (an integer) for the sign of x; it maps straight
+# to the engine's sign(). LAST_INSERT_ID() returns the connection's last
+# AUTO_INCREMENT value, which is the engine's last_insert_rowid() -- the same
+# value, since the front-end lowers AUTO_INCREMENT to the rowid-alias integer
+# primary key. Both are on a single connection, so the runner's sequential
+# statements see a stable LAST_INSERT_ID. NULL propagates through SIGN.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# SIGN of negative, zero, and positive values (including a small fraction).
+query
+SELECT SIGN(-5), SIGN(0), SIGN(7), SIGN(-0.001)
+----
+-1	0	1	-1
+
+query
+SELECT SIGN(NULL)
+----
+NULL
+
+statement ok
+CREATE TABLE IF NOT EXISTS lii_demo (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(10))
+
+statement ok
+INSERT INTO lii_demo (v) VALUES ('a')
+
+statement ok
+INSERT INTO lii_demo (v) VALUES ('b')
+
+# LAST_INSERT_ID reflects the most recent auto-increment insert.
+query
+SELECT LAST_INSERT_ID()
+----
+2
+
+statement ok
+INSERT INTO lii_demo (v) VALUES ('c')
+
+# It now reflects the new row, which matches that row's id.
+query
+SELECT LAST_INSERT_ID()
+----
+3
+
+query
+SELECT id FROM lii_demo WHERE v = 'c'
+----
+3
