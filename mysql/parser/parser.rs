@@ -2629,6 +2629,13 @@ impl Parser {
             return self.elt_call();
         }
 
+        // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
+        // comma-separated `strlist`, or 0; synthesized from comma-wrapped
+        // string surgery.
+        if upper == "FIND_IN_SET" {
+            return self.find_in_set_call();
+        }
+
         // `ISNULL(x)` returns 1 if `x` is NULL else 0; lower to the `x IS NULL`
         // predicate, which the engine evaluates to the same 1/0.
         if upper == "ISNULL" {
@@ -2971,6 +2978,46 @@ impl Parser {
             when_then_pairs,
             else_expr: None,
         })
+    }
+
+    /// Parses a `FIND_IN_SET(str, strlist)` call (the name and `(` are already
+    /// consumed) and lowers it to the 1-based index of `str` among the
+    /// comma-separated elements of `strlist`, or 0 if absent.
+    ///
+    /// With `h = lower(',' || strlist || ',')` and `n = lower(',' || str || ',')`,
+    /// the match's position is `instr(h, n)`; the element index is the number of
+    /// commas in `substr(h, 1, instr(h, n))`, counted as
+    /// `length(prefix) - length(replace(prefix, ',', ''))`. When `str` is absent
+    /// `instr` is 0, the prefix is empty, and the count is 0. Wrapping in `lower`
+    /// gives MySQL's default case-insensitive match (ASCII). NULL propagates.
+    /// (A `str` that itself contains a comma returns 0 in MySQL but may match here
+    /// — a documented edge.)
+    fn find_in_set_call(&mut self) -> Result<ast::Expr> {
+        let needle = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let strlist = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let needle = comma_wrapped_lower(needle);
+        let pos = call_fn("instr", vec![comma_wrapped_lower(strlist.clone()), needle]);
+        let prefix = substr_fn(
+            comma_wrapped_lower(strlist),
+            ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+            pos,
+        );
+        let without_commas = call_fn(
+            "replace",
+            vec![
+                prefix.clone(),
+                ast::Expr::Literal(ast::Literal::String(requote(","))),
+                ast::Expr::Literal(ast::Literal::String(requote(""))),
+            ],
+        );
+        Ok(ast::Expr::binary(
+            call_fn("length", vec![prefix]),
+            ast::Operator::Subtract,
+            call_fn("length", vec![without_commas]),
+        ))
     }
 
     /// Parses an `ISNULL(x)` call (the name and `(` are already consumed) and
@@ -4196,6 +4243,33 @@ fn repeat_expr(s: ast::Expr, n: ast::Expr) -> ast::Expr {
         )],
         else_expr: Some(Box::new(repeated)),
     }
+}
+
+/// Builds a function-call expression `name(args...)`.
+fn call_fn(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// Builds `lower(',' || x || ',')` — the value `x` wrapped in commas and
+/// lower-cased, the building block of the [`Parser::find_in_set_call`] lowering.
+fn comma_wrapped_lower(x: ast::Expr) -> ast::Expr {
+    let comma = || ast::Expr::Literal(ast::Literal::String(requote(",")));
+    let wrapped = ast::Expr::binary(
+        ast::Expr::binary(comma(), ast::Operator::Concat, x),
+        ast::Operator::Concat,
+        comma(),
+    );
+    call_fn("lower", vec![wrapped])
 }
 
 /// Builds `substr(s, start, len)`.
@@ -6695,6 +6769,31 @@ mod tests {
             parse_expr("a <> b").unwrap(),
             ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
         );
+    }
+
+    #[test]
+    fn find_in_set_lowers_to_comma_count() {
+        // FIND_IN_SET(s, list) -> length(prefix) - length(replace(prefix, ',','')).
+        let ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) =
+            parse_expr("FIND_IN_SET(s, list)").unwrap()
+        else {
+            panic!("expected FIND_IN_SET to lower to a subtraction");
+        };
+        // Both sides are length(...) calls.
+        for side in [lhs.as_ref(), rhs.as_ref()] {
+            let ast::Expr::FunctionCall { name, .. } = side else {
+                panic!("expected a length() call");
+            };
+            assert_eq!(name.as_str(), "length");
+        }
+        // The right side strips commas via replace(..., ',', '').
+        let ast::Expr::FunctionCall { args, .. } = rhs.as_ref() else {
+            unreachable!()
+        };
+        let ast::Expr::FunctionCall { name: rname, .. } = args[0].as_ref() else {
+            panic!("expected replace() inside the right length()");
+        };
+        assert_eq!(rname.as_str(), "replace");
     }
 
     #[test]

@@ -1,0 +1,69 @@
+# FIND_IN_SET(str, strlist) conformance.
+#
+# FIND_IN_SET returns the 1-based index of str among the comma-separated elements
+# of strlist, 0 if absent, NULL if either argument is NULL. The front-end
+# synthesizes it by wrapping both sides in commas and lower-casing
+# (h = lower(',' || strlist || ','), n = lower(',' || str || ',')): the match is
+# instr(h, n), and the element index is the comma count in substr(h, 1, instr).
+# The comma wrapping makes matches whole-element (not substring), and lower()
+# gives MySQL's default case-insensitive comparison.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The 1-based position within the list.
+query
+SELECT FIND_IN_SET('a', 'a,b,c'), FIND_IN_SET('b', 'a,b,c'), FIND_IN_SET('c', 'a,b,c')
+----
+1	2	3
+
+# Absent values (and the empty string) give 0.
+query
+SELECT FIND_IN_SET('x', 'a,b,c'), FIND_IN_SET('', 'a,b,c')
+----
+0	0
+
+# Matching is whole-element, not substring: '1' matches only the '1' element,
+# and '10' the '10' element.
+query
+SELECT FIND_IN_SET('1', '1,5,10,15'), FIND_IN_SET('10', '1,5,10,15')
+----
+1	3
+
+# Matching is case-insensitive, like MySQL's default collation.
+query
+SELECT FIND_IN_SET('B', 'a,b,c')
+----
+2
+
+# A single-element list.
+query
+SELECT FIND_IN_SET('a', 'a')
+----
+1
+
+# NULL in either argument gives NULL.
+query
+SELECT FIND_IN_SET('b', NULL), FIND_IN_SET(NULL, 'a,b')
+----
+NULL	NULL
+
+# Usable over a column and in WHERE (membership in a stored comma list).
+statement ok
+CREATE TABLE IF NOT EXISTS fis_demo (id INT PRIMARY KEY, tags VARCHAR(50))
+
+statement ok
+INSERT INTO fis_demo (id, tags) VALUES (1, 'red,green'), (2, 'blue'), (3, 'green,blue,red')
+
+query
+SELECT id FROM fis_demo WHERE FIND_IN_SET('blue', tags) > 0 ORDER BY id
+----
+2
+3
+
+query
+SELECT id, FIND_IN_SET('red', tags) FROM fis_demo ORDER BY id
+----
+1	1
+2	0
+3	3
