@@ -330,8 +330,11 @@ impl Parser {
     ///   - `RENAME [TO|AS] new` → `ALTER TABLE ... RENAME TO`, and
     ///   - `RENAME COLUMN old TO new` → `ALTER TABLE ... RENAME COLUMN`.
     ///
+    ///   - `DROP PRIMARY KEY` → `DROP INDEX <table>_primary`, the inverse of the
+    ///     `ADD PRIMARY KEY` emulation (see [`Self::alter_drop`]).
+    ///
     /// Everything else — `ADD FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
-    /// `DROP {INDEX|PRIMARY KEY|FOREIGN KEY}`, the type-changing `CHANGE`/`MODIFY`
+    /// `DROP {FOREIGN KEY|CONSTRAINT}`, the type-changing `CHANGE`/`MODIFY`
     /// operations, and `RENAME INDEX` — is rejected as unsupported. The
     /// comma-separated multi-operation form has no single-statement engine
     /// equivalent and is rejected here, but [`Self::parse_statement_list`] expands
@@ -495,15 +498,16 @@ impl Parser {
     }
 
     /// Lowers `DROP [COLUMN] col` (the `DROP` keyword is already consumed) to the
-    /// engine's `ALTER TABLE ... DROP COLUMN`. Dropping an index, primary key, or
-    /// foreign key (`DROP {INDEX|KEY|PRIMARY KEY|FOREIGN KEY|CONSTRAINT|CHECK}`)
-    /// has no single-statement engine equivalent and is rejected.
+    /// engine's `ALTER TABLE ... DROP COLUMN`. `DROP {INDEX|KEY} name` becomes a
+    /// `DROP INDEX`, and `DROP PRIMARY KEY` drops the `<table>_primary` index that
+    /// [`Self::alter_add_primary_key`] created. Dropping a foreign key or other
+    /// constraint (`DROP {FOREIGN KEY|CONSTRAINT|CHECK}`) has no engine equivalent
+    /// and is rejected.
     fn alter_drop(&mut self, name: ast::QualifiedName) -> Result<ast::Stmt> {
         // `DROP {INDEX|KEY} idx_name` drops a secondary index, mirroring the
         // `ADD KEY` -> `CREATE INDEX` lowering; it becomes the engine's
         // `DROP INDEX idx_name` (index names are per-database here, so the table
-        // is implied). `DROP PRIMARY KEY` / `DROP FOREIGN KEY` have no in-place
-        // engine form.
+        // is implied).
         if self.eat_keyword("INDEX") || self.eat_keyword("KEY") {
             let idx_name = self.qualified_name()?;
             return Ok(ast::Stmt::DropIndex {
@@ -511,7 +515,21 @@ impl Parser {
                 idx_name,
             });
         }
-        for kw in ["PRIMARY", "FOREIGN", "CONSTRAINT", "CHECK"] {
+        // `DROP PRIMARY KEY` is symmetric with the `ADD PRIMARY KEY` emulation:
+        // drop the `<table>_primary` UNIQUE index that stood in for the primary
+        // key, so an ADD/DROP cycle round-trips. (A table whose primary key came
+        // from `CREATE TABLE` instead -- the engine's rowid alias -- has no such
+        // index, so this errors there; the engine cannot drop a rowid primary key
+        // in place.)
+        if self.eat_keyword("PRIMARY") {
+            self.expect_keyword("KEY")?;
+            let idx_name = ast::Name::from_string(format!("{}_primary", name.name.as_str()));
+            return Ok(ast::Stmt::DropIndex {
+                if_exists: false,
+                idx_name: ast::QualifiedName::single(idx_name),
+            });
+        }
+        for kw in ["FOREIGN", "CONSTRAINT", "CHECK"] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
                     "ALTER TABLE ... DROP {kw} is not supported yet"
@@ -7290,18 +7308,18 @@ mod tests {
 
     #[test]
     fn alter_table_unsupported_variants() {
-        // Foreign-key and other constraint adds, index/key drops, the
-        // type-changing CHANGE/MODIFY operations, RENAME INDEX, and the
-        // multi-operation comma form are all rejected (a real mysqld accepts
-        // them, but the engine has no in-place equivalent). `ADD PRIMARY KEY` is
-        // the exception -- it lowers to a UNIQUE index (see
-        // `alter_table_add_primary_key_lowers_to_unique_index`).
+        // Foreign-key and other constraint adds and drops, the type-changing
+        // CHANGE/MODIFY operations, RENAME INDEX, and the multi-operation comma
+        // form are all rejected (a real mysqld accepts them, but the engine has
+        // no in-place equivalent). `ADD`/`DROP PRIMARY KEY` are the exceptions --
+        // they lower to creating / dropping a UNIQUE index (see
+        // `alter_table_add_primary_key_lowers_to_unique_index` and
+        // `alter_table_drop_primary_key_drops_the_emulated_index`).
         for sql in [
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
             "ALTER TABLE t ADD SPATIAL KEY sp (c)",
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
             "ALTER TABLE t ADD a INT, ADD b INT",
-            "ALTER TABLE t DROP PRIMARY KEY",
             "ALTER TABLE t DROP FOREIGN KEY fk",
             "ALTER TABLE t CHANGE COLUMN a b INT",
             "ALTER TABLE t MODIFY COLUMN a BIGINT",
@@ -7328,6 +7346,18 @@ mod tests {
             };
             assert_eq!(idx_name.name.as_str(), "idx", "{sql}");
         }
+    }
+
+    #[test]
+    fn alter_table_drop_primary_key_drops_the_emulated_index() {
+        // DROP PRIMARY KEY drops the `<table>_primary` index that ADD PRIMARY KEY
+        // creates, so an ADD/DROP cycle round-trips.
+        let ast::Stmt::DropIndex { idx_name, .. } =
+            parse("ALTER TABLE t DROP PRIMARY KEY").unwrap()
+        else {
+            panic!("expected DROP PRIMARY KEY to lower to DROP INDEX");
+        };
+        assert_eq!(idx_name.name.as_str(), "t_primary");
     }
 
     /// Parses `input` as a single complete expression.

@@ -1,0 +1,58 @@
+# ALTER TABLE ... DROP PRIMARY KEY conformance.
+#
+# DROP PRIMARY KEY is the inverse of the ADD PRIMARY KEY emulation: ADD PRIMARY
+# KEY stands a primary key up as a UNIQUE index named <table>_primary, so DROP
+# PRIMARY KEY drops that index. An ADD/DROP cycle therefore round-trips -- after
+# the drop the key's uniqueness is no longer enforced.
+#
+# (A primary key declared in CREATE TABLE is the engine's rowid alias, which has
+# no such index and cannot be dropped in place; that case is not exercised here
+# since it diverges from a real mysqld, which would drop it. See mysql/COMPAT.md.)
+#
+# Uses its own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS adpk_demo (id INT NOT NULL, v INT)
+
+statement ok
+ALTER TABLE adpk_demo ADD PRIMARY KEY (id)
+
+statement ok
+INSERT INTO adpk_demo (id, v) VALUES (1, 10)
+
+# While the key exists, a duplicate id is rejected.
+statement error
+INSERT INTO adpk_demo (id, v) VALUES (1, 20)
+
+# Dropping the primary key removes the uniqueness constraint.
+statement ok
+ALTER TABLE adpk_demo DROP PRIMARY KEY
+
+statement ok
+INSERT INTO adpk_demo (id, v) VALUES (1, 20)
+
+query
+SELECT id, v FROM adpk_demo ORDER BY v
+----
+1	10
+1	20
+
+# A fresh primary key can be added again after the drop.
+statement ok
+CREATE TABLE IF NOT EXISTS adpk_cycle (a INT, b INT)
+
+statement ok
+ALTER TABLE adpk_cycle ADD PRIMARY KEY (a)
+
+statement ok
+ALTER TABLE adpk_cycle DROP PRIMARY KEY
+
+statement ok
+ALTER TABLE adpk_cycle ADD PRIMARY KEY (b)
+
+statement ok
+INSERT INTO adpk_cycle (a, b) VALUES (1, 100), (1, 200)
+
+# The second key (on b) is now enforced; a is unconstrained.
+statement error
+INSERT INTO adpk_cycle (a, b) VALUES (9, 100)
