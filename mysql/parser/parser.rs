@@ -248,11 +248,13 @@ impl Parser {
     ///   - `ADD [COLUMN] <column-def>` → `ALTER TABLE ... ADD COLUMN`,
     ///   - `ADD [UNIQUE] {KEY|INDEX} [name] (cols)` → `CREATE [UNIQUE] INDEX`
     ///     (see [`Self::alter_add_index`]),
+    ///   - `ADD FULLTEXT [KEY|INDEX] [name] (cols)` → a plain `CREATE INDEX`,
+    ///     since the engine has no full-text index (see [`Self::alter_add_index`]),
     ///   - `DROP [COLUMN] col` → `ALTER TABLE ... DROP COLUMN`,
     ///   - `RENAME [TO|AS] new` → `ALTER TABLE ... RENAME TO`, and
     ///   - `RENAME COLUMN old TO new` → `ALTER TABLE ... RENAME COLUMN`.
     ///
-    /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`FULLTEXT`/`CONSTRAINT`,
+    /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
     /// `DROP {INDEX|PRIMARY KEY|FOREIGN KEY}`, the type-changing `CHANGE`/`MODIFY`
     /// operations, `RENAME INDEX`, and the comma-separated multi-operation form —
     /// is rejected as unsupported.
@@ -279,18 +281,23 @@ impl Parser {
             return self.alter_add_index(name, unique);
         }
 
+        // `ADD FULLTEXT [KEY|INDEX] [name] (cols)` has no engine full-text index,
+        // so it degrades to a plain secondary index. The statement succeeds (as
+        // it does on a real mysqld with a full-text-capable storage engine) and a
+        // following `SHOW INDEX` reports the key, which is what WordPress's
+        // `dbDelta()` relies on to avoid re-adding it. The index provides ordinary
+        // indexed lookups only -- not `MATCH ... AGAINST` full-text search, which
+        // the engine does not implement.
+        if self.eat_keyword("FULLTEXT") {
+            let _ = self.eat_keyword("KEY") || self.eat_keyword("INDEX");
+            return self.alter_add_index(name, false);
+        }
+
         // `COLUMN` is optional after `ADD`. Any other index/constraint add starts
         // with one of these keywords and has no single-statement engine
         // equivalent.
         self.eat_keyword("COLUMN");
-        for kw in [
-            "PRIMARY",
-            "CONSTRAINT",
-            "FULLTEXT",
-            "SPATIAL",
-            "FOREIGN",
-            "CHECK",
-        ] {
+        for kw in ["PRIMARY", "CONSTRAINT", "SPATIAL", "FOREIGN", "CHECK"] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
                     "ALTER TABLE ... ADD {kw} is not supported yet"
@@ -5173,7 +5180,9 @@ mod tests {
     #[test]
     fn alter_table_add_index_lowers_to_create_index() {
         // ADD KEY / ADD INDEX / ADD UNIQUE KEY become CREATE [UNIQUE] INDEX;
-        // a prefix length is dropped and an omitted name is synthesized.
+        // a prefix length is dropped and an omitted name is synthesized. ADD
+        // FULLTEXT (with or without KEY/INDEX) degrades to a plain, non-unique
+        // CREATE INDEX since the engine has no full-text index.
         let cases = [
             (
                 "ALTER TABLE t ADD KEY name_idx (name)",
@@ -5189,6 +5198,8 @@ mod tests {
                 "combo",
                 2,
             ),
+            ("ALTER TABLE t ADD FULLTEXT KEY ft (body)", false, "ft", 1),
+            ("ALTER TABLE t ADD FULLTEXT (body)", false, "t_body", 1),
         ];
         for (sql, want_unique, want_name, want_cols) in cases {
             let ast::Stmt::CreateIndex {
@@ -5274,7 +5285,7 @@ mod tests {
         for sql in [
             "ALTER TABLE t ADD PRIMARY KEY (id)",
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
-            "ALTER TABLE t ADD FULLTEXT KEY ft (c)",
+            "ALTER TABLE t ADD SPATIAL KEY sp (c)",
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
             "ALTER TABLE t ADD a INT, ADD b INT",
             "ALTER TABLE t DROP PRIMARY KEY",

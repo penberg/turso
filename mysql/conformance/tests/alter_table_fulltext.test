@@ -1,0 +1,42 @@
+# ALTER TABLE ... ADD FULLTEXT degrades to a plain secondary index.
+#
+# The engine has no full-text index, so the front-end lowers ADD FULLTEXT to a
+# plain CREATE INDEX: the statement succeeds (as it does on a real mysqld with a
+# full-text-capable storage engine) and the key is reported by SHOW INDEX, which
+# is what WordPress's dbDelta() relies on to avoid re-adding it. The degraded
+# index provides ordinary indexed lookups only -- not MATCH ... AGAINST
+# full-text search, which the engine does not implement.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table and index names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS aft_docs (id INT PRIMARY KEY, title TEXT, body TEXT)
+
+# Named FULLTEXT KEY.
+statement ok
+ALTER TABLE aft_docs ADD FULLTEXT KEY aft_body_idx (body)
+
+# Name-elided form (FULLTEXT without KEY/INDEX and without a name); MySQL
+# auto-names it and so does the front-end.
+statement ok
+ALTER TABLE aft_docs ADD FULLTEXT (title)
+
+statement ok
+INSERT INTO aft_docs VALUES (1, 'hello', 'the quick brown fox'), (2, 'world', 'lazy dog')
+
+# Ordinary lookups on the indexed columns are unaffected by the degraded index.
+query
+SELECT body FROM aft_docs WHERE id = 1
+----
+the quick brown fox
+
+query
+SELECT id FROM aft_docs WHERE title = 'world'
+----
+2
+
+# Adding the same FULLTEXT key again is rejected (the underlying index already
+# exists), so dbDelta-style "create if missing" stays well-defined.
+statement error
+ALTER TABLE aft_docs ADD FULLTEXT KEY aft_body_idx (body)
