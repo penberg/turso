@@ -2570,6 +2570,12 @@ impl Parser {
             return self.elt_call();
         }
 
+        // `ISNULL(x)` returns 1 if `x` is NULL else 0; lower to the `x IS NULL`
+        // predicate, which the engine evaluates to the same 1/0.
+        if upper == "ISNULL" {
+            return self.isnull_call();
+        }
+
         // `MOD(a, b)` is the function spelling of the `a MOD b` operator; MySQL
         // defines them identically, so lower it the same way (exact for floats,
         // unlike the engine's `%`).
@@ -2879,6 +2885,16 @@ impl Parser {
             when_then_pairs,
             else_expr: None,
         })
+    }
+
+    /// Parses an `ISNULL(x)` call (the name and `(` are already consumed) and
+    /// lowers it to the `x IS NULL` predicate, which the engine evaluates to 1
+    /// when `x` is NULL and 0 otherwise — exactly MySQL's `ISNULL`. Exactly one
+    /// argument is required.
+    fn isnull_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::is_null(arg))
     }
 
     /// Parses an `INSTR(str, substr)` or `LOCATE(substr, str)` call (the name and
@@ -6191,6 +6207,15 @@ mod tests {
             parse_expr("ELT(1)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn isnull_lowers_to_is_null_predicate() {
+        // ISNULL(x) -> x IS NULL.
+        assert_eq!(
+            parse_expr("ISNULL(v)").unwrap(),
+            ast::Expr::is_null(col("v"))
+        );
     }
 
     #[test]

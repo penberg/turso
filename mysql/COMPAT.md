@@ -337,6 +337,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `COALESCE`                             | ✅     |         |
 | `NULLIF`                               | ✅     |         |
 | `IFNULL`                               | ✅     |         |
+| `ISNULL`                               | ✅     | The single-argument test: lowered to the `x IS NULL` predicate, returning 1 if x is NULL else 0. Distinct from the two-argument `IFNULL(x, y)`. |
 | `ABS`                                  | ✅     |         |
 | `LOWER` / `UPPER`                      | ✅     | ASCII case folding. |
 | `REPLACE`                              | ✅     | Replaces every occurrence, case-sensitively. |
