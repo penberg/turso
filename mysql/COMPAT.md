@@ -322,6 +322,7 @@ diverge are deliberately excluded.
 | `%` (modulo operator)                  | ❌     | **Excluded** — the symbolic `%` is not parsed (the engine's `%` truncates float operands to integers). |
 | `a MOD b` / `MOD(a, b)` / `a DIV b`    | ✅     | The `MOD`/`DIV` keyword operators and the `MOD(a, b)` function are lowered to integer arithmetic (`a - b * CAST(a / b AS INTEGER)` and `CAST(a / b AS INTEGER)`), which matches MySQL for both integer and float operands. |
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
+| `&` / `\|` (bitwise)                    | 🚧     | Bitwise AND / OR, mapped to the engine's `&`/`\|`. `&` binds tighter than `\|`, both tighter than comparison but looser than `+`/`-`, as in MySQL. MySQL evaluates on unsigned 64-bit integers and the engine on signed, so a result with bit 63 set prints differently; for small non-negative operands (flag masks, the common case) they match. Unary `~`, `^` (XOR), and the `<<`/`>>` shifts are not parsed. |
 | `[NOT] IN (SELECT ...)`                | ✅     | Uncorrelated subquery in `IN`/`NOT IN`; evaluates identically. |
 | `[NOT] EXISTS (SELECT ...)`            | ✅     | Correlated subqueries supported; identical semantics. |
 | Derived table `FROM (SELECT ...) alias` | ✅    | Subquery in `FROM`; the alias is required (as in MySQL). |

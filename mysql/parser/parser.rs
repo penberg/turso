@@ -2004,7 +2004,7 @@ impl Parser {
     }
 
     fn comparison_expr(&mut self) -> Result<ast::Expr> {
-        let lhs = self.additive_expr()?;
+        let lhs = self.bitor_expr()?;
 
         // `IS [NOT] {NULL | UNKNOWN | TRUE | FALSE}`. `UNKNOWN` is a synonym for
         // `NULL`. The boolean tests never yield NULL in MySQL, so `IS TRUE`
@@ -2119,8 +2119,40 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.advance();
-        let rhs = self.additive_expr()?;
+        let rhs = self.bitor_expr()?;
         Ok(ast::Expr::binary(lhs, op, rhs))
+    }
+
+    /// Bitwise-OR tier: `|`, left-associative. Binds looser than `&` and the
+    /// arithmetic operators, but tighter than the comparison operators — matching
+    /// MySQL.
+    ///
+    /// MySQL's bitwise operators work on unsigned 64-bit integers, whereas the
+    /// engine's are signed, so a result with bit 63 set prints differently (e.g.
+    /// MySQL's huge unsigned value vs a negative number). For the common case of
+    /// small non-negative operands (flag masks) the results match. The unary `~`
+    /// (which always sets high bits), `^` (bitwise XOR), and the `<<`/`>>` shifts
+    /// are not modeled. (See `mysql/COMPAT.md`.)
+    fn bitor_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.bitand_expr()?;
+        while matches!(self.peek(), Some(Token::Other('|'))) {
+            self.advance();
+            let rhs = self.bitand_expr()?;
+            lhs = ast::Expr::binary(lhs, ast::Operator::BitwiseOr, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// Bitwise-AND tier: `&`, left-associative. Binds tighter than `|` and looser
+    /// than the arithmetic operators, as in MySQL.
+    fn bitand_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.additive_expr()?;
+        while matches!(self.peek(), Some(Token::Other('&'))) {
+            self.advance();
+            let rhs = self.additive_expr()?;
+            lhs = ast::Expr::binary(lhs, ast::Operator::BitwiseAnd, rhs);
+        }
+        Ok(lhs)
     }
 
     /// `expr [NOT] IN (v1, v2, ...)` (a value list) or `expr [NOT] IN (SELECT ...)`
@@ -6346,6 +6378,54 @@ mod tests {
             parse_expr("ELT(1)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn bitwise_and_or_precedence() {
+        use ast::Operator::{Add, BitwiseAnd, BitwiseOr, Equals};
+
+        // a & b and a | b lower to the engine's bitwise operators.
+        assert_eq!(
+            parse_expr("a & b").unwrap(),
+            ast::Expr::binary(col("a"), BitwiseAnd, col("b"))
+        );
+        assert_eq!(
+            parse_expr("a | b").unwrap(),
+            ast::Expr::binary(col("a"), BitwiseOr, col("b"))
+        );
+
+        // `&` binds tighter than `|`: a | b & c == a | (b & c).
+        assert_eq!(
+            parse_expr("a | b & c").unwrap(),
+            ast::Expr::binary(
+                col("a"),
+                BitwiseOr,
+                ast::Expr::binary(col("b"), BitwiseAnd, col("c")),
+            )
+        );
+
+        // `+` binds tighter than `&`: a + b & c == (a + b) & c.
+        assert_eq!(
+            parse_expr("a + b & c").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::binary(col("a"), Add, col("b")),
+                BitwiseAnd,
+                col("c"),
+            )
+        );
+
+        // Bitwise binds tighter than comparison: a & b = c == (a & b) = c.
+        assert_eq!(
+            parse_expr("a & b = c").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::binary(col("a"), BitwiseAnd, col("b")),
+                Equals,
+                col("c"),
+            )
+        );
+
+        // `~` (unsigned in MySQL, signed here) is not modeled.
+        assert!(parse_expr("~a").is_err());
     }
 
     #[test]
