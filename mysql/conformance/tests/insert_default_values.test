@@ -1,0 +1,42 @@
+# INSERT ... () VALUES () (all-defaults row) conformance.
+#
+# MySQL's INSERT INTO t () VALUES () (and the column-list-less INSERT INTO t
+# VALUES ()) inserts a single row using every column's default. The front-end
+# maps the no-column-list, single-empty-row form to the engine's DEFAULT VALUES,
+# which applies the column defaults the same way.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS idv_demo (id INT PRIMARY KEY AUTO_INCREMENT, n INT DEFAULT 7, s VARCHAR(10) DEFAULT 'def')
+
+# The empty column list / empty values form inserts an all-defaults row.
+statement ok
+INSERT INTO idv_demo () VALUES ()
+
+# The column-list-less form does the same.
+statement ok
+INSERT INTO idv_demo VALUES ()
+
+# Both rows carry the column defaults, with the auto-increment id advancing.
+query
+SELECT id, n, s FROM idv_demo ORDER BY id
+----
+1	7	def
+2	7	def
+
+# Ordinary inserts are unaffected and coexist.
+statement ok
+INSERT INTO idv_demo (n, s) VALUES (10, 'x')
+
+statement ok
+INSERT INTO idv_demo () VALUES ()
+
+query
+SELECT id, n, s FROM idv_demo ORDER BY id
+----
+1	7	def
+2	7	def
+3	10	x
+4	7	def

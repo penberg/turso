@@ -995,15 +995,18 @@ impl Parser {
         self.eat_keyword("INTO"); // `INTO` is optional in MySQL
         let tbl_name = self.qualified_name()?;
 
-        // Optional explicit column list.
+        // Optional explicit column list. The empty list `()` is the MySQL
+        // all-defaults form (`INSERT INTO t () VALUES ()`), handled below.
         let mut columns = Vec::new();
         if self.eat(&Token::LParen) {
-            loop {
-                columns.push(self.name()?);
-                if self.eat(&Token::Comma) {
-                    continue;
+            if !self.is(&Token::RParen) {
+                loop {
+                    columns.push(self.name()?);
+                    if self.eat(&Token::Comma) {
+                        continue;
+                    }
+                    break;
                 }
-                break;
             }
             self.expect(&Token::RParen, "`)`")?;
         }
@@ -1066,6 +1069,21 @@ impl Parser {
         } else {
             None
         };
+
+        // `INSERT INTO t () VALUES ()` / `INSERT INTO t VALUES ()` — a single
+        // empty row with no column list inserts one all-defaults row, which is
+        // the engine's `DEFAULT VALUES`. (Multiple empty rows have no
+        // single-statement engine equivalent and fall through.)
+        if columns.is_empty() && upsert.is_none() && rows.len() == 1 && rows[0].is_empty() {
+            return Ok(ast::Stmt::Insert {
+                with: None,
+                or_conflict,
+                tbl_name,
+                columns,
+                body: ast::InsertBody::DefaultValues,
+                returning: Vec::new(),
+            });
+        }
 
         Ok(ast::Stmt::Insert {
             with: None,
@@ -6237,6 +6255,28 @@ mod tests {
             parse("INSERT t VALUES (1)").unwrap(),
             ast::Stmt::Insert { .. }
         ));
+    }
+
+    #[test]
+    fn insert_empty_values_lowers_to_default_values() {
+        // `INSERT INTO t () VALUES ()` and `INSERT INTO t VALUES ()` both insert
+        // one all-defaults row -> the engine's DEFAULT VALUES body.
+        for sql in ["INSERT INTO t () VALUES ()", "INSERT INTO t VALUES ()"] {
+            let ast::Stmt::Insert { columns, body, .. } = parse(sql).unwrap() else {
+                panic!("expected Insert for `{sql}`");
+            };
+            assert!(columns.is_empty(), "{sql}");
+            assert!(
+                matches!(body, ast::InsertBody::DefaultValues),
+                "expected DEFAULT VALUES for `{sql}`"
+            );
+        }
+
+        // A non-empty row keeps the VALUES body even with an empty column list.
+        let ast::Stmt::Insert { body, .. } = parse("INSERT INTO t () VALUES (1)").unwrap() else {
+            unreachable!()
+        };
+        assert!(matches!(body, ast::InsertBody::Select(_, _)));
     }
 
     #[test]
