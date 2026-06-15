@@ -1815,7 +1815,56 @@ impl Parser {
         }
         let tbl_name = self.qualified_name()?;
         let alias = self.table_alias()?;
+        self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
+    }
+
+    /// Consumes zero or more MySQL index hints following a table reference:
+    /// `{USE|IGNORE|FORCE} {INDEX|KEY} [FOR {JOIN|ORDER BY|GROUP BY}] (idx, ...)`.
+    /// Index hints only steer MySQL's optimizer; the engine plans its own access
+    /// path, so they are parsed and discarded (the result set is identical). The
+    /// index list may be empty (`USE INDEX ()`), and `PRIMARY` is accepted as a
+    /// name.
+    fn skip_index_hints(&mut self) -> Result<()> {
+        loop {
+            let is_hint = matches!(self.peek(), Some(Token::Word(w))
+                if w.eq_ignore_ascii_case("USE")
+                    || w.eq_ignore_ascii_case("FORCE")
+                    || w.eq_ignore_ascii_case("IGNORE"))
+                && matches!(self.peek_nth(1), Some(Token::Word(w))
+                    if w.eq_ignore_ascii_case("INDEX") || w.eq_ignore_ascii_case("KEY"));
+            if !is_hint {
+                break;
+            }
+            self.advance(); // USE / FORCE / IGNORE
+            self.advance(); // INDEX / KEY
+
+            // Optional `FOR {JOIN | ORDER BY | GROUP BY}` scope.
+            if self.eat_keyword("FOR") {
+                if self.eat_keyword("JOIN") {
+                    // no further tokens
+                } else if self.eat_keyword("ORDER") || self.eat_keyword("GROUP") {
+                    self.expect_keyword("BY")?;
+                } else {
+                    return Err(self.unexpected("`JOIN`, `ORDER BY`, or `GROUP BY`"));
+                }
+            }
+
+            // The parenthesized index list (possibly empty); names may be
+            // identifiers or the `PRIMARY` keyword.
+            self.expect(&Token::LParen, "`(`")?;
+            while !self.is(&Token::RParen) {
+                match self.peek() {
+                    Some(Token::Word(_)) | Some(Token::QuotedIdent(_)) => self.advance(),
+                    _ => return Err(self.unexpected("an index name")),
+                }
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen, "`)`")?;
+        }
+        Ok(())
     }
 
     /// Parses an optional table alias: `AS name`, a backtick-quoted name, or a
@@ -5605,6 +5654,11 @@ fn is_reserved_after_table(word: &str) -> bool {
             | "LOCK"
             | "WINDOW"
             | "AS"
+            // Index-hint keywords (`USE`/`FORCE`/`IGNORE INDEX`) follow a table
+            // reference and must not be mistaken for an alias.
+            | "USE"
+            | "FORCE"
+            | "IGNORE"
     )
 }
 
@@ -6688,6 +6742,28 @@ mod tests {
             panic!("expected a typed join");
         };
         assert!(t.contains(ast::JoinType::INNER) && !t.contains(ast::JoinType::CROSS));
+    }
+
+    #[test]
+    fn index_hints_are_parsed_and_ignored() {
+        // Index hints after a table reference parse and are discarded -- the
+        // statement is otherwise identical to the unhinted form.
+        let baseline = parse("SELECT id FROM t WHERE c > 1").unwrap();
+        for hint in [
+            "USE INDEX (PRIMARY)",
+            "FORCE INDEX (a, b)",
+            "IGNORE INDEX (a)",
+            "USE KEY (a)",
+            "USE INDEX ()",
+            "FORCE INDEX FOR ORDER BY (a)",
+            "USE INDEX FOR JOIN (a) IGNORE INDEX FOR GROUP BY (b)",
+        ] {
+            let sql = format!("SELECT id FROM t {hint} WHERE c > 1");
+            assert_eq!(parse(&sql).unwrap(), baseline, "for `{sql}`");
+        }
+
+        // Hints attach to joined tables too.
+        assert!(parse("SELECT * FROM a USE INDEX (x) JOIN b FORCE INDEX (y) ON a.id = b.id").is_ok());
     }
 
     #[test]

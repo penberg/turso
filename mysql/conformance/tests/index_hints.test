@@ -1,0 +1,62 @@
+# Index hints (USE / FORCE / IGNORE INDEX) conformance.
+#
+# A table reference in MySQL may carry index hints --
+# `{USE|IGNORE|FORCE} {INDEX|KEY} [FOR {JOIN|ORDER BY|GROUP BY}] (idx, ...)` --
+# that steer the optimizer. The front-end previously rejected them with a syntax
+# error; it now parses and discards them, since the engine plans its own access
+# path and the hint cannot change the result set. The index list may be empty
+# (`USE INDEX ()`), `PRIMARY` is a valid name, and hints attach to joined tables
+# too.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (the hints
+# are advisory, so the rows are the same with or without them). Uses its own
+# table / index names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ih_demo (id INT PRIMARY KEY, c INT)
+
+statement ok
+INSERT INTO ih_demo (id, c) VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE INDEX ih_c_idx ON ih_demo (c)
+
+# FORCE / USE / IGNORE INDEX all parse and return the unhinted result.
+query
+SELECT id FROM ih_demo FORCE INDEX (PRIMARY) WHERE c > 10 ORDER BY id
+----
+2
+3
+
+query
+SELECT id FROM ih_demo USE INDEX (ih_c_idx) WHERE c > 10 ORDER BY id
+----
+2
+3
+
+query
+SELECT id FROM ih_demo IGNORE INDEX (ih_c_idx) WHERE c > 10 ORDER BY id
+----
+2
+3
+
+# An empty USE INDEX () list, and the FOR scope, are accepted.
+query
+SELECT id FROM ih_demo USE INDEX () ORDER BY id
+----
+1
+2
+3
+
+query
+SELECT id FROM ih_demo FORCE INDEX FOR ORDER BY (ih_c_idx) ORDER BY c DESC
+----
+3
+2
+1
+
+# Hints attach to joined tables, including the KEY synonym, and an alias.
+query
+SELECT a.id FROM ih_demo AS a USE INDEX (PRIMARY) JOIN ih_demo b IGNORE KEY (ih_c_idx) ON a.id = b.id WHERE a.c = 20
+----
+2
