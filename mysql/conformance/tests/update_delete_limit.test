@@ -1,0 +1,75 @@
+# UPDATE / DELETE ... LIMIT conformance.
+#
+# MySQL allows a row-count LIMIT on UPDATE and DELETE: it caps the number of
+# affected rows. Without an ORDER BY (which the engine cannot honor on
+# UPDATE/DELETE, so it stays rejected) the affected rows are unspecified on both
+# MySQL and the engine, so the tests assert only counts -- never which specific
+# rows -- which is deterministic. The count-only form is required (no OFFSET).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+# UPDATE ... LIMIT n affects exactly n rows when at least n match.
+statement ok
+CREATE TABLE IF NOT EXISTS udl_u (id INT PRIMARY KEY, flag INT DEFAULT 0)
+
+statement ok
+INSERT INTO udl_u (id) VALUES (1), (2), (3), (4), (5)
+
+statement ok
+UPDATE udl_u SET flag = 1 LIMIT 2
+
+# Exactly two rows were flagged, three left untouched (which two is unspecified).
+query
+SELECT COUNT(*) FROM udl_u WHERE flag = 1
+----
+2
+
+query
+SELECT COUNT(*) FROM udl_u WHERE flag = 0
+----
+3
+
+# A LIMIT larger than the number of matching rows updates them all.
+statement ok
+UPDATE udl_u SET flag = 1 LIMIT 100
+
+query
+SELECT COUNT(*) FROM udl_u WHERE flag = 1
+----
+5
+
+# DELETE ... LIMIT n removes exactly n rows when at least n match.
+statement ok
+CREATE TABLE IF NOT EXISTS udl_d (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO udl_d (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+statement ok
+DELETE FROM udl_d LIMIT 2
+
+query
+SELECT COUNT(*) FROM udl_d
+----
+3
+
+# A WHERE narrows the candidates; a LIMIT exceeding them deletes them all.
+statement ok
+DELETE FROM udl_d WHERE id <= 5 LIMIT 100
+
+query
+SELECT COUNT(*) FROM udl_d
+----
+0
+
+# ORDER BY on UPDATE/DELETE is rejected (the engine cannot honor it).
+statement error
+DELETE FROM udl_u ORDER BY id LIMIT 1
+
+statement error
+UPDATE udl_u SET flag = 0 ORDER BY id LIMIT 1
+
+# An OFFSET on the row-count LIMIT is rejected (MySQL does not allow it here).
+statement error
+DELETE FROM udl_u LIMIT 1, 2

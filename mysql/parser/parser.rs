@@ -1810,6 +1810,28 @@ impl Parser {
         }
     }
 
+    /// Parses an optional MySQL `LIMIT <count>` row-limit for `UPDATE`/`DELETE` —
+    /// the count-only form (MySQL does not allow an `OFFSET` / `offset, count`
+    /// here). The engine applies it to cap the number of affected rows. Without an
+    /// `ORDER BY` (which the engine cannot honor on `UPDATE`/`DELETE`, so it stays
+    /// rejected) MySQL likewise affects an unspecified `count` rows, so the two
+    /// match.
+    fn row_limit(&mut self) -> Result<Option<ast::Limit>> {
+        if !self.eat_keyword("LIMIT") {
+            return Ok(None);
+        }
+        let count = self.expr()?;
+        if self.is(&Token::Comma) || self.is_keyword("OFFSET") {
+            return Err(ParseError::Unsupported(
+                "LIMIT on UPDATE/DELETE takes a row count only (no offset)".to_string(),
+            ));
+        }
+        Ok(Some(ast::Limit {
+            expr: Box::new(count),
+            offset: None,
+        }))
+    }
+
     // === UPDATE ===
 
     /// Parses `UPDATE tbl SET col = expr [, ...] [WHERE expr]`. Multi-table
@@ -1852,11 +1874,14 @@ impl Parser {
             None
         };
 
-        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+        // `ORDER BY` is rejected — the engine cannot order an UPDATE — but the
+        // count-only `LIMIT` is honored.
+        if self.is_keyword("ORDER") {
             return Err(ParseError::Unsupported(
-                "ORDER BY / LIMIT on UPDATE is not supported yet".to_string(),
+                "ORDER BY on UPDATE is not supported yet".to_string(),
             ));
         }
+        let limit = self.row_limit()?;
 
         Ok(ast::Stmt::Update(ast::Update {
             with: None,
@@ -1868,7 +1893,7 @@ impl Parser {
             where_clause,
             returning: Vec::new(),
             order_by: Vec::new(),
-            limit: None,
+            limit,
         }))
     }
 
@@ -2000,11 +2025,14 @@ impl Parser {
             None
         };
 
-        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+        // `ORDER BY` is rejected — the engine cannot order a DELETE — but the
+        // count-only `LIMIT` is honored.
+        if self.is_keyword("ORDER") {
             return Err(ParseError::Unsupported(
-                "ORDER BY / LIMIT on DELETE is not supported yet".to_string(),
+                "ORDER BY on DELETE is not supported yet".to_string(),
             ));
         }
+        let limit = self.row_limit()?;
 
         Ok(ast::Stmt::Delete {
             with: None,
@@ -2013,7 +2041,7 @@ impl Parser {
             where_clause,
             returning: Vec::new(),
             order_by: Vec::new(),
-            limit: None,
+            limit,
         })
     }
 
@@ -8396,8 +8424,10 @@ mod tests {
     fn update_unsupported_variants() {
         for sql in [
             "UPDATE a, b SET a.x = 1",
+            // ORDER BY (the engine cannot order an UPDATE) and a LIMIT with an
+            // offset stay rejected.
             "UPDATE t SET a = 1 ORDER BY a",
-            "UPDATE t SET a = 1 LIMIT 1",
+            "UPDATE t SET a = 1 LIMIT 1, 2",
             "UPDATE IGNORE t SET a = 1",
         ] {
             assert!(
@@ -8405,6 +8435,13 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+
+        // A count-only LIMIT is honored.
+        let ast::Stmt::Update(update) = parse("UPDATE t SET a = 1 WHERE b = 2 LIMIT 3").unwrap()
+        else {
+            panic!("expected an Update");
+        };
+        assert!(update.limit.is_some());
     }
 
     #[test]
@@ -8465,8 +8502,9 @@ mod tests {
             "DELETE t1, t2 FROM t1, t2 WHERE t1.id = t2.id", // multiple target tables
             "DELETE FROM a, b",
             "DELETE FROM t USING u",
+            // ORDER BY (unorderable) and an offset on the LIMIT stay rejected.
             "DELETE FROM t ORDER BY a",
-            "DELETE FROM t LIMIT 1",
+            "DELETE FROM t LIMIT 1, 2",
             "DELETE QUICK FROM t",
         ] {
             assert!(
@@ -8474,6 +8512,13 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+
+        // A count-only LIMIT is honored.
+        let ast::Stmt::Delete { limit, .. } = parse("DELETE FROM t WHERE a = 1 LIMIT 5").unwrap()
+        else {
+            panic!("expected a Delete");
+        };
+        assert!(limit.is_some());
     }
 
     #[test]
