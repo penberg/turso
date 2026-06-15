@@ -1,0 +1,54 @@
+# The `%` modulo operator.
+#
+# MySQL's `%` is a synonym for `MOD`: the remainder, which takes the sign of the
+# dividend and is exact for float operands. The front-end lowers `a % b` the same
+# way as `a MOD b` -- `a - b * CAST(a / b AS INTEGER)` -- rather than using the
+# engine's own `%`, which would wrongly truncate float operands (e.g. it gives
+# `5.5 % 2` = 1 instead of 1.5). `%` sits in the multiplicative precedence tier.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Integer remainders.
+query
+SELECT 7 % 3, 10 % 4, 17 % 5, 9 % 3
+----
+1	2	2	0
+
+# Float operands keep their fractional remainder (the engine's own `%` would not).
+query
+SELECT 5.5 % 2, 7.5 % 2.5
+----
+1.5	0.0
+
+# The remainder takes the sign of the dividend, as in MySQL.
+query
+SELECT -7 % 3, 7 % -3, -7 % -3
+----
+-1	1	-1
+
+# `%` and `MOD` are synonyms, and `%` binds like multiplication (tighter than +).
+query
+SELECT (7 % 3) = (7 MOD 3), 2 + 10 % 3, 10 % 3 * 2
+----
+1	3	2
+
+# Division by zero and NULL operands yield NULL.
+query
+SELECT 5 % 0 IS NULL, NULL % 3 IS NULL, 3 % NULL IS NULL
+----
+1	1	1
+
+# Usable over a column (even-id filter).
+statement ok
+CREATE TABLE IF NOT EXISTS modop (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO modop (id) VALUES (1), (2), (3), (4), (5), (6)
+
+query
+SELECT id FROM modop WHERE id % 2 = 0 ORDER BY id
+----
+2
+4
+6

@@ -2689,15 +2689,16 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// Multiplicative tier: `*` and the MySQL keyword operators `DIV` (integer
-    /// division) and `MOD` (modulo). The symbolic `/` and `%` are intentionally
-    /// not parsed — their MySQL semantics differ from SQLite (float division,
-    /// float modulo) — but `DIV`/`MOD` have a well-defined integer mapping:
+    /// Multiplicative tier: `*`, the modulo operators `%` and `MOD`, and the
+    /// integer-division keyword `DIV`. The symbolic `/` is intentionally not
+    /// parsed — MySQL's `/` is float division while the engine's truncates two
+    /// integers — but `DIV`/`MOD`/`%` have a well-defined mapping:
     ///   - `a DIV b` → `CAST(a / b AS INTEGER)`: the quotient truncated toward
     ///     zero, regardless of whether the engine divides as integer or float.
-    ///   - `a MOD b` → `a - b * CAST(a / b AS INTEGER)`: the remainder, which
-    ///     takes the sign of `a` and is exact for float operands too (where the
-    ///     engine's `%` would wrongly truncate to integers).
+    ///   - `a MOD b` / `a % b` → `a - b * CAST(a / b AS INTEGER)`: the remainder,
+    ///     which takes the sign of `a` and is exact for float operands too (where
+    ///     the engine's own `%` would wrongly truncate them to integers, e.g.
+    ///     `5.5 % 2` is `1.5`, not `1`). `%` and `MOD` are synonyms in MySQL.
     fn multiplicative_expr(&mut self) -> Result<ast::Expr> {
         let mut lhs = self.collate_expr()?;
         loop {
@@ -2708,7 +2709,7 @@ impl Parser {
             } else if self.eat_keyword("DIV") {
                 let rhs = self.collate_expr()?;
                 lhs = integer_division(lhs, rhs);
-            } else if self.eat_keyword("MOD") {
+            } else if self.eat_keyword("MOD") || self.eat(&Token::Other('%')) {
                 let rhs = self.collate_expr()?;
                 lhs = modulo(lhs, rhs);
             } else {
@@ -8962,6 +8963,15 @@ mod tests {
             parse_expr("MOD(a, b)").unwrap(),
             parse_expr("a MOD b").unwrap()
         );
+
+        // The `%` operator is a synonym for `MOD` and lowers identically, at the
+        // same (multiplicative) precedence — so `2 + a % b` parses the same as
+        // `2 + a MOD b` (the modulo binding tighter than the addition).
+        assert_eq!(parse_expr("a % b").unwrap(), parse_expr("a MOD b").unwrap());
+        assert_eq!(
+            parse_expr("2 + a % b").unwrap(),
+            parse_expr("2 + a MOD b").unwrap()
+        );
     }
 
     #[test]
@@ -9140,8 +9150,10 @@ mod tests {
 
     #[test]
     fn expr_unsupported_forms_are_not_fully_parsed() {
-        // The divergent operators `/`, `%`, `||` are intentionally not parsed.
-        for input in ["a / b", "a % b", "a || b"] {
+        // The divergent operators `/` (MySQL float division) and `||` (MySQL
+        // logical OR) are intentionally not parsed. (`%` is supported — it lowers
+        // like `MOD`.)
+        for input in ["a / b", "a || b"] {
             let mut p = Parser::new(input.as_bytes()).unwrap();
             let fully_parsed = p.expr().is_ok() && p.peek().is_none();
             assert!(!fully_parsed, "expected `{input}` to be rejected");
