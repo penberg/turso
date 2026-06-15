@@ -1,0 +1,54 @@
+# ELT(n, str1, str2, ...) conformance.
+#
+# ELT returns the n-th string argument (1-based), or NULL if n is less than 1,
+# greater than the number of strings, or NULL. It is the inverse of FIELD, and
+# the front-end lowers it to `CASE n WHEN 1 THEN str1 WHEN 2 THEN str2 ... END`
+# (no ELSE), so an out-of-range or NULL index matches no branch and yields NULL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The n-th string, 1-based.
+query
+SELECT ELT(1, 'a', 'b', 'c'), ELT(2, 'a', 'b', 'c'), ELT(3, 'a', 'b', 'c')
+----
+a	b	c
+
+# An index below 1 or past the end yields NULL.
+query
+SELECT ELT(0, 'a', 'b'), ELT(4, 'a', 'b'), ELT(-1, 'a', 'b')
+----
+NULL	NULL	NULL
+
+# A NULL index yields NULL.
+query
+SELECT ELT(NULL, 'a', 'b')
+----
+NULL
+
+# The selected element is returned verbatim, including a NULL element, and
+# numeric arguments work too.
+query
+SELECT ELT(2, 'a', NULL, 'c'), ELT(2, 10, 20, 30)
+----
+NULL	20
+
+# ELT inverts FIELD: FIELD finds the index, ELT returns the value at it.
+query
+SELECT ELT(FIELD('b', 'a', 'b', 'c'), 'a', 'b', 'c')
+----
+b
+
+# Usable over a column (a 1-based selector into a fixed set of labels).
+statement ok
+CREATE TABLE IF NOT EXISTS elt_demo (id INT PRIMARY KEY, sel INT)
+
+statement ok
+INSERT INTO elt_demo (id, sel) VALUES (1, 1), (2, 3), (3, 9)
+
+query
+SELECT id, ELT(sel, 'low', 'mid', 'high') FROM elt_demo ORDER BY id
+----
+1	low
+2	high
+3	NULL

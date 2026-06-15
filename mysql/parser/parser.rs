@@ -2564,6 +2564,12 @@ impl Parser {
             return self.field_call();
         }
 
+        // `ELT(n, a, b, ...)` (the `n`-th string, else NULL) is the inverse of
+        // FIELD and lowers to `CASE n WHEN 1 THEN a WHEN 2 THEN b ... END`.
+        if upper == "ELT" {
+            return self.elt_call();
+        }
+
         // `MOD(a, b)` is the function spelling of the `a MOD b` operator; MySQL
         // defines them identically, so lower it the same way (exact for floats,
         // unlike the engine's `%`).
@@ -2839,6 +2845,39 @@ impl Parser {
             else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                 "0".to_string(),
             )))),
+        })
+    }
+
+    /// Parses an `ELT(n, a, b, ...)` call (the name and `(` are already consumed)
+    /// and lowers it to `CASE n WHEN 1 THEN a WHEN 2 THEN b ... END` — the `n`-th
+    /// string argument (1-based), which the engine evaluates the same way MySQL's
+    /// `ELT` does. The `CASE` has no `ELSE`, so an out-of-range or NULL `n` (which
+    /// matches no `WHEN`) yields NULL, matching MySQL. At least two arguments (the
+    /// index and one string) are required.
+    fn elt_call(&mut self) -> Result<ast::Expr> {
+        let index = self.expr()?;
+        let mut strings = Vec::new();
+        while self.eat(&Token::Comma) {
+            strings.push(self.expr()?);
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        if strings.is_empty() {
+            return Err(ParseError::Unsupported(
+                "ELT() requires at least two arguments".to_string(),
+            ));
+        }
+        let when_then_pairs = strings
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let idx = ast::Expr::Literal(ast::Literal::Numeric((i + 1).to_string()));
+                (Box::new(idx), Box::new(value))
+            })
+            .collect();
+        Ok(ast::Expr::Case {
+            base: Some(Box::new(index)),
+            when_then_pairs,
+            else_expr: None,
         })
     }
 
@@ -6125,6 +6164,33 @@ mod tests {
             assert_eq!(**then, num(&(i + 1).to_string()));
         }
         assert_eq!(else_expr.as_deref(), Some(&num("0")));
+    }
+
+    #[test]
+    fn elt_lowers_to_case_without_else() {
+        // ELT(n, a, b, c) -> CASE n WHEN 1 THEN a WHEN 2 THEN b WHEN 3 THEN c END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("ELT(n, 'a', 'b', 'c')").unwrap()
+        else {
+            panic!("expected ELT to lower to a CASE");
+        };
+        assert_eq!(base.as_deref(), Some(&col("n")));
+        assert_eq!(when_then_pairs.len(), 3);
+        // The WHEN labels are the 1-based indices.
+        for (i, (when, _)) in when_then_pairs.iter().enumerate() {
+            assert_eq!(**when, num(&(i + 1).to_string()));
+        }
+        // No ELSE, so an out-of-range / NULL index yields NULL.
+        assert!(else_expr.is_none());
+
+        // ELT requires the index plus at least one string.
+        assert!(matches!(
+            parse_expr("ELT(1)").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]
