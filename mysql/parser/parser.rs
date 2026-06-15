@@ -3049,6 +3049,12 @@ impl Parser {
             return self.truncate_call();
         }
 
+        // `LOG(x)` is the natural log in MySQL (the engine's 1-arg `log` is
+        // base-10), while `LOG(b, x)` is the base-`b` log on both (see `log_call`).
+        if upper == "LOG" {
+            return self.log_call();
+        }
+
         // `CHAR(n, ...)` builds a string from character codes, mapping to the
         // engine's `char()` (see `char_call`).
         if upper == "CHAR" {
@@ -3853,6 +3859,23 @@ impl Parser {
         let scaled = ast::Expr::binary(x, ast::Operator::Multiply, scale_num);
         let truncated = unary_fn("trunc", scaled);
         Ok(float_division(truncated, scale_den))
+    }
+
+    /// Parses MySQL `LOG(x)` or `LOG(b, x)` (the name and `(` are already
+    /// consumed). The one-argument form is the **natural** log, so it lowers to
+    /// the engine's `ln(x)` (the engine's own one-argument `log` is base-10). The
+    /// two-argument `LOG(b, x)` is the base-`b` logarithm, identical on both, so
+    /// it passes through as `log(b, x)`.
+    fn log_call(&mut self) -> Result<ast::Expr> {
+        let first = self.expr()?;
+        if self.eat(&Token::Comma) {
+            let x = self.expr()?;
+            self.expect(&Token::RParen, "`)`")?;
+            Ok(call_fn("log", vec![first, x]))
+        } else {
+            self.expect(&Token::RParen, "`)`")?;
+            Ok(unary_fn("ln", first))
+        }
     }
 
     /// Parses a `LEFT(str, len)` call (the name and `(` are already consumed)
@@ -5793,6 +5816,11 @@ fn is_supported_function(upper_name: &str) -> bool {
         // square root, exponential, and natural log. `CEILING`/`POWER` are MySQL
         // synonyms renamed to `ceil`/`pow` below.
         | "ROUND" | "FLOOR" | "CEIL" | "CEILING" | "POW" | "POWER" | "SQRT" | "EXP" | "LN"
+        // `PI()` is the constant, and `LOG2`/`LOG10` are the base-2 / base-10
+        // logarithms — all identical to the engine's. (`LOG`, whose 1-argument
+        // form is the natural log in MySQL but base-10 in the engine, is handled
+        // separately by `log_call`.)
+        | "PI" | "LOG2" | "LOG10"
         // Aggregate functions. `AVG` (the mean, ignoring NULLs — and `AVG(DISTINCT
         // x)`) maps to the engine's `avg`, which behaves identically.
         | "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
@@ -9285,6 +9313,32 @@ mod tests {
         };
         assert_eq!(name.as_str(), "pow");
         assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn log_one_arg_is_natural_log_two_arg_is_base_log() {
+        // LOG(x) -> ln(x) (MySQL's one-arg LOG is the natural log; the engine's
+        // own one-arg log is base-10).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("LOG(x)").unwrap() else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "ln");
+        assert_eq!(args.len(), 1);
+
+        // LOG(b, x) -> log(b, x) (base-b logarithm, identical on both).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("LOG(2, 8)").unwrap() else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "log");
+        assert_eq!(args.len(), 2);
+
+        // LOG2 / LOG10 / PI keep their name (engine resolves them).
+        for input in ["LOG2(x)", "LOG10(x)", "PI()"] {
+            assert!(
+                matches!(parse_expr(input).unwrap(), ast::Expr::FunctionCall { .. }),
+                "expected `{input}` to parse as a function call"
+            );
+        }
     }
 
     #[test]
