@@ -1143,18 +1143,14 @@ impl Parser {
     /// inserting, which is exactly the engine's `INSERT OR REPLACE`. The keyword
     /// has already been consumed.
     fn insert(&mut self, or_conflict: Option<ast::ResolveType>) -> Result<ast::Stmt> {
-        let kw = if or_conflict.is_some() {
-            "REPLACE"
-        } else {
-            "INSERT"
-        };
-        for modifier in ["LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY"] {
-            if self.is_keyword(modifier) {
-                return Err(ParseError::Unsupported(format!(
-                    "{kw} {modifier} is not supported yet"
-                )));
-            }
-        }
+        // MySQL's priority modifiers (`LOW_PRIORITY`/`DELAYED`/`HIGH_PRIORITY`) are
+        // locking/scheduling hints with no bearing on the result, and `DELAYED` is
+        // deprecated and treated as a normal insert by modern MySQL too; consume
+        // and ignore them. (They also precede `REPLACE`.)
+        while self.eat_keyword("LOW_PRIORITY")
+            || self.eat_keyword("DELAYED")
+            || self.eat_keyword("HIGH_PRIORITY")
+        {}
 
         // `INSERT IGNORE` downgrades row-level errors — notably duplicate-key
         // conflicts — to warnings and skips the offending row, which is exactly
@@ -2077,12 +2073,16 @@ impl Parser {
     /// updates, `ORDER BY`/`LIMIT`, and the `LOW_PRIORITY`/`IGNORE` modifiers are
     /// rejected as unsupported.
     fn update(&mut self) -> Result<ast::Stmt> {
-        // `UPDATE` has already been consumed.
-        if self.is_keyword("LOW_PRIORITY") || self.is_keyword("IGNORE") {
-            return Err(ParseError::Unsupported(
-                "UPDATE LOW_PRIORITY / IGNORE is not supported yet".to_string(),
-            ));
-        }
+        // `UPDATE` has already been consumed. `LOW_PRIORITY` is a locking hint
+        // with no result effect; consume it. `UPDATE IGNORE` skips a row whose
+        // update would raise an error (e.g. a duplicate-key violation) instead of
+        // aborting — exactly the engine's `UPDATE OR IGNORE`.
+        self.eat_keyword("LOW_PRIORITY");
+        let or_conflict = if self.eat_keyword("IGNORE") {
+            Some(ast::ResolveType::Ignore)
+        } else {
+            None
+        };
 
         let tbl_name = self.qualified_name()?;
         if self.is(&Token::Comma) || self.is_keyword("JOIN") {
@@ -2124,7 +2124,7 @@ impl Parser {
 
         Ok(ast::Stmt::Update(ast::Update {
             with: None,
-            or_conflict: None,
+            or_conflict,
             tbl_name,
             indexed: None,
             sets,
@@ -2230,13 +2230,15 @@ impl Parser {
     }
 
     fn delete(&mut self) -> Result<ast::Stmt> {
-        // `DELETE` has already been consumed.
-        if self.is_keyword("LOW_PRIORITY") || self.is_keyword("QUICK") || self.is_keyword("IGNORE")
-        {
-            return Err(ParseError::Unsupported(
-                "DELETE LOW_PRIORITY / QUICK / IGNORE is not supported yet".to_string(),
-            ));
-        }
+        // `DELETE` has already been consumed. `LOW_PRIORITY`/`QUICK` are
+        // scheduling/space hints with no result effect. `DELETE IGNORE` only
+        // downgrades errors that the engine does not raise on a single-table
+        // delete anyway (it enforces no foreign keys here), so all three are
+        // consumed and ignored.
+        while self.eat_keyword("LOW_PRIORITY")
+            || self.eat_keyword("QUICK")
+            || self.eat_keyword("IGNORE")
+        {}
 
         // The multi-table form is `DELETE t1 FROM ...` — a target list before
         // `FROM`, rather than `DELETE FROM tbl`.
@@ -7048,13 +7050,37 @@ mod tests {
     }
 
     #[test]
-    fn insert_unsupported_variants() {
-        for sql in ["INSERT DELAYED INTO t VALUES (1)"] {
-            assert!(
-                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
-                "expected `{sql}` to be unsupported"
-            );
+    fn dml_priority_and_ignore_modifiers_are_handled() {
+        // Priority hints (LOW_PRIORITY / DELAYED / HIGH_PRIORITY / QUICK) are
+        // consumed as no-ops on every data-change statement.
+        for sql in [
+            "INSERT LOW_PRIORITY INTO t (a) VALUES (1)",
+            "INSERT DELAYED INTO t (a) VALUES (1)",
+            "INSERT HIGH_PRIORITY INTO t (a) VALUES (1)",
+            "REPLACE LOW_PRIORITY INTO t (a) VALUES (1)",
+            "UPDATE LOW_PRIORITY t SET a = 1",
+            "DELETE LOW_PRIORITY FROM t",
+            "DELETE QUICK FROM t",
+            "DELETE IGNORE FROM t",
+        ] {
+            assert!(parse(sql).is_ok(), "expected `{sql}` to parse");
         }
+
+        // `UPDATE IGNORE` maps to the engine's `UPDATE OR IGNORE`.
+        let ast::Stmt::Update(update) = parse("UPDATE IGNORE t SET a = 1").unwrap() else {
+            panic!("expected an UPDATE");
+        };
+        assert!(matches!(update.or_conflict, Some(ast::ResolveType::Ignore)));
+
+        // `INSERT LOW_PRIORITY IGNORE` keeps the IGNORE -> OR IGNORE mapping.
+        let ast::Stmt::Insert { body, .. } =
+            parse("INSERT LOW_PRIORITY IGNORE INTO t (a) VALUES (1)").unwrap()
+        else {
+            panic!("expected an INSERT");
+        };
+        let ast::InsertBody::Select(_, _) = body else {
+            panic!("expected a VALUES insert");
+        };
     }
 
     #[test]
@@ -9472,7 +9498,6 @@ mod tests {
             // offset stay rejected.
             "UPDATE t SET a = 1 ORDER BY a",
             "UPDATE t SET a = 1 LIMIT 1, 2",
-            "UPDATE IGNORE t SET a = 1",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
@@ -9549,7 +9574,6 @@ mod tests {
             // ORDER BY (unorderable) and an offset on the LIMIT stay rejected.
             "DELETE FROM t ORDER BY a",
             "DELETE FROM t LIMIT 1, 2",
-            "DELETE QUICK FROM t",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),

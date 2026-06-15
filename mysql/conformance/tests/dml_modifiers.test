@@ -1,0 +1,76 @@
+# DML priority / IGNORE modifiers on INSERT / UPDATE / DELETE / REPLACE.
+#
+# MySQL accepts scheduling and error-handling modifiers on the data-change
+# statements: LOW_PRIORITY / DELAYED / HIGH_PRIORITY / QUICK are locking or
+# scheduling hints with no effect on the result, and IGNORE downgrades row-level
+# errors. The front-end now consumes the priority hints as no-ops and maps
+# `UPDATE IGNORE` to the engine's `UPDATE OR IGNORE` (a row whose update would
+# violate a constraint is skipped rather than aborting the statement).
+# `INSERT IGNORE` was already supported.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS dmlm (id INT PRIMARY KEY, c INT)
+
+# Priority hints are accepted on every statement and behave like the unadorned
+# form.
+statement ok
+INSERT LOW_PRIORITY INTO dmlm (id, c) VALUES (1, 10)
+
+statement ok
+INSERT DELAYED INTO dmlm (id, c) VALUES (2, 20)
+
+statement ok
+INSERT HIGH_PRIORITY INTO dmlm (id, c) VALUES (3, 30)
+
+statement ok
+UPDATE LOW_PRIORITY dmlm SET c = c + 1 WHERE id = 1
+
+statement ok
+DELETE LOW_PRIORITY FROM dmlm WHERE id = 3
+
+statement ok
+DELETE QUICK FROM dmlm WHERE id = 99
+
+query
+SELECT id, c FROM dmlm ORDER BY id
+----
+1	11
+2	20
+
+statement ok
+REPLACE LOW_PRIORITY INTO dmlm (id, c) VALUES (1, 100)
+
+query
+SELECT c FROM dmlm WHERE id = 1
+----
+100
+
+# UPDATE IGNORE skips a row whose update would violate a unique key, instead of
+# aborting (the rest of the statement still applies).
+statement ok
+CREATE TABLE IF NOT EXISTS dmlm_uniq (id INT PRIMARY KEY, c INT UNIQUE)
+
+statement ok
+INSERT INTO dmlm_uniq (id, c) VALUES (1, 10), (2, 20)
+
+# Without IGNORE this update would fail (c = 20 already exists); IGNORE skips it.
+statement ok
+UPDATE IGNORE dmlm_uniq SET c = 20 WHERE id = 1
+
+query
+SELECT id, c FROM dmlm_uniq ORDER BY id
+----
+1	10
+2	20
+
+# A non-conflicting UPDATE IGNORE still applies normally.
+statement ok
+UPDATE IGNORE dmlm_uniq SET c = 30 WHERE id = 1
+
+query
+SELECT c FROM dmlm_uniq WHERE id = 1
+----
+30

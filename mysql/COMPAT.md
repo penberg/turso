@@ -273,7 +273,7 @@ incomplete.
 | INSERT ... SET                         | ✅     | The `INSERT [INTO] t SET col = expr, ...` assignment form, built as the equivalent `(cols) VALUES (exprs)`. |
 | INSERT ... SELECT                      | ✅     | `INSERT [INTO] t [(cols)] SELECT ...`; the query runs through the same SELECT subset, evaluated by the engine. |
 | INSERT ... ON DUPLICATE KEY UPDATE     | ✅     | Lowered to the engine's target-less upsert (`ON CONFLICT DO UPDATE SET ...`), which fires on any unique/primary-key conflict like MySQL. The `VALUES(col)` pseudo-function (the would-be-inserted value) is mapped to `excluded.col` anywhere in the assignment expression (e.g. `c = c + VALUES(c)`, `GREATEST(c, VALUES(c))`); a bare column on the right refers to the existing row. |
-| INSERT IGNORE / DELAYED / priority     | ❌     | **Not supported.** |
+| INSERT/UPDATE/DELETE/REPLACE modifiers | ✅ | The priority/scheduling hints `LOW_PRIORITY`, `DELAYED`, `HIGH_PRIORITY`, and `QUICK` are accepted and ignored (no result effect). `INSERT IGNORE` and `UPDATE IGNORE` lower to the engine's `INSERT OR IGNORE` / `UPDATE OR IGNORE` (a row whose change would violate a constraint is skipped instead of aborting the statement). `DELETE IGNORE` is a no-op (the engine raises no per-row delete errors here). |
 | INTERSECT clause                       | ❌     |         |
 | LOAD DATA                              | ❌     |         |
 | LOAD XML                               | ❌     |         |
