@@ -3875,7 +3875,9 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Scalar functions.
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
-        | "REPLACE" | "SUBSTR" | "TRIM"
+        // `LTRIM`/`RTRIM` strip leading/trailing spaces (their one-argument
+        // MySQL form), like the engine's same-named functions.
+        | "REPLACE" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
         // `CONCAT_WS(sep, ...)` joins the non-NULL arguments with `sep`, skipping
         // NULLs (and yielding NULL only for a NULL separator) — exactly the
         // engine's `concat_ws`. (Distinct from `CONCAT`, which is lowered to `||`
@@ -6145,6 +6147,8 @@ mod tests {
             "REPLACE(s, '-', '_')",
             "SUBSTR(s, 2, 3)",
             "TRIM(s)",
+            "LTRIM(s)",
+            "RTRIM(s)",
             "CONCAT_WS('-', a, b)",
         ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
