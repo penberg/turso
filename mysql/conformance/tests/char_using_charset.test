@@ -1,0 +1,41 @@
+# The CHAR(...) function with an optional `USING charset` clause.
+#
+# CHAR(n1, n2, ...) builds a string from the given code points. MySQL allows a
+# trailing `USING charset_name` to select how the bytes are interpreted; for the
+# default utf8mb4 this is a no-op over ASCII/BMP code points. The front-end
+# parses and ignores the USING clause (the engine always builds from Unicode
+# code points), so it had previously rejected the form with a syntax error.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# A single code point, with and without USING.
+query
+SELECT CHAR(65), CHAR(65 USING utf8mb4)
+----
+A	A
+
+# Multiple code points with USING.
+query
+SELECT CHAR(72, 105 USING utf8mb4), CHAR(72, 73, 33 USING ascii)
+----
+Hi	HI!
+
+# The result is an ordinary string, usable in comparisons.
+query
+SELECT CHAR(87, 80 USING utf8mb4) = 'WP'
+----
+1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS cu (id INT PRIMARY KEY, code INT)
+
+statement ok
+INSERT INTO cu (id, code) VALUES (1, 65), (2, 90)
+
+query
+SELECT id, CHAR(code USING utf8mb4) FROM cu ORDER BY id
+----
+1	A
+2	Z

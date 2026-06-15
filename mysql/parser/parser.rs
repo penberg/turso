@@ -3697,9 +3697,10 @@ impl Parser {
     /// this matches MySQL exactly. Two documented divergences: MySQL skips NULL
     /// arguments whereas the engine stops at the first NULL, and for code points
     /// above 127 MySQL emits raw bytes (a number can span several) while the
-    /// engine emits the single UTF-8 code point. The `CHAR(... USING charset)`
-    /// form is rejected (the `USING` clause is left unparsed). At least one
-    /// argument is required.
+    /// engine emits the single UTF-8 code point. An optional trailing
+    /// `USING charset` clause is parsed and ignored (the engine always builds
+    /// from Unicode code points, matching MySQL's default `utf8mb4`). At least
+    /// one argument is required.
     fn char_call(&mut self) -> Result<ast::Expr> {
         let mut args = Vec::new();
         loop {
@@ -3708,6 +3709,13 @@ impl Parser {
                 continue;
             }
             break;
+        }
+        // An optional trailing `USING charset_name` selects how the resulting
+        // bytes are interpreted. The engine builds the string from Unicode code
+        // points (MySQL's default `utf8mb4` behaviour), so the charset is parsed
+        // and ignored.
+        if self.eat_keyword("USING") {
+            let _ = self.name()?;
         }
         self.expect(&Token::RParen, "`)`")?;
         Ok(call_fn("char", args))
@@ -9778,8 +9786,16 @@ mod tests {
         assert_eq!(args.len(), 2);
         assert_eq!(*args[0], num("72"));
 
-        // The `USING charset` form is rejected.
-        assert!(parse_expr("CHAR(72 USING utf8)").is_err());
+        // A trailing `USING charset` clause is parsed and ignored; the call
+        // still lowers to `char()` with the same code-point arguments.
+        let ast::Expr::FunctionCall { name, args, .. } =
+            parse_expr("CHAR(72, 105 USING utf8mb4)").unwrap()
+        else {
+            panic!("expected CHAR ... USING to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "char");
+        assert_eq!(args.len(), 2);
+        assert_eq!(*args[1], num("105"));
     }
 
     #[test]
