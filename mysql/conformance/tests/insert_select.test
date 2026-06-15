@@ -1,0 +1,64 @@
+# INSERT ... SELECT conformance.
+#
+# MySQL's INSERT [INTO] tbl [(cols)] SELECT ... populates a table from a query.
+# The engine runs this directly, so the front-end parses the SELECT (through the
+# same parser as a top-level one) into the insert body. The IGNORE and REPLACE
+# conflict modifiers carry through to the SELECT form.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS isel_src (id INT PRIMARY KEY, name VARCHAR(20), n INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS isel_dst (id INT PRIMARY KEY, name VARCHAR(20), n INT)
+
+statement ok
+INSERT INTO isel_src (id, name, n) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)
+
+# Column-list form with a WHERE filter and a transformed expression.
+statement ok
+INSERT INTO isel_dst (id, name, n) SELECT id, name, n FROM isel_src WHERE n >= 20
+
+query
+SELECT id, name, n FROM isel_dst ORDER BY id
+----
+2	b	20
+3	c	30
+
+# No column list: the select's columns line up with the table's, and the rows
+# may be computed.
+statement ok
+INSERT INTO isel_dst SELECT id + 10, name, n * 2 FROM isel_src WHERE id = 1
+
+query
+SELECT id, name, n FROM isel_dst ORDER BY id
+----
+2	b	20
+3	c	30
+11	a	20
+
+# INSERT IGNORE ... SELECT skips rows that would violate the primary key.
+statement ok
+INSERT IGNORE INTO isel_dst (id, name, n) SELECT id, name, n FROM isel_src
+
+query
+SELECT id, name, n FROM isel_dst ORDER BY id
+----
+1	a	10
+2	b	20
+3	c	30
+11	a	20
+
+# REPLACE ... SELECT overwrites the conflicting rows.
+statement ok
+REPLACE INTO isel_dst (id, name, n) SELECT id, name, n + 100 FROM isel_src WHERE id IN (2, 3)
+
+query
+SELECT id, name, n FROM isel_dst ORDER BY id
+----
+1	a	10
+2	b	120
+3	c	130
+11	a	20

@@ -821,10 +821,10 @@ impl Parser {
 
     // === INSERT ===
 
-    /// Parses the basic `INSERT INTO tbl [(cols)] VALUES (...)[, (...)]` form.
-    /// `INSERT ... SELECT`, `INSERT ... SET`, and the priority modifiers
-    /// (`LOW_PRIORITY`/`DELAYED`/`HIGH_PRIORITY`) are rejected as unsupported;
-    /// `INSERT IGNORE` lowers to `INSERT OR IGNORE`.
+    /// Parses the `INSERT INTO tbl [(cols)] VALUES (...)[, (...)]` and
+    /// `INSERT INTO tbl [(cols)] SELECT ...` forms. `INSERT ... SET` and the
+    /// priority modifiers (`LOW_PRIORITY`/`DELAYED`/`HIGH_PRIORITY`) are rejected
+    /// as unsupported; `INSERT IGNORE` lowers to `INSERT OR IGNORE`.
     /// Parses an `INSERT ... VALUES` statement, or — when `or_conflict` is
     /// `Some(ResolveType::Replace)` — a `REPLACE ... VALUES` statement. MySQL's
     /// `REPLACE` deletes any row that conflicts on a primary/unique key before
@@ -876,14 +876,27 @@ impl Parser {
             ));
         }
 
-        // Only the VALUES / VALUE form is supported.
+        // `INSERT [INTO] tbl [(cols)] SELECT ...`: the rows come from a query,
+        // which the engine runs directly. The SELECT goes through the same
+        // parser as a top-level one, so it supports the same subset. A trailing
+        // `ON DUPLICATE KEY UPDATE` (valid MySQL, but not modeled here) is not
+        // accepted: `ON` is consumed as the final column's alias, so the leftover
+        // `DUPLICATE ...` surfaces as a syntax error.
+        if self.eat_keyword("SELECT") {
+            let select = self.parse_select()?;
+            return Ok(ast::Stmt::Insert {
+                with: None,
+                or_conflict,
+                tbl_name,
+                columns,
+                body: ast::InsertBody::Select(select, None),
+                returning: Vec::new(),
+            });
+        }
+
+        // Only the VALUES / VALUE form is supported otherwise.
         if !(self.eat_keyword("VALUES") || self.eat_keyword("VALUE")) {
-            if self.is_keyword("SELECT") || self.is(&Token::LParen) {
-                return Err(ParseError::Unsupported(
-                    "INSERT ... SELECT is not supported yet".to_string(),
-                ));
-            }
-            return Err(self.unexpected("`VALUES`"));
+            return Err(self.unexpected("`VALUES` or `SELECT`"));
         }
 
         let mut rows = Vec::new();
@@ -4090,12 +4103,46 @@ mod tests {
     fn insert_unsupported_variants() {
         for sql in [
             "INSERT INTO t SET a = 1",
-            "INSERT INTO t SELECT * FROM u",
             "INSERT DELAYED INTO t VALUES (1)",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_select_parses_query_body() {
+        // INSERT [(cols)] SELECT ... carries the query into the insert body, with
+        // or without a column list, preserving the conflict modifier.
+        for (sql, want_cols, want_conflict) in [
+            ("INSERT INTO t (a, b) SELECT a, b FROM u", 2, None),
+            ("INSERT INTO t SELECT * FROM u", 0, None),
+            (
+                "INSERT IGNORE INTO t (a) SELECT a FROM u",
+                1,
+                Some(ast::ResolveType::Ignore),
+            ),
+        ] {
+            let ast::Stmt::Insert {
+                columns,
+                body,
+                or_conflict,
+                ..
+            } = parse(sql).unwrap()
+            else {
+                panic!("expected Insert for `{sql}`");
+            };
+            assert_eq!(columns.len(), want_cols, "{sql}");
+            assert_eq!(or_conflict, want_conflict, "{sql}");
+            let ast::InsertBody::Select(select, upsert) = body else {
+                panic!("expected a SELECT body for `{sql}`");
+            };
+            assert!(upsert.is_none(), "{sql}");
+            assert!(
+                !matches!(select.body.select, ast::OneSelect::Values(_)),
+                "expected a real query, not VALUES, for `{sql}`"
             );
         }
     }
