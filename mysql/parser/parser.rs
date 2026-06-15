@@ -2056,10 +2056,25 @@ impl Parser {
 
     /// Parses an expression at the lowest precedence level (`OR`).
     fn expr(&mut self) -> Result<ast::Expr> {
-        let mut lhs = self.and_expr()?;
+        let mut lhs = self.xor_expr()?;
         while self.eat_keyword("OR") {
-            let rhs = self.and_expr()?;
+            let rhs = self.xor_expr()?;
             lhs = ast::Expr::binary(lhs, ast::Operator::Or, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// Logical-XOR tier: `XOR`, between `OR` and `AND` in MySQL precedence,
+    /// left-associative. The engine has no `XOR`, so `a XOR b` lowers to
+    /// `(a <> 0) <> (b <> 0)` — 1 when exactly one operand is truthy. NULL
+    /// propagates naturally (`NULL <> 0` is NULL). This matches MySQL for numeric
+    /// and boolean operands; a non-numeric string's truthiness diverges (the
+    /// engine does not coerce it to 0), a documented edge (see `mysql/COMPAT.md`).
+    fn xor_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.and_expr()?;
+        while self.eat_keyword("XOR") {
+            let rhs = self.and_expr()?;
+            lhs = logical_xor(lhs, rhs);
         }
         Ok(lhs)
     }
@@ -4589,6 +4604,18 @@ fn pad_expr(left: bool, target: ast::Expr, len: ast::Expr, pad: ast::Expr) -> as
     substr_fn(body, one(), len)
 }
 
+/// Builds the lowering for MySQL's `a XOR b`: `(a <> 0) <> (b <> 0)` — the
+/// boolean exclusive-or, 1 when exactly one operand is truthy. `x <> 0` is 1 for
+/// a non-zero number and 0 for zero, and NULL for a NULL operand, so a NULL
+/// propagates through the outer `<>`, matching MySQL. (A non-numeric string's
+/// truthiness diverges, since the engine does not coerce it to 0.)
+fn logical_xor(a: ast::Expr, b: ast::Expr) -> ast::Expr {
+    let zero = || ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+    let a_bool = ast::Expr::binary(a, ast::Operator::NotEquals, zero());
+    let b_bool = ast::Expr::binary(b, ast::Operator::NotEquals, zero());
+    ast::Expr::binary(a_bool, ast::Operator::NotEquals, b_bool)
+}
+
 /// Builds the lowering for MySQL's `a <=> b` (NULL-safe equality):
 /// `CASE WHEN a IS NULL AND b IS NULL THEN 1
 ///       WHEN a IS NULL OR b IS NULL THEN 0 ELSE a = b END`.
@@ -7052,6 +7079,35 @@ mod tests {
         assert!(matches!(
             parse_expr("ELT(1)").unwrap_err(),
             ParseError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn logical_xor_lowers_to_nested_not_equals() {
+        // a XOR b -> (a <> 0) <> (b <> 0).
+        let ast::Expr::Binary(lhs, ast::Operator::NotEquals, rhs) = parse_expr("a XOR b").unwrap()
+        else {
+            panic!("expected XOR to lower to a `<>`");
+        };
+        assert_eq!(
+            *lhs,
+            ast::Expr::binary(col("a"), ast::Operator::NotEquals, num("0"))
+        );
+        assert_eq!(
+            *rhs,
+            ast::Expr::binary(col("b"), ast::Operator::NotEquals, num("0"))
+        );
+
+        // Precedence: AND binds tighter than XOR, XOR tighter than OR.
+        // `a OR b XOR c` parses as `a OR (b XOR c)`.
+        let ast::Expr::Binary(_, ast::Operator::Or, or_rhs) = parse_expr("a OR b XOR c").unwrap()
+        else {
+            panic!("expected the top operator to be OR");
+        };
+        // The OR's right side is the XOR lowering (a `<>` of two `<>`s).
+        assert!(matches!(
+            or_rhs.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::NotEquals, _)
         ));
     }
 

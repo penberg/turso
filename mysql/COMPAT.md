@@ -311,6 +311,7 @@ diverge are deliberately excluded.
 | `<=>` (NULL-safe equality)             | ✅     | Lowered to `CASE WHEN a IS NULL AND b IS NULL THEN 1 WHEN a IS NULL OR b IS NULL THEN 0 ELSE a = b END` — 1 if both NULL, 0 if exactly one, the ordinary equality otherwise; never NULL, as in MySQL. |
 | `AND` / `OR` / `NOT`, parentheses      | ✅     |         |
 | `&&` (logical AND)                      | ✅     | A MySQL synonym for the `AND` keyword, at the same precedence. A single `&` remains the bitwise operator. (`\|\|` is **not** treated as logical OR — it stays excluded, since the engine uses it for string concatenation.) |
+| `XOR` (logical)                         | 🚧     | Lowered to `(a <> 0) <> (b <> 0)` — 1 when exactly one operand is truthy, NULL if either is NULL; between `OR` and `AND` in precedence. Matches MySQL for numeric / boolean operands; a non-numeric string's truthiness diverges (the engine does not coerce it to 0). |
 | `IS [NOT] NULL`                        | ✅     |         |
 | Arithmetic `+` `-` `*`                 | ✅     |         |
 | `[NOT] IN (value list)`                | ✅     | Includes the empty list: `x IN ()` folds to `0` and `x NOT IN ()` to `1` (MySQL semantics), since the engine has no empty-list `IN`. |
