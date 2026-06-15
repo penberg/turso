@@ -1,0 +1,48 @@
+# CONCAT_WS(separator, ...) conformance.
+#
+# MySQL's CONCAT_WS joins its arguments with the given separator, but unlike
+# CONCAT it SKIPS NULL arguments (no separator is emitted for them) and yields
+# NULL only when the separator itself is NULL. That matches the engine's
+# concat_ws exactly, so the front-end passes it straight through. (Contrast
+# CONCAT, which is lowered to `||` so any NULL argument makes the whole result
+# NULL -- see concat.test.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+# Plain join with a string separator.
+query
+SELECT CONCAT_WS('-', 'a', 'b', 'c')
+----
+a-b-c
+
+# NULL arguments are skipped, not propagated: no separator is emitted for them.
+query
+SELECT CONCAT_WS('-', 'a', NULL, 'c'), CONCAT_WS('-', NULL, 'b', NULL, 'd')
+----
+a-c	b-d
+
+# Numeric arguments are stringified.
+query
+SELECT CONCAT_WS(',', 1, 2, 3)
+----
+1,2,3
+
+# A NULL separator makes the whole result NULL.
+query
+SELECT CONCAT_WS(NULL, 'a', 'b')
+----
+NULL
+
+# Column form: skip the NULL middle name, ORDER BY-deterministic.
+statement ok
+CREATE TABLE IF NOT EXISTS cws_demo (id INT PRIMARY KEY, first VARCHAR(20), mid VARCHAR(20), last VARCHAR(20))
+
+statement ok
+INSERT INTO cws_demo (id, first, mid, last) VALUES (1, 'Ada', NULL, 'Lovelace'), (2, 'John', 'Q', 'Public')
+
+query
+SELECT id, CONCAT_WS(' ', first, mid, last) FROM cws_demo ORDER BY id
+----
+1	Ada Lovelace
+2	John Q Public

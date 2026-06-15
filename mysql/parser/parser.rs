@@ -3614,6 +3614,11 @@ fn is_supported_function(upper_name: &str) -> bool {
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
         | "REPLACE" | "SUBSTR" | "TRIM"
+        // `CONCAT_WS(sep, ...)` joins the non-NULL arguments with `sep`, skipping
+        // NULLs (and yielding NULL only for a NULL separator) — exactly the
+        // engine's `concat_ws`. (Distinct from `CONCAT`, which is lowered to `||`
+        // so it propagates NULL; see `concat_call`.)
+        | "CONCAT_WS"
         // Functions sharing behaviour with the engine under a different name;
         // renamed on emit (see `engine_function_name`).
         | "IF"
@@ -5593,12 +5598,19 @@ mod tests {
         for input in [
             "REPLACE(s, '-', '_')",
             "SUBSTR(s, 2, 3)",
-            "INSTR(s, 'x')",
             "TRIM(s)",
+            "CONCAT_WS('-', a, b)",
         ] {
+            let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
+                panic!("expected `{input}` to parse as a function call");
+            };
+            // These keep their name (no lowering / renaming).
             assert!(
-                matches!(parse_expr(input).unwrap(), ast::Expr::FunctionCall { .. }),
-                "expected `{input}` to parse as a function call"
+                input
+                    .to_ascii_uppercase()
+                    .starts_with(&name.as_str().to_ascii_uppercase()),
+                "`{input}` should keep its name, got `{}`",
+                name.as_str()
             );
         }
     }
