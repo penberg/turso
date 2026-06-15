@@ -1,0 +1,63 @@
+# Row-value (tuple) comparison conformance.
+#
+# MySQL compares row values: (a, b) = (1, 2) is true when a = 1 and b = 2, and
+# (a, b) IN ((1, 2), (3, 4)) tests membership of the tuple. The front-end parses
+# a parenthesized comma-separated list as a row-value expression, which the
+# engine evaluates the same way (it has row-value comparison support). Used for
+# compound-key lookups.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS rv_demo (a INT, b INT, label VARCHAR(5))
+
+statement ok
+INSERT INTO rv_demo (a, b, label) VALUES (1, 2, 'x'), (3, 4, 'y'), (5, 6, 'z'), (1, 9, 'w')
+
+# Equality of a row value matches only the row whose columns both match (so the
+# (1, 9) row is excluded even though it shares a = 1).
+query
+SELECT label FROM rv_demo WHERE (a, b) = (3, 4)
+----
+y
+
+# Row-value IN tests membership of the whole tuple.
+query
+SELECT label FROM rv_demo WHERE (a, b) IN ((1, 2), (5, 6)) ORDER BY label
+----
+x
+z
+
+# NOT IN / inequality on a row value.
+query
+SELECT label FROM rv_demo WHERE (a, b) <> (1, 2) ORDER BY label
+----
+w
+y
+z
+
+query
+SELECT label FROM rv_demo WHERE (a, b) NOT IN ((1, 2), (3, 4)) ORDER BY label
+----
+w
+z
+
+# A scalar IN list and ordinary parenthesized arithmetic are unaffected.
+query
+SELECT label FROM rv_demo WHERE a IN (1, 5) ORDER BY label
+----
+w
+x
+z
+
+query
+SELECT (1 + 2) * 3, a FROM rv_demo WHERE label = 'y'
+----
+9	3
+
+# A three-column row value.
+query
+SELECT label FROM rv_demo WHERE (a, b, label) = (1, 2, 'x')
+----
+x

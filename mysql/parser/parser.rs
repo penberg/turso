@@ -2546,9 +2546,11 @@ impl Parser {
     fn primary_expr(&mut self) -> Result<ast::Expr> {
         match self.peek() {
             // A parenthesized group: either a scalar subquery `(SELECT ...)` —
-            // usable as a value, possibly correlated — or an ordinary
-            // parenthesized expression. The `Parenthesized` wrapper is kept so
-            // the rendered SQL preserves the original grouping.
+            // usable as a value, possibly correlated — an ordinary parenthesized
+            // expression `(expr)`, or a row-value tuple `(a, b, ...)` (used in
+            // row comparisons like `(a, b) = (1, 2)` and `(a, b) IN (...)`). The
+            // `Parenthesized` wrapper carries one or more expressions and is kept
+            // so the rendered SQL preserves the original grouping.
             Some(Token::LParen) => {
                 self.advance();
                 if self.eat_keyword("SELECT") {
@@ -2556,9 +2558,12 @@ impl Parser {
                     self.expect(&Token::RParen, "`)`")?;
                     return Ok(ast::Expr::Subquery(select));
                 }
-                let inner = self.expr()?;
+                let mut exprs = vec![Box::new(self.expr()?)];
+                while self.eat(&Token::Comma) {
+                    exprs.push(Box::new(self.expr()?));
+                }
                 self.expect(&Token::RParen, "`)`")?;
-                Ok(ast::Expr::Parenthesized(vec![Box::new(inner)]))
+                Ok(ast::Expr::Parenthesized(exprs))
             }
             Some(Token::Num(n)) => {
                 let n = n.clone();
@@ -8349,6 +8354,40 @@ mod tests {
             panic!("expected InList");
         };
         assert!(not);
+    }
+
+    #[test]
+    fn row_value_tuples_parse() {
+        // `(a, b)` is a row value — Parenthesized with two expressions; a single
+        // `(a)` keeps one (an ordinary parenthesized expression).
+        let ast::Expr::Parenthesized(exprs) = parse_expr("(a, b)").unwrap() else {
+            panic!("expected a Parenthesized row value");
+        };
+        assert_eq!(exprs.len(), 2);
+        assert_eq!(*exprs[0], col("a"));
+        assert_eq!(*exprs[1], col("b"));
+
+        assert!(matches!(
+            parse_expr("(a)").unwrap(),
+            ast::Expr::Parenthesized(e) if e.len() == 1
+        ));
+
+        // `(a, b) = (1, 2)` compares two row values.
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) =
+            parse_expr("(a, b) = (1, 2)").unwrap()
+        else {
+            panic!("expected a row-value equality");
+        };
+        assert!(matches!(lhs.as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
+        assert!(matches!(rhs.as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
+
+        // `(a, b) IN ((1, 2), (3, 4))` keeps the scalar-IN list of two tuples.
+        let ast::Expr::InList { rhs, .. } = parse_expr("(a, b) IN ((1, 2), (3, 4))").unwrap()
+        else {
+            panic!("expected InList");
+        };
+        assert_eq!(rhs.len(), 2);
+        assert!(matches!(rhs[0].as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
     }
 
     #[test]
