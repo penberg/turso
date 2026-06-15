@@ -2334,20 +2334,24 @@ impl Parser {
 
     /// Parses `DATE_ADD(x, INTERVAL n unit)` (or `DATE_SUB`, when `subtract` is
     /// true) — the name and `(` are already consumed — and lowers it to the
-    /// engine's `datetime(x, '<signed-n> <unit>')` modifier. Only an
-    /// integer-literal interval value is supported; `WEEK` is expanded to days.
-    /// `datetime()` returns `'YYYY-MM-DD HH:MM:SS'`, matching MySQL's result for
-    /// a DATETIME argument.
+    /// engine's `datetime(x, '<signed-n> <unit>')` modifier. The interval value
+    /// may be an integer literal or a quoted numeric string (`INTERVAL '30'
+    /// SECOND`, which WordPress emits and MySQL coerces); `WEEK` is expanded to
+    /// days. `datetime()` returns `'YYYY-MM-DD HH:MM:SS'`, matching MySQL's
+    /// result for a DATETIME argument.
     fn date_add_call(&mut self, subtract: bool) -> Result<ast::Expr> {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
         self.expect_keyword("INTERVAL")?;
 
         let negative = self.eat(&Token::Minus);
-        let Some(Token::Num(n)) = self.peek() else {
-            return Err(self.unexpected("an integer interval value"));
+        // MySQL takes the interval amount either as a number or as a quoted
+        // numeric string and coerces the string to an integer; accept both.
+        let raw = match self.peek() {
+            Some(Token::Num(n) | Token::Str(n)) => n.clone(),
+            _ => return Err(self.unexpected("an integer interval value")),
         };
-        let value: i64 = n.parse().map_err(|_| {
+        let value: i64 = raw.trim().parse().map_err(|_| {
             ParseError::Unsupported(
                 "DATE_ADD / DATE_SUB INTERVAL value must be an integer literal".to_string(),
             )
@@ -4030,6 +4034,10 @@ mod tests {
             ("DATE_ADD(d, INTERVAL 1 WEEK)", "'+7 days'"),
             ("DATE_ADD(d, INTERVAL 2 MONTH)", "'+2 months'"),
             ("DATE_SUB(d, INTERVAL 3 HOUR)", "'-3 hours'"),
+            // A quoted numeric string is coerced like MySQL does (WordPress
+            // emits `INTERVAL '30' SECOND`).
+            ("DATE_ADD(d, INTERVAL '30' SECOND)", "'+30 seconds'"),
+            ("DATE_SUB(d, INTERVAL '5' DAY)", "'-5 days'"),
         ];
         for (sql, modifier) in cases {
             let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
@@ -4042,8 +4050,9 @@ mod tests {
                 "wrong modifier for `{sql}`"
             );
         }
-        // A non-literal interval value is rejected.
+        // A non-literal interval value, or a non-numeric string, is rejected.
         assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
+        assert!(parse_expr("DATE_ADD(d, INTERVAL 'abc' DAY)").is_err());
     }
 
     #[test]

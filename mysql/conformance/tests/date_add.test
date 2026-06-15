@@ -5,10 +5,11 @@
 # datetime(d, '+n unit') / datetime(d, '-n unit') modifier. On DATETIME values
 # both targets return 'YYYY-MM-DD HH:MM:SS'.
 #
-# Scope: only integer-literal intervals are supported. On a bare DATE value
-# MySQL returns a DATE (no time) while the engine keeps the time, and MONTH/YEAR
-# arithmetic that overflows a month end clamps in MySQL but rolls over in the
-# engine — both diverge and are avoided here (see mysql/COMPAT.md).
+# Scope: the interval amount may be an integer literal or a quoted numeric
+# string (`INTERVAL '30' SECOND`, which WordPress emits and MySQL coerces). On a
+# bare DATE value MySQL returns a DATE (no time) while the engine keeps the time,
+# and MONTH/YEAR arithmetic that overflows a month end clamps in MySQL but rolls
+# over in the engine — both diverge and are avoided here (see mysql/COMPAT.md).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -47,3 +48,16 @@ query
 SELECT DATE_ADD('2020-01-15 08:00:00', INTERVAL 2 MONTH)
 ----
 2020-03-15 08:00:00
+
+# A quoted numeric string is accepted as the interval amount, exactly as
+# WordPress emits it (e.g. its transient-expiry probes use INTERVAL '30' SECOND).
+query
+SELECT DATE_ADD(d, INTERVAL '30' SECOND) FROM dt_demo
+----
+2020-01-31 10:21:00
+
+# The string form works for DATE_SUB too.
+query
+SELECT DATE_SUB(d, INTERVAL '5' DAY) FROM dt_demo
+----
+2020-01-26 10:20:30
