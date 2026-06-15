@@ -1273,11 +1273,24 @@ impl Parser {
             None
         };
 
-        // `SQL_CALC_FOUND_ROWS` is a SELECT modifier that asks MySQL to remember
-        // the unlimited row count for a later `FOUND_ROWS()`. It does not change
-        // the rows this query returns, so it is consumed here; the server
-        // recognizes it (from the SQL text) and maintains the count separately.
-        self.eat_keyword("SQL_CALC_FOUND_ROWS");
+        // MySQL SELECT modifiers that are optimizer or query-cache hints with no
+        // effect on the result set are consumed and ignored. `SQL_CALC_FOUND_ROWS`
+        // is also consumed here, but the server separately detects it from the
+        // SQL text to maintain the `FOUND_ROWS()` count. Lenient about order.
+        loop {
+            if self.eat_keyword("HIGH_PRIORITY")
+                || self.eat_keyword("STRAIGHT_JOIN")
+                || self.eat_keyword("SQL_SMALL_RESULT")
+                || self.eat_keyword("SQL_BIG_RESULT")
+                || self.eat_keyword("SQL_BUFFER_RESULT")
+                || self.eat_keyword("SQL_NO_CACHE")
+                || self.eat_keyword("SQL_CACHE")
+                || self.eat_keyword("SQL_CALC_FOUND_ROWS")
+            {
+                continue;
+            }
+            break;
+        }
 
         let columns = self.select_list()?;
 
@@ -4575,6 +4588,21 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].as_str(), "id");
         assert_eq!(cols[1].as_str(), "ref");
+    }
+
+    #[test]
+    fn select_noop_modifiers_are_consumed() {
+        // The optimizer/cache hints are consumed and the query parses to the
+        // same thing as without them.
+        let baseline = parse("SELECT id FROM t WHERE id = 1").unwrap();
+        for sql in [
+            "SELECT SQL_NO_CACHE id FROM t WHERE id = 1",
+            "SELECT HIGH_PRIORITY id FROM t WHERE id = 1",
+            "SELECT SQL_BIG_RESULT SQL_BUFFER_RESULT id FROM t WHERE id = 1",
+            "SELECT SQL_NO_CACHE SQL_CALC_FOUND_ROWS id FROM t WHERE id = 1",
+        ] {
+            assert_eq!(parse(sql).unwrap(), baseline, "for `{sql}`");
+        }
     }
 
     #[test]

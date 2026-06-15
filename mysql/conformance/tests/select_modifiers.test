@@ -1,0 +1,59 @@
+# SELECT optimizer / cache modifier conformance.
+#
+# MySQL accepts several SELECT modifiers that are optimizer or query-cache hints
+# and do not change the result set: HIGH_PRIORITY, STRAIGHT_JOIN,
+# SQL_SMALL_RESULT, SQL_BIG_RESULT, SQL_BUFFER_RESULT, SQL_NO_CACHE, SQL_CACHE
+# (and SQL_CALC_FOUND_ROWS, handled separately). The front-end consumes and
+# ignores them, so a query with the hint returns exactly what it would without.
+# WordPress and plugins emit some of these (e.g. SQL_NO_CACHE).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS sm_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO sm_demo (id, n) VALUES (1, 5), (2, 15), (3, 25), (3 + 1, 25)
+
+# Each hint leaves the result unchanged.
+query
+SELECT SQL_NO_CACHE id FROM sm_demo WHERE n = 25 ORDER BY id
+----
+3
+4
+
+query
+SELECT HIGH_PRIORITY id FROM sm_demo WHERE id = 2
+----
+2
+
+# The hint composes with DISTINCT.
+query
+SELECT DISTINCT SQL_NO_CACHE n FROM sm_demo ORDER BY n
+----
+5
+15
+25
+
+# SQL_BIG_RESULT / SQL_BUFFER_RESULT are likewise ignored.
+query
+SELECT SQL_BIG_RESULT SQL_BUFFER_RESULT id FROM sm_demo ORDER BY id
+----
+1
+2
+3
+4
+
+# SQL_NO_CACHE composes with SQL_CALC_FOUND_ROWS, which still reports the
+# unlimited count.
+query
+SELECT SQL_CALC_FOUND_ROWS SQL_NO_CACHE id FROM sm_demo ORDER BY id LIMIT 2
+----
+1
+2
+
+query
+SELECT FOUND_ROWS()
+----
+4
