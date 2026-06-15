@@ -1,6 +1,7 @@
 # Additional scalar string functions whose MySQL and SQLite/turso semantics are
-# identical: REPLACE, SUBSTR, INSTR, TRIM. They share both name and behaviour, so
-# they pass straight through to the engine.
+# identical: REPLACE, SUBSTR, TRIM. They share both name and behaviour, so they
+# pass straight through to the engine. (INSTR/LOCATE are MySQL-case-insensitive
+# and are lowered separately — see instr_locate.test.)
 #
 # (CONCAT and LENGTH are intentionally excluded — they diverge: CONCAT returns
 # NULL if any argument is NULL, and LENGTH counts bytes in MySQL but characters
@@ -30,17 +31,6 @@ query
 SELECT SUBSTR('hello', -2)
 ----
 lo
-
-# INSTR returns the 1-indexed position of the first match, or 0.
-query
-SELECT INSTR('hello', 'l')
-----
-3
-
-query
-SELECT INSTR('hello', 'z')
-----
-0
 
 # TRIM removes leading and trailing spaces.
 query

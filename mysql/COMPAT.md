@@ -340,7 +340,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `LOWER` / `UPPER`                      | ✅     | ASCII case folding. |
 | `REPLACE`                              | ✅     | Replaces every occurrence, case-sensitively. |
 | `SUBSTR`                               | ✅     | 1-indexed, optional length, negative position from the end. |
-| `INSTR`                                | ✅     | 1-indexed position of the first match, or 0. |
+| `INSTR` / `LOCATE`                     | 🚧     | 1-indexed position of the first match, or 0. `LOCATE(substr, str)` reverses `INSTR`'s operands. Lowered to `instr(lower(str), lower(substr))` so the match is case-insensitive like MySQL's default collation — exact for ASCII; non-ASCII case folding and the 3-arg `LOCATE(substr, str, pos)` form are not modeled. |
 | `TRIM`                                 | ✅     | `TRIM(str)` (leading/trailing spaces); the `TRIM(... FROM ...)` form is not parsed. |
 | `COUNT(*)` / `COUNT(expr)`             | ✅     | aggregate |
 | `SUM` / `MIN` / `MAX`                  | ✅     | aggregate |

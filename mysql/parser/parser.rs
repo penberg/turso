@@ -2373,6 +2373,17 @@ impl Parser {
             return self.field_call();
         }
 
+        // `INSTR(str, substr)` and `LOCATE(substr, str)` (note the swapped
+        // operand order) find the 1-based position of a substring. MySQL's are
+        // case-insensitive under the default collation, so both lower to
+        // `instr(lower(str), lower(substr))`.
+        if upper == "INSTR" {
+            return self.instr_call(false);
+        }
+        if upper == "LOCATE" {
+            return self.instr_call(true);
+        }
+
         // `GROUP_CONCAT(expr [SEPARATOR 's'])` maps to the engine's
         // `group_concat(expr[, 's'])`, which uses the same default `,` separator.
         if upper == "GROUP_CONCAT" {
@@ -2600,6 +2611,45 @@ impl Parser {
             else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                 "0".to_string(),
             )))),
+        })
+    }
+
+    /// Parses an `INSTR(str, substr)` or `LOCATE(substr, str)` call (the name and
+    /// `(` are already consumed) and lowers it to `instr(lower(str), lower(substr))`
+    /// — the 1-based position of the substring, or 0 if absent. `swap_args` is
+    /// true for `LOCATE`, whose operands are the reverse of `INSTR`. Wrapping both
+    /// operands in `lower()` makes the search case-insensitive, matching MySQL's
+    /// default-collation behaviour (ASCII case folding; positions are unchanged so
+    /// the result matches). The three-argument `LOCATE(substr, str, pos)` form has
+    /// no engine equivalent and is rejected. NULL propagates.
+    fn instr_call(&mut self, swap_args: bool) -> Result<ast::Expr> {
+        let first = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let second = self.expr()?;
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "LOCATE with a start position is not supported yet".to_string(),
+            ));
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        let (haystack, needle) = if swap_args {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("instr"),
+            distinctness: None,
+            args: vec![
+                Box::new(unary_fn("lower", haystack)),
+                Box::new(unary_fn("lower", needle)),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         })
     }
 
@@ -3518,7 +3568,7 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Scalar functions.
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
-        | "REPLACE" | "SUBSTR" | "INSTR" | "TRIM"
+        | "REPLACE" | "SUBSTR" | "TRIM"
         // Functions sharing behaviour with the engine under a different name;
         // renamed on emit (see `engine_function_name`).
         | "IF"
@@ -5275,6 +5325,44 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn instr_and_locate_lower_to_case_insensitive_instr() {
+        // INSTR(str, substr) -> instr(lower(str), lower(substr)).
+        let ast::Expr::FunctionCall { name, args, .. } =
+            parse_expr("INSTR('Haystack', 'NEEDLE')").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "instr");
+        assert_eq!(args.len(), 2);
+        for a in &args {
+            assert!(matches!(
+                a.as_ref(),
+                ast::Expr::FunctionCall { name, .. } if name.as_str() == "lower"
+            ));
+        }
+
+        // LOCATE swaps the operands: LOCATE(needle, haystack) puts the haystack
+        // first, as instr() expects.
+        let ast::Expr::FunctionCall { args, .. } =
+            parse_expr("LOCATE('NEEDLE', 'Haystack')").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        let inner = |e: &ast::Expr| match e {
+            ast::Expr::FunctionCall { args, .. } => match args[0].as_ref() {
+                ast::Expr::Literal(ast::Literal::String(s)) => s.clone(),
+                _ => panic!("expected a string literal inside lower()"),
+            },
+            _ => panic!("expected lower(...)"),
+        };
+        assert_eq!(inner(args[0].as_ref()), "'Haystack'");
+        assert_eq!(inner(args[1].as_ref()), "'NEEDLE'");
+
+        // The 3-argument LOCATE form is rejected.
+        assert!(parse_expr("LOCATE('a', 'banana', 3)").is_err());
     }
 
     #[test]

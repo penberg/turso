@@ -1,0 +1,58 @@
+# INSTR / LOCATE conformance.
+#
+# MySQL's INSTR(str, substr) and LOCATE(substr, str) -- note the reversed
+# operand order -- return the 1-based position of the substring, or 0 if it is
+# absent. Under MySQL's default collation the search is case-insensitive, so the
+# front-end lowers both to instr(lower(str), lower(substr)): the lower() wrapper
+# folds ASCII case without shifting positions. NULL propagates.
+#
+# Scope: the three-argument LOCATE(substr, str, pos) form has no engine
+# equivalent and is rejected (covered by a parser unit test, not here, because a
+# real mysqld accepts it).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS il_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO il_demo (id, s) VALUES (1, 'WordPress'), (2, 'hello world'), (3, 'banana')
+
+# INSTR(str, substr): position of the first match, or 0.
+query
+SELECT INSTR('hello world', 'o'), INSTR('hello world', 'z')
+----
+5	0
+
+# LOCATE(substr, str): same, with the arguments reversed.
+query
+SELECT LOCATE('o', 'hello world'), LOCATE('z', 'hello world')
+----
+5	0
+
+# Matching is case-insensitive (MySQL's default), for both spellings.
+query
+SELECT INSTR('WordPress', 'press'), LOCATE('PRESS', 'WordPress')
+----
+5	5
+
+# NULL in either argument yields NULL.
+query
+SELECT INSTR(NULL, 'a'), LOCATE('a', NULL)
+----
+NULL	NULL
+
+# Case-insensitive search against table data, used in a predicate.
+query
+SELECT id FROM il_demo WHERE INSTR(s, 'WORLD') > 0 ORDER BY id
+----
+2
+
+# As an ORDER BY key: rows sorted by where 'an' first appears (0 = not found).
+query
+SELECT id FROM il_demo ORDER BY LOCATE('AN', s), id
+----
+1
+2
+3
