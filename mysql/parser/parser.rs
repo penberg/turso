@@ -198,26 +198,33 @@ impl Parser {
 
     // === ALTER TABLE ===
 
-    /// Parses `ALTER TABLE tbl ADD [COLUMN] <column-def>` and lowers it to the
-    /// engine's single-operation `ALTER TABLE ... ADD COLUMN`. `ALTER` has
-    /// already been consumed.
-    ///
-    /// MySQL allows many operations in one `ALTER TABLE` (adding/dropping keys,
-    /// changing column types, ...). Two forms are supported:
-    ///   - `ADD [COLUMN] <column-def>` → the engine's single-operation
-    ///     `ALTER TABLE ... ADD COLUMN`, and
+    /// Parses an `ALTER TABLE tbl ...` statement (`ALTER` already consumed) and
+    /// lowers it to an engine operation. MySQL allows many operations per
+    /// `ALTER TABLE`; the forms with a single-statement engine equivalent are
+    /// supported:
+    ///   - `ADD [COLUMN] <column-def>` → `ALTER TABLE ... ADD COLUMN`,
     ///   - `ADD [UNIQUE] {KEY|INDEX} [name] (cols)` → `CREATE [UNIQUE] INDEX`
-    ///     (see [`Self::alter_add_index`]).
+    ///     (see [`Self::alter_add_index`]),
+    ///   - `DROP [COLUMN] col` → `ALTER TABLE ... DROP COLUMN`,
+    ///   - `RENAME [TO|AS] new` → `ALTER TABLE ... RENAME TO`, and
+    ///   - `RENAME COLUMN old TO new` → `ALTER TABLE ... RENAME COLUMN`.
     /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`FULLTEXT`/`CONSTRAINT`,
-    /// the `CHANGE`/`MODIFY`/`DROP`/`RENAME` operations, and the comma-separated
-    /// multi-operation form — is rejected as unsupported.
+    /// `DROP {INDEX|PRIMARY KEY|FOREIGN KEY}`, the type-changing `CHANGE`/`MODIFY`
+    /// operations, `RENAME INDEX`, and the comma-separated multi-operation form —
+    /// is rejected as unsupported.
     fn alter(&mut self) -> Result<ast::Stmt> {
         self.expect_keyword("TABLE")?;
         let name = self.qualified_name()?;
 
+        if self.eat_keyword("DROP") {
+            return self.alter_drop(name);
+        }
+        if self.eat_keyword("RENAME") {
+            return self.alter_rename(name);
+        }
         if !self.eat_keyword("ADD") {
             return Err(ParseError::Unsupported(
-                "only ALTER TABLE ... ADD COLUMN / ADD KEY is supported yet".to_string(),
+                "only ALTER TABLE ... ADD / DROP COLUMN / RENAME is supported yet".to_string(),
             ));
         }
 
@@ -306,6 +313,61 @@ impl Parser {
             with_clause: Vec::new(),
             where_clause: None,
         })
+    }
+
+    /// Lowers `DROP [COLUMN] col` (the `DROP` keyword is already consumed) to the
+    /// engine's `ALTER TABLE ... DROP COLUMN`. Dropping an index, primary key, or
+    /// foreign key (`DROP {INDEX|KEY|PRIMARY KEY|FOREIGN KEY|CONSTRAINT|CHECK}`)
+    /// has no single-statement engine equivalent and is rejected.
+    fn alter_drop(&mut self, name: ast::QualifiedName) -> Result<ast::Stmt> {
+        for kw in ["INDEX", "KEY", "PRIMARY", "FOREIGN", "CONSTRAINT", "CHECK"] {
+            if self.is_keyword(kw) {
+                return Err(ParseError::Unsupported(format!(
+                    "ALTER TABLE ... DROP {kw} is not supported yet"
+                )));
+            }
+        }
+        // `COLUMN` is optional in MySQL.
+        self.eat_keyword("COLUMN");
+        let column = self.name()?;
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "ALTER TABLE with multiple operations is not supported yet".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::AlterTable(ast::AlterTable {
+            name,
+            body: ast::AlterTableBody::DropColumn(column),
+        }))
+    }
+
+    /// Lowers the `RENAME` operations (the `RENAME` keyword is already consumed):
+    /// `RENAME COLUMN old TO new` → `RENAME COLUMN`, and `RENAME [TO|AS] new` →
+    /// `RENAME TO`. `RENAME {INDEX|KEY} old TO new` has no engine equivalent and
+    /// is rejected.
+    fn alter_rename(&mut self, name: ast::QualifiedName) -> Result<ast::Stmt> {
+        if self.eat_keyword("COLUMN") {
+            let old = self.name()?;
+            self.expect_keyword("TO")?;
+            let new = self.name()?;
+            return Ok(ast::Stmt::AlterTable(ast::AlterTable {
+                name,
+                body: ast::AlterTableBody::RenameColumn { old, new },
+            }));
+        }
+        if self.is_keyword("INDEX") || self.is_keyword("KEY") {
+            return Err(ParseError::Unsupported(
+                "ALTER TABLE ... RENAME INDEX is not supported yet".to_string(),
+            ));
+        }
+        // `RENAME [TO|AS] new_table`; a database qualifier is tolerated.
+        self.eat_keyword("TO");
+        self.eat_keyword("AS");
+        let new_table = self.qualified_name()?;
+        Ok(ast::Stmt::AlterTable(ast::AlterTable {
+            name,
+            body: ast::AlterTableBody::RenameTo(new_table.name),
+        }))
     }
 
     /// Resolves MySQL `AUTO_INCREMENT` onto the engine's rowid-alias
@@ -4108,19 +4170,59 @@ mod tests {
     }
 
     #[test]
+    fn alter_table_drop_and_rename_lower_to_engine_ops() {
+        // DROP [COLUMN] col -> DropColumn.
+        for sql in ["ALTER TABLE t DROP COLUMN c", "ALTER TABLE t DROP c"] {
+            let ast::Stmt::AlterTable(alter) = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to parse as ALTER TABLE");
+            };
+            let ast::AlterTableBody::DropColumn(col) = &alter.body else {
+                panic!("expected DROP COLUMN for `{sql}`");
+            };
+            assert_eq!(col.as_str(), "c");
+        }
+
+        // RENAME COLUMN old TO new -> RenameColumn.
+        let ast::Stmt::AlterTable(alter) = parse("ALTER TABLE t RENAME COLUMN a TO b").unwrap()
+        else {
+            panic!("expected ALTER TABLE");
+        };
+        let ast::AlterTableBody::RenameColumn { old, new } = &alter.body else {
+            panic!("expected RENAME COLUMN");
+        };
+        assert_eq!(old.as_str(), "a");
+        assert_eq!(new.as_str(), "b");
+
+        // RENAME [TO|AS] new_table -> RenameTo.
+        for sql in ["ALTER TABLE t RENAME TO u", "ALTER TABLE t RENAME u"] {
+            let ast::Stmt::AlterTable(alter) = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to parse as ALTER TABLE");
+            };
+            let ast::AlterTableBody::RenameTo(new) = &alter.body else {
+                panic!("expected RENAME TO for `{sql}`");
+            };
+            assert_eq!(new.as_str(), "u");
+        }
+    }
+
+    #[test]
     fn alter_table_unsupported_variants() {
-        // Primary/foreign-key and other constraint adds, column changes, drops,
-        // and the multi-operation comma form are all rejected (a real mysqld
-        // accepts them, but the engine has no in-place equivalent).
+        // Primary/foreign-key and other constraint adds, index/key drops, the
+        // type-changing CHANGE/MODIFY operations, RENAME INDEX, and the
+        // multi-operation comma form are all rejected (a real mysqld accepts
+        // them, but the engine has no in-place equivalent).
         for sql in [
             "ALTER TABLE t ADD PRIMARY KEY (id)",
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
             "ALTER TABLE t ADD FULLTEXT KEY ft (c)",
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
             "ALTER TABLE t ADD a INT, ADD b INT",
-            "ALTER TABLE t DROP COLUMN c",
+            "ALTER TABLE t DROP PRIMARY KEY",
+            "ALTER TABLE t DROP INDEX idx",
+            "ALTER TABLE t DROP FOREIGN KEY fk",
             "ALTER TABLE t CHANGE COLUMN a b INT",
-            "ALTER TABLE t RENAME TO u",
+            "ALTER TABLE t MODIFY COLUMN a BIGINT",
+            "ALTER TABLE t RENAME INDEX a TO b",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),

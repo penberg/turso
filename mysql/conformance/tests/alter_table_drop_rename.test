@@ -1,0 +1,70 @@
+# ALTER TABLE ... DROP COLUMN / RENAME conformance.
+#
+# MySQL's ALTER TABLE can drop a column, rename a column, and rename a table;
+# the engine (like SQLite) supports all three in place, so the front-end lowers
+# them to the matching engine operations:
+#   DROP [COLUMN] col          -> ALTER TABLE ... DROP COLUMN
+#   RENAME COLUMN old TO new   -> ALTER TABLE ... RENAME COLUMN
+#   RENAME [TO|AS] new_table   -> ALTER TABLE ... RENAME TO
+#
+# Scope: DROP {INDEX|PRIMARY KEY|FOREIGN KEY}, RENAME INDEX, and the
+# type-changing CHANGE/MODIFY operations are rejected by the front-end and
+# covered by a parser unit test, not here, because a real mysqld accepts them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS altmod_demo (id INT PRIMARY KEY, name VARCHAR(20), tmp INT)
+
+statement ok
+INSERT INTO altmod_demo (id, name, tmp) VALUES (1, 'a', 9), (2, 'b', 8)
+
+# DROP COLUMN removes the column; selecting it afterwards is an error.
+statement ok
+ALTER TABLE altmod_demo DROP COLUMN tmp
+
+statement error
+SELECT tmp FROM altmod_demo
+
+query
+SELECT id, name FROM altmod_demo ORDER BY id
+----
+1	a
+2	b
+
+# RENAME COLUMN: the old name is gone, the new name works.
+statement ok
+ALTER TABLE altmod_demo RENAME COLUMN name TO label
+
+statement error
+SELECT name FROM altmod_demo
+
+query
+SELECT id, label FROM altmod_demo ORDER BY id
+----
+1	a
+2	b
+
+# The COLUMN keyword is optional on DROP.
+statement ok
+ALTER TABLE altmod_demo ADD COLUMN extra INT DEFAULT 7
+
+statement ok
+ALTER TABLE altmod_demo DROP extra
+
+statement error
+SELECT extra FROM altmod_demo
+
+# RENAME TO renames the table; the new name works and the old name is gone.
+statement ok
+ALTER TABLE altmod_demo RENAME TO altmod_renamed
+
+query
+SELECT id, label FROM altmod_renamed ORDER BY id
+----
+1	a
+2	b
+
+statement error
+SELECT id FROM altmod_demo
