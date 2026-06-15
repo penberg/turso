@@ -6151,6 +6151,12 @@ fn is_supported_function(upper_name: &str) -> bool {
         // `SUBSTR`/`SUBSTRING` are handled separately by `trim_call` /
         // `substring_call`, which also parse their SQL-standard `FROM` forms.)
         | "REPLACE" | "LTRIM" | "RTRIM"
+        // `UNHEX(s)` is the inverse of `HEX` for the string case: it decodes a hex
+        // string to the bytes it represents, mapping straight onto the engine's
+        // `unhex` (a NULL or invalid/odd-length hex string yields NULL, as in
+        // MySQL). The result is a binary string. (`HEX` is overloaded and handled
+        // separately by `hex_call`.)
+        | "UNHEX"
         // `CONCAT_WS(sep, ...)` joins the non-NULL arguments with `sep`, skipping
         // NULLs (and yielding NULL only for a NULL separator) — exactly the
         // engine's `concat_ws`. (Distinct from `CONCAT`, which is lowered to `||`
@@ -9985,6 +9991,7 @@ mod tests {
             "LTRIM(s)",
             "RTRIM(s)",
             "CONCAT_WS('-', a, b)",
+            "UNHEX('41')",
         ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");

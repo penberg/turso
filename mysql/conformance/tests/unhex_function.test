@@ -1,0 +1,43 @@
+# The UNHEX() function.
+#
+# UNHEX is the inverse of HEX for the string case: it decodes a hexadecimal
+# string to the bytes it represents (UNHEX('48656C6C6F') -> 'Hello'). It maps
+# straight onto the engine's unhex; a NULL or invalid/odd-length hex string
+# yields NULL, as in MySQL.
+#
+# The result is a binary string (a BLOB in the engine), which renders the same as
+# MySQL's binary string and round-trips through HEX, but compares against a plain
+# string differently (BLOB vs text) -- so the test uses the rendered value and
+# HEX round-trips rather than `UNHEX(...) = 'str'`. Passes against both
+# turso-mysql-server and a real mysqld. Uses its own table name.
+
+# Decoding to the byte string.
+query
+SELECT UNHEX('48656C6C6F'), UNHEX('41'), UNHEX('776F726C64')
+----
+Hello	A	world
+
+# Round-trips with HEX both ways.
+query
+SELECT HEX(UNHEX('DEADBEEF')), UNHEX(HEX('Hi'))
+----
+DEADBEEF	Hi
+
+# NULL, and an invalid or odd-length hex string, yield NULL.
+query
+SELECT UNHEX(NULL) IS NULL, UNHEX('xyz') IS NULL, UNHEX('4') IS NULL
+----
+1	1	1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS uh (id INT PRIMARY KEY, h VARCHAR(20))
+
+statement ok
+INSERT INTO uh (id, h) VALUES (1, '414243'), (2, '787978')
+
+query
+SELECT id, UNHEX(h) FROM uh ORDER BY id
+----
+1	ABC
+2	xyx
