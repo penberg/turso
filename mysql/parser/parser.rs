@@ -2747,6 +2747,12 @@ impl Parser {
             return self.pad_call(false);
         }
 
+        // `INSERT(str, pos, len, newstr)` splices `newstr` into `str`, replacing
+        // `len` characters from `pos`; synthesized from `substr` and `||`.
+        if upper == "INSERT" {
+            return self.insert_string_call();
+        }
+
         // `INSTR(str, substr)` and `LOCATE(substr, str)` (note the swapped
         // operand order) find the 1-based position of a substring. MySQL's are
         // case-insensitive under the default collation, so both lower to
@@ -3940,6 +3946,64 @@ impl Parser {
         self.expect(&Token::RParen, "`)`")?;
         let space = ast::Expr::Literal(ast::Literal::String(requote(" ")));
         Ok(repeat_expr(space, n))
+    }
+
+    /// Lowers `INSERT(str, pos, len, newstr)` (the name and `(` are already
+    /// consumed) — replace `len` characters of `str` starting at the 1-based
+    /// `pos` with `newstr` — to
+    /// `CASE WHEN pos < 1 OR pos > length(str) THEN str
+    ///       ELSE substr(str, 1, pos - 1) || newstr || substr(str, pos + len) END`.
+    ///
+    /// The guard returns `str` unchanged when `pos` is out of range, as in MySQL;
+    /// otherwise the prefix before `pos`, `newstr`, and the suffix from `pos+len`
+    /// are concatenated (a `len` past the end simply yields an empty suffix). The
+    /// engine's `length`/`substr` are character-based, matching MySQL's
+    /// per-character positions, and a NULL in any argument falls through the
+    /// guard and propagates via the concatenation. A negative `len` is a
+    /// documented edge. Exactly four arguments are required.
+    fn insert_string_call(&mut self) -> Result<ast::Expr> {
+        let target = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let pos = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let len = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let newstr = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        // pos < 1 OR pos > length(str)
+        let cond = ast::Expr::binary(
+            ast::Expr::binary(pos.clone(), ast::Operator::Less, one()),
+            ast::Operator::Or,
+            ast::Expr::binary(
+                pos.clone(),
+                ast::Operator::Greater,
+                call_fn("length", vec![target.clone()]),
+            ),
+        );
+        let prefix = substr_fn(
+            target.clone(),
+            one(),
+            ast::Expr::binary(pos.clone(), ast::Operator::Subtract, one()),
+        );
+        let suffix = call_fn(
+            "substr",
+            vec![
+                target.clone(),
+                ast::Expr::binary(pos, ast::Operator::Add, len),
+            ],
+        );
+        let spliced = ast::Expr::binary(
+            ast::Expr::binary(prefix, ast::Operator::Concat, newstr),
+            ast::Operator::Concat,
+            suffix,
+        );
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(Box::new(cond), Box::new(target))],
+            else_expr: Some(Box::new(spliced)),
+        })
     }
 
     /// Lowers `LPAD(str, len, pad)` / `RPAD(str, len, pad)` (the name and `(` are
@@ -7083,6 +7147,27 @@ mod tests {
             parse_expr("SPACE(n)").unwrap(),
             parse_expr("REPEAT(' ', n)").unwrap()
         );
+    }
+
+    #[test]
+    fn insert_function_lowers_to_guarded_splice() {
+        // INSERT(s, pos, len, new) -> a guarded CASE; the ELSE splices via
+        // substr/concat.
+        let ast::Expr::Case {
+            base, else_expr, ..
+        } = parse_expr("INSERT(s, 3, 4, 'X')").unwrap()
+        else {
+            panic!("expected INSERT() to lower to a CASE");
+        };
+        assert!(base.is_none());
+        // The ELSE is a concatenation (prefix || new || suffix).
+        assert!(matches!(
+            else_expr.unwrap().as_ref(),
+            ast::Expr::Binary(_, ast::Operator::Concat, _)
+        ));
+
+        // Exactly four arguments are required.
+        assert!(parse_expr("INSERT(s, 3, 4)").is_err());
     }
 
     #[test]

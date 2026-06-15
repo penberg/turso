@@ -1,0 +1,63 @@
+# INSERT(str, pos, len, newstr) string-function conformance.
+#
+# INSERT replaces len characters of str starting at the 1-based pos with newstr.
+# (This is the string function, distinct from the INSERT statement, and is
+# recognized in expression position.) The front-end lowers it to
+#   CASE WHEN pos < 1 OR pos > length(str) THEN str
+#        ELSE substr(str, 1, pos - 1) || newstr || substr(str, pos + len) END,
+# so an out-of-range pos leaves str unchanged, a len past the end drops the rest,
+# and NULL in any argument propagates. Positions are per-character.
+#
+# Scope: a negative len is a documented edge and not exercised.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The classic example: replace 4 chars from position 3.
+query
+SELECT INSERT('Quadratic', 3, 4, 'What')
+----
+QuWhattic
+
+# An out-of-range position (below 1 or past the end) leaves the string unchanged.
+query
+SELECT INSERT('Quadratic', -1, 4, 'What'), INSERT('Quadratic', 10, 4, 'What')
+----
+Quadratic	Quadratic
+
+# A length past the end of the string drops everything from pos.
+query
+SELECT INSERT('Quadratic', 3, 100, 'What')
+----
+QuWhat
+
+# A length of zero inserts without removing anything.
+query
+SELECT INSERT('hello', 1, 0, 'X'), INSERT('hello', 5, 0, '!')
+----
+Xhello	hell!o
+
+# Replace in the middle.
+query
+SELECT INSERT('abcdef', 2, 3, 'XY')
+----
+aXYef
+
+# NULL in any argument propagates.
+query
+SELECT INSERT(NULL, 1, 1, 'x'), INSERT('abc', NULL, 1, 'x'), INSERT('abc', 1, NULL, 'x'), INSERT('abc', 1, 1, NULL)
+----
+NULL	NULL	NULL	NULL
+
+# Usable over a column (mask all but the last two characters).
+statement ok
+CREATE TABLE IF NOT EXISTS ins_demo (id INT PRIMARY KEY, code VARCHAR(20))
+
+statement ok
+INSERT INTO ins_demo (id, code) VALUES (1, '123456'), (2, 'abcdef')
+
+query
+SELECT id, INSERT(code, 1, 4, '****') FROM ins_demo ORDER BY id
+----
+1	****56
+2	****ef
