@@ -1,0 +1,53 @@
+# POSITION(substr IN str) conformance.
+#
+# POSITION is the SQL-standard spelling of LOCATE(substr, str): the 1-based
+# position of substr in str, or 0 if absent. The front-end lowers it like the
+# two-argument LOCATE -- instr(lower(str), lower(substr)) -- so it is
+# case-insensitive (ASCII, MySQL's default collation) and NULL propagates. The
+# `IN` keyword separates the operands.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The 1-based position, or 0 when absent.
+query
+SELECT POSITION('b' IN 'abc'), POSITION('x' IN 'abc'), POSITION('lo' IN 'hello')
+----
+2	0	4
+
+# Case-insensitive, like LOCATE.
+query
+SELECT POSITION('B' IN 'abc'), POSITION('HE' IN 'hello')
+----
+2	1
+
+# It agrees with LOCATE.
+query
+SELECT POSITION('l' IN 'hello') = LOCATE('l', 'hello')
+----
+1
+
+# NULL in either operand propagates.
+query
+SELECT POSITION(NULL IN 'abc'), POSITION('b' IN NULL)
+----
+NULL	NULL
+
+# Usable over a column and in WHERE.
+statement ok
+CREATE TABLE IF NOT EXISTS pos_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO pos_demo (id, s) VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry')
+
+query
+SELECT id, POSITION('a' IN s) FROM pos_demo ORDER BY id
+----
+1	1
+2	2
+3	0
+
+query
+SELECT id FROM pos_demo WHERE POSITION('rr' IN s) > 0 ORDER BY id
+----
+3

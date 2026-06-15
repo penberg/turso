@@ -3004,6 +3004,13 @@ impl Parser {
             return self.instr_call(true);
         }
 
+        // `POSITION(substr IN str)` is the SQL-standard spelling of
+        // `LOCATE(substr, str)` — same lowering, with the `IN` keyword separating
+        // the operands.
+        if upper == "POSITION" {
+            return self.position_call();
+        }
+
         // `GROUP_CONCAT(expr [SEPARATOR 's'])` maps to the engine's
         // `group_concat(expr[, 's'])`, which uses the same default `,` separator.
         if upper == "GROUP_CONCAT" {
@@ -3472,6 +3479,25 @@ impl Parser {
             )],
             else_expr: Some(Box::new(absolute)),
         })
+    }
+
+    /// Parses the SQL-standard `POSITION(substr IN str)` (the name and `(` are
+    /// already consumed) and lowers it exactly like `LOCATE(substr, str)`:
+    /// `instr(lower(str), lower(substr))` — the 1-based position of the substring
+    /// (case-insensitive, matching MySQL's default collation), or 0 if absent.
+    /// NULL propagates.
+    fn position_call(&mut self) -> Result<ast::Expr> {
+        // The operands are `bit_expr`s (below the comparison/`IN` tier), so parse
+        // the substring at the bitwise level — `self.expr()` would otherwise
+        // swallow the separating `IN` as an `IN`-list operator.
+        let needle = self.bitor_expr()?;
+        self.expect_keyword("IN")?;
+        let haystack = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(call_fn(
+            "instr",
+            vec![unary_fn("lower", haystack), unary_fn("lower", needle)],
+        ))
     }
 
     /// Parses a `GROUP_CONCAT([DISTINCT] expr [SEPARATOR 's'])` call (the name and
@@ -7944,6 +7970,13 @@ mod tests {
         };
         assert_eq!(inner(args[0].as_ref()), "'Haystack'");
         assert_eq!(inner(args[1].as_ref()), "'NEEDLE'");
+
+        // POSITION(substr IN str) is the SQL-standard LOCATE and lowers the same
+        // way (instr(lower(str), lower(substr))).
+        assert_eq!(
+            parse_expr("POSITION('NEEDLE' IN 'Haystack')").unwrap(),
+            parse_expr("LOCATE('NEEDLE', 'Haystack')").unwrap()
+        );
 
         // The 3-argument LOCATE(substr, str, pos) form searches from `pos`,
         // lowering to a guarded CASE over an offset instr(); INSTR stays 2-arg.
