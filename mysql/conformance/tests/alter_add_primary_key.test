@@ -1,0 +1,70 @@
+# ALTER TABLE ... ADD PRIMARY KEY (cols) conformance.
+#
+# The engine cannot add a real, in-place primary key (SQLite/turso reserve that
+# for CREATE TABLE's rowid alias), so the front-end lowers ADD PRIMARY KEY to a
+# CREATE UNIQUE INDEX over the key columns. The statement succeeds and the key's
+# uniqueness is enforced -- which is what WordPress's dbDelta() relies on. A
+# column prefix length (col(10)) is dropped, and the composite form is supported.
+#
+# The synthesized index is reported by SHOW INDEX under a `<table>_primary` name
+# rather than MySQL's `PRIMARY`, and the columns are not made implicitly NOT NULL
+# (see mysql/COMPAT.md), so this file does not assert those; it tests the
+# behavior that matches both targets. Uses its own table names.
+
+# Single-column primary key added after the fact.
+statement ok
+CREATE TABLE IF NOT EXISTS apk_one (id INT NOT NULL, v INT)
+
+statement ok
+ALTER TABLE apk_one ADD PRIMARY KEY (id)
+
+statement ok
+INSERT INTO apk_one (id, v) VALUES (1, 10), (2, 20)
+
+query
+SELECT id, v FROM apk_one ORDER BY id
+----
+1	10
+2	20
+
+# The key's uniqueness is enforced: a duplicate key is rejected.
+statement error
+INSERT INTO apk_one (id, v) VALUES (1, 99)
+
+# Composite primary key.
+statement ok
+CREATE TABLE IF NOT EXISTS apk_two (a INT, b INT, v INT)
+
+statement ok
+ALTER TABLE apk_two ADD PRIMARY KEY (a, b)
+
+statement ok
+INSERT INTO apk_two (a, b, v) VALUES (1, 1, 1), (1, 2, 2)
+
+# A repeated (a, b) pair violates the composite key; a new pair is fine.
+statement error
+INSERT INTO apk_two (a, b, v) VALUES (1, 1, 9)
+
+statement ok
+INSERT INTO apk_two (a, b, v) VALUES (2, 1, 3)
+
+query
+SELECT a, b, v FROM apk_two ORDER BY a, b
+----
+1	1	1
+1	2	2
+2	1	3
+
+# A MySQL column prefix length is accepted (and dropped -- the whole column is
+# indexed).
+statement ok
+CREATE TABLE IF NOT EXISTS apk_prefix (k VARCHAR(50), v INT)
+
+statement ok
+ALTER TABLE apk_prefix ADD PRIMARY KEY (k(10))
+
+statement ok
+INSERT INTO apk_prefix (k, v) VALUES ('alpha', 1)
+
+statement error
+INSERT INTO apk_prefix (k, v) VALUES ('alpha', 2)

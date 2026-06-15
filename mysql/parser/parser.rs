@@ -323,11 +323,14 @@ impl Parser {
     ///     (see [`Self::alter_add_index`]),
     ///   - `ADD FULLTEXT [KEY|INDEX] [name] (cols)` → a plain `CREATE INDEX`,
     ///     since the engine has no full-text index (see [`Self::alter_add_index`]),
+    ///   - `ADD PRIMARY KEY (cols)` → a `CREATE UNIQUE INDEX` standing in for the
+    ///     in-place primary key the engine cannot add (see
+    ///     [`Self::alter_add_primary_key`]),
     ///   - `DROP [COLUMN] col` → `ALTER TABLE ... DROP COLUMN`,
     ///   - `RENAME [TO|AS] new` → `ALTER TABLE ... RENAME TO`, and
     ///   - `RENAME COLUMN old TO new` → `ALTER TABLE ... RENAME COLUMN`.
     ///
-    /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
+    /// Everything else — `ADD FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
     /// `DROP {INDEX|PRIMARY KEY|FOREIGN KEY}`, the type-changing `CHANGE`/`MODIFY`
     /// operations, and `RENAME INDEX` — is rejected as unsupported. The
     /// comma-separated multi-operation form has no single-statement engine
@@ -381,11 +384,21 @@ impl Parser {
             return self.alter_add_index(name, false);
         }
 
+        // `ADD PRIMARY KEY (cols)` -- the engine cannot add a real (rowid)
+        // primary key in place, so emulate it with a UNIQUE index over the key
+        // columns. This enforces the key's uniqueness (its primary runtime
+        // effect) and lets the statement succeed, which is what WordPress's
+        // `dbDelta()` issues. See [`Self::alter_add_primary_key`].
+        if self.eat_keyword("PRIMARY") {
+            self.expect_keyword("KEY")?;
+            return self.alter_add_primary_key(name);
+        }
+
         // `COLUMN` is optional after `ADD`. Any other index/constraint add starts
         // with one of these keywords and has no single-statement engine
         // equivalent.
         self.eat_keyword("COLUMN");
-        for kw in ["PRIMARY", "CONSTRAINT", "SPATIAL", "FOREIGN", "CHECK"] {
+        for kw in ["CONSTRAINT", "SPATIAL", "FOREIGN", "CHECK"] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
                     "ALTER TABLE ... ADD {kw} is not supported yet"
@@ -439,6 +452,38 @@ impl Parser {
 
         Ok(ast::Stmt::CreateIndex {
             unique,
+            if_not_exists: false,
+            idx_name: ast::QualifiedName::single(idx_name),
+            tbl_name: tbl.name,
+            using: None,
+            columns,
+            with_clause: Vec::new(),
+            where_clause: None,
+        })
+    }
+
+    /// Lowers `ADD PRIMARY KEY [USING ...] (cols)` (the `PRIMARY KEY` keywords
+    /// already consumed) to a `CREATE UNIQUE INDEX` over the key columns. The
+    /// engine cannot add a real, in-place primary key (SQLite/turso reserve that
+    /// for `CREATE TABLE`'s rowid alias), so the unique index stands in: it
+    /// enforces the key's uniqueness and the statement succeeds. As with
+    /// [`Self::alter_add_index`], a column prefix length (`col(191)`) is dropped
+    /// and an optional `USING {BTREE|HASH}` type is ignored. The index is named
+    /// `<table>_primary` to be unique within the per-database index namespace
+    /// (a table has at most one primary key). This is not a true primary key:
+    /// `SHOW INDEX` reports it under that name rather than MySQL's `PRIMARY`, and
+    /// the columns are not made implicitly `NOT NULL` -- see `mysql/COMPAT.md`.
+    fn alter_add_primary_key(&mut self, tbl: ast::QualifiedName) -> Result<ast::Stmt> {
+        if self.eat_keyword("USING") {
+            let _ = self.name()?;
+        }
+        let columns = self.sorted_column_list()?;
+        if self.eat_keyword("USING") {
+            let _ = self.name()?;
+        }
+        let idx_name = ast::Name::from_string(format!("{}_primary", tbl.name.as_str()));
+        Ok(ast::Stmt::CreateIndex {
+            unique: true,
             if_not_exists: false,
             idx_name: ast::QualifiedName::single(idx_name),
             tbl_name: tbl.name,
@@ -7148,6 +7193,45 @@ mod tests {
     }
 
     #[test]
+    fn alter_table_add_primary_key_lowers_to_unique_index() {
+        // ADD PRIMARY KEY (cols) becomes a UNIQUE CREATE INDEX named
+        // `<table>_primary`; a prefix length is dropped and the composite form is
+        // supported.
+        let cases = [
+            ("ALTER TABLE t ADD PRIMARY KEY (id)", "t_primary", 1),
+            ("ALTER TABLE t ADD PRIMARY KEY (a, b)", "t_primary", 2),
+            ("ALTER TABLE t ADD PRIMARY KEY (k(10))", "t_primary", 1),
+        ];
+        for (sql, want_name, want_cols) in cases {
+            let ast::Stmt::CreateIndex {
+                unique,
+                idx_name,
+                tbl_name,
+                columns,
+                ..
+            } = parse(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to CREATE INDEX");
+            };
+            assert!(unique, "primary key must lower to a UNIQUE index: {sql}");
+            assert_eq!(idx_name.name.as_str(), want_name, "{sql}");
+            assert_eq!(tbl_name.as_str(), "t", "{sql}");
+            assert_eq!(columns.len(), want_cols, "{sql}");
+        }
+
+        // The non-PRIMARY constraint adds are still unsupported.
+        for sql in [
+            "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES u (b)",
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0)",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
+    }
+
+    #[test]
     fn rename_table_lowers_to_alter_rename() {
         // RENAME TABLE old TO new -> ALTER TABLE old RENAME TO new.
         let ast::Stmt::AlterTable(alter) = parse("RENAME TABLE old_t TO new_t").unwrap() else {
@@ -7206,12 +7290,13 @@ mod tests {
 
     #[test]
     fn alter_table_unsupported_variants() {
-        // Primary/foreign-key and other constraint adds, index/key drops, the
+        // Foreign-key and other constraint adds, index/key drops, the
         // type-changing CHANGE/MODIFY operations, RENAME INDEX, and the
         // multi-operation comma form are all rejected (a real mysqld accepts
-        // them, but the engine has no in-place equivalent).
+        // them, but the engine has no in-place equivalent). `ADD PRIMARY KEY` is
+        // the exception -- it lowers to a UNIQUE index (see
+        // `alter_table_add_primary_key_lowers_to_unique_index`).
         for sql in [
-            "ALTER TABLE t ADD PRIMARY KEY (id)",
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
             "ALTER TABLE t ADD SPATIAL KEY sp (c)",
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
