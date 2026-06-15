@@ -2024,15 +2024,15 @@ impl Parser {
         if !self.eat_keyword("LIMIT") {
             return Ok(None);
         }
-        let first = self.expr()?;
+        let first = clamp_limit_literal(self.expr()?);
         if self.eat(&Token::Comma) {
-            let count = self.expr()?;
+            let count = clamp_limit_literal(self.expr()?);
             Ok(Some(ast::Limit {
                 expr: Box::new(count),
                 offset: Some(Box::new(first)),
             }))
         } else if self.eat_keyword("OFFSET") {
-            let offset = self.expr()?;
+            let offset = clamp_limit_literal(self.expr()?);
             Ok(Some(ast::Limit {
                 expr: Box::new(first),
                 offset: Some(Box::new(offset)),
@@ -2055,7 +2055,7 @@ impl Parser {
         if !self.eat_keyword("LIMIT") {
             return Ok(None);
         }
-        let count = self.expr()?;
+        let count = clamp_limit_literal(self.expr()?);
         if self.is(&Token::Comma) || self.is_keyword("OFFSET") {
             return Err(ParseError::Unsupported(
                 "LIMIT on UPDATE/DELETE takes a row count only (no offset)".to_string(),
@@ -5504,6 +5504,22 @@ fn float_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
     ast::Expr::binary(a_real, ast::Operator::Divide, b)
 }
 
+/// Clamps a `LIMIT`/`OFFSET` integer literal that overflows `i64` down to
+/// `i64::MAX`. MySQL allows a `LIMIT`/`OFFSET` up to `2^64 - 1` and the idiom
+/// `LIMIT 18446744073709551615` means "all remaining rows" (used after an
+/// `OFFSET`); the engine stores the bound as a signed 64-bit integer, so such a
+/// value would overflow. Since no table holds anywhere near `2^63` rows,
+/// `i64::MAX` returns every remaining row just the same. Non-literal or
+/// in-range bounds are returned unchanged.
+fn clamp_limit_literal(expr: ast::Expr) -> ast::Expr {
+    if let ast::Expr::Literal(ast::Literal::Numeric(ref s)) = expr {
+        if s.parse::<i64>().is_err() && s.parse::<u64>().is_ok() {
+            return ast::Expr::Literal(ast::Literal::Numeric(i64::MAX.to_string()));
+        }
+    }
+    expr
+}
+
 fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
     ast::Expr::FunctionCall {
         name: ast::Name::from_string(name),
@@ -6434,6 +6450,48 @@ mod tests {
             let limit = select.limit.unwrap();
             assert!(limit.offset.is_some());
         }
+    }
+
+    #[test]
+    fn limit_literal_overflowing_i64_is_clamped() {
+        // MySQL's `LIMIT 18446744073709551615` ("all remaining rows") overflows
+        // the engine's signed 64-bit bound, so it is clamped to i64::MAX.
+        let max = i64::MAX.to_string();
+        let ast::Stmt::Select(select) =
+            parse("SELECT * FROM t LIMIT 2, 18446744073709551615").unwrap()
+        else {
+            unreachable!()
+        };
+        let limit = select.limit.unwrap();
+        assert_eq!(
+            *limit.expr,
+            ast::Expr::Literal(ast::Literal::Numeric(max.clone()))
+        );
+        // The in-range offset is left untouched.
+        assert_eq!(
+            *limit.offset.unwrap(),
+            ast::Expr::Literal(ast::Literal::Numeric("2".to_string()))
+        );
+
+        // An in-range LIMIT is unchanged.
+        let ast::Stmt::Select(select) = parse("SELECT * FROM t LIMIT 50").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            *select.limit.unwrap().expr,
+            ast::Expr::Literal(ast::Literal::Numeric("50".to_string()))
+        );
+
+        // The clamp also applies to UPDATE/DELETE row limits.
+        let ast::Stmt::Delete { limit, .. } =
+            parse("DELETE FROM t LIMIT 18446744073709551615").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *limit.unwrap().expr,
+            ast::Expr::Literal(ast::Literal::Numeric(max))
+        );
     }
 
     #[test]

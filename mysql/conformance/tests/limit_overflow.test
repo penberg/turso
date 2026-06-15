@@ -1,0 +1,59 @@
+# A LIMIT/OFFSET that overflows a signed 64-bit integer.
+#
+# MySQL allows a LIMIT up to 2^64 - 1, and the idiom `LIMIT 18446744073709551615`
+# (that maximum) means "all remaining rows" -- used after an OFFSET to skip the
+# first N rows and return the rest. The engine stores the bound as a signed
+# 64-bit integer, so the value overflowed (a "datatype mismatch" runtime error).
+# The front-end now clamps a LIMIT/OFFSET literal above i64::MAX down to i64::MAX,
+# which returns every remaining row just the same (no table holds 2^63 rows).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS limov (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO limov (id) VALUES (1), (2), (3), (4), (5)
+
+# The bare huge LIMIT returns every row.
+query
+SELECT id FROM limov ORDER BY id LIMIT 18446744073709551615
+----
+1
+2
+3
+4
+5
+
+# `LIMIT offset, huge` returns all rows after the offset (the WordPress/MySQL
+# "skip N, take the rest" idiom).
+query
+SELECT id FROM limov ORDER BY id LIMIT 2, 18446744073709551615
+----
+3
+4
+5
+
+# The `LIMIT huge OFFSET n` spelling behaves the same.
+query
+SELECT id FROM limov ORDER BY id LIMIT 18446744073709551615 OFFSET 3
+----
+4
+5
+
+# A normal in-range LIMIT is unaffected.
+query
+SELECT id FROM limov ORDER BY id LIMIT 2
+----
+1
+2
+
+# DELETE ... LIMIT also accepts the huge count.
+statement ok
+DELETE FROM limov WHERE id > 4 LIMIT 18446744073709551615
+
+query
+SELECT COUNT(*) FROM limov
+----
+4

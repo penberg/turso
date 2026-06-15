@@ -280,6 +280,7 @@ incomplete.
 | Parenthesized Query Expressions        | ❌     |         |
 | REPLACE ... VALUES                     | ✅     | `REPLACE [INTO] tbl ... VALUES ...` lowers to the engine's `INSERT OR REPLACE`: a row conflicting on a primary/unique key is deleted before the new row is inserted, like MySQL. The `REPLACE ... SET` and `REPLACE ... SELECT` forms are not supported. |
 | SELECT (single table, WHERE/ORDER BY/LIMIT) | ✅ |         |
+| `LIMIT count` / `LIMIT offset, count` / `LIMIT count OFFSET offset` | ✅ | All three spellings. A `LIMIT`/`OFFSET` literal above `i64::MAX` (MySQL allows up to `2^64-1`, and `LIMIT 18446744073709551615` is the "all remaining rows" idiom used after an `OFFSET`) is clamped to `i64::MAX`, which the engine's signed 64-bit bound represents and which still returns every remaining row. |
 | SELECT ... GROUP BY [HAVING]           | ✅     | GROUP BY column expressions (not integer ordinals — those diverge). |
 | SELECT DISTINCT                        | ✅     | `DISTINCTROW` synonym not supported. |
 | `SELECT SQL_CALC_FOUND_ROWS ...` + `SELECT FOUND_ROWS()` | 🚧 | The modifier is honored: the query returns its limited rows, and a following `FOUND_ROWS()` on the same connection returns the count the query would return without its `LIMIT` (computed by re-running it without the limit). Drives `WP_Query` pagination. `FOUND_ROWS()` is only meaningful right after a `SQL_CALC_FOUND_ROWS` query — it is not updated after ordinary `SELECT`s. |
