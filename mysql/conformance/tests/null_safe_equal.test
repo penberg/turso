@@ -1,0 +1,63 @@
+# NULL-safe equality operator (<=>) conformance.
+#
+# MySQL's `a <=> b` is equality that treats NULL as a comparable value: it is 1
+# when both sides are NULL, 0 when exactly one is, and the ordinary equality
+# otherwise -- never NULL. The front-end lowers it to
+#   CASE WHEN a IS NULL AND b IS NULL THEN 1
+#        WHEN a IS NULL OR b IS NULL THEN 0 ELSE a = b END,
+# which uses only IS NULL / = / AND / OR (no engine `IS expr` operator needed).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Both NULL -> 1; one NULL -> 0; the ordinary cases match `=`.
+query
+SELECT 1 <=> 1, 1 <=> 2, NULL <=> NULL, 1 <=> NULL, NULL <=> 1
+----
+1	0	1	0	0
+
+# Works on strings.
+query
+SELECT 'a' <=> 'a', 'a' <=> 'b'
+----
+1	0
+
+# It never yields NULL, so it is a clean boolean (unlike `=` with NULL).
+query
+SELECT (NULL <=> NULL) = 1, (1 <=> NULL) = 0
+----
+1	1
+
+# The `<=` and `>=` operators are unaffected by the new `<=>` lexing.
+query
+SELECT 1 <= 2, 2 >= 2, 3 <= 1
+----
+1	1	0
+
+# Usable in WHERE to match rows by a possibly-NULL column, including NULL itself.
+statement ok
+CREATE TABLE IF NOT EXISTS nse_demo (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO nse_demo (id, v) VALUES (1, 10), (2, NULL), (3, 20), (4, NULL)
+
+# `v <=> NULL` selects exactly the NULL rows (where `v = NULL` would select none).
+query
+SELECT id FROM nse_demo WHERE v <=> NULL ORDER BY id
+----
+2
+4
+
+query
+SELECT id FROM nse_demo WHERE v <=> 20 ORDER BY id
+----
+3
+
+# Per-row result of comparing against a fixed value.
+query
+SELECT id, v <=> 10 FROM nse_demo ORDER BY id
+----
+1	1
+2	0
+3	0
+4	0

@@ -58,6 +58,8 @@ impl<'a> Lexer<'a> {
             b'=' => self.single(Token::Eq),
             b'*' => self.single(Token::Star),
             b'<' => match self.peek_at(1) {
+                // `<=>` (NULL-safe equality) must be checked before `<=`.
+                Some(b'=') if self.peek_at(2) == Some(b'>') => self.triple(Token::Spaceship),
                 Some(b'=') => self.double(Token::Le),
                 Some(b'>') => self.double(Token::Ne),
                 Some(b'<') => self.double(Token::ShiftLeft),
@@ -92,6 +94,11 @@ impl<'a> Lexer<'a> {
 
     fn double(&mut self, token: Token) -> Token {
         self.pos += 2;
+        token
+    }
+
+    fn triple(&mut self, token: Token) -> Token {
+        self.pos += 3;
         token
     }
 

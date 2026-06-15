@@ -308,6 +308,7 @@ diverge are deliberately excluded.
 | Construct                              | Status | Comment |
 |----------------------------------------|--------|---------|
 | Comparisons `= <> != < <= > >=`        | ✅     |         |
+| `<=>` (NULL-safe equality)             | ✅     | Lowered to `CASE WHEN a IS NULL AND b IS NULL THEN 1 WHEN a IS NULL OR b IS NULL THEN 0 ELSE a = b END` — 1 if both NULL, 0 if exactly one, the ordinary equality otherwise; never NULL, as in MySQL. |
 | `AND` / `OR` / `NOT`, parentheses      | ✅     |         |
 | `IS [NOT] NULL`                        | ✅     |         |
 | Arithmetic `+` `-` `*`                 | ✅     |         |

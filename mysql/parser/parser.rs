@@ -2187,6 +2187,13 @@ impl Parser {
             return Err(self.unexpected("`IN`, `BETWEEN`, `LIKE`, or `REGEXP` after `NOT`"));
         }
 
+        // `a <=> b` — NULL-safe equality, at the comparison tier.
+        if self.is(&Token::Spaceship) {
+            self.advance();
+            let rhs = self.bitor_expr()?;
+            return Ok(null_safe_equals(lhs, rhs));
+        }
+
         let op = match self.peek() {
             Some(Token::Eq) => ast::Operator::Equals,
             Some(Token::Ne) => ast::Operator::NotEquals,
@@ -4579,6 +4586,42 @@ fn pad_expr(left: bool, target: ast::Expr, len: ast::Expr, pad: ast::Expr) -> as
         ast::Expr::binary(target, ast::Operator::Concat, filler)
     };
     substr_fn(body, one(), len)
+}
+
+/// Builds the lowering for MySQL's `a <=> b` (NULL-safe equality):
+/// `CASE WHEN a IS NULL AND b IS NULL THEN 1
+///       WHEN a IS NULL OR b IS NULL THEN 0 ELSE a = b END`.
+///
+/// It yields 1 when both sides are NULL, 0 when exactly one is, and the ordinary
+/// equality otherwise — never NULL, as in MySQL. The lowering uses only `IS
+/// NULL`, `=`, `AND`, and `OR`, so it needs no engine support for a general `IS`
+/// operator.
+fn null_safe_equals(a: ast::Expr, b: ast::Expr) -> ast::Expr {
+    let both_null = ast::Expr::binary(
+        ast::Expr::is_null(a.clone()),
+        ast::Operator::And,
+        ast::Expr::is_null(b.clone()),
+    );
+    let either_null = ast::Expr::binary(
+        ast::Expr::is_null(a.clone()),
+        ast::Operator::Or,
+        ast::Expr::is_null(b.clone()),
+    );
+    let equal = ast::Expr::binary(a, ast::Operator::Equals, b);
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (
+                Box::new(both_null),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+            ),
+            (
+                Box::new(either_null),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
+            ),
+        ],
+        else_expr: Some(Box::new(equal)),
+    }
 }
 
 /// Builds `a - b * CAST(a / b AS INTEGER)` — the MySQL remainder, which takes
@@ -7009,6 +7052,43 @@ mod tests {
             parse_expr("ELT(1)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn null_safe_equal_lowers_to_case() {
+        // a <=> b -> CASE WHEN a IS NULL AND b IS NULL THEN 1
+        //                 WHEN a IS NULL OR b IS NULL THEN 0 ELSE a = b END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("a <=> b").unwrap()
+        else {
+            panic!("expected <=> to lower to a CASE");
+        };
+        assert!(base.is_none());
+        assert_eq!(when_then_pairs.len(), 2);
+        // The two WHEN results are 1 (both NULL) then 0 (either NULL).
+        assert_eq!(*when_then_pairs[0].1, num("1"));
+        assert_eq!(*when_then_pairs[1].1, num("0"));
+        // The ELSE is the ordinary equality.
+        assert_eq!(
+            *else_expr.unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::Equals, col("b"))
+        );
+
+        // The new `<=>` lexing does not disturb `<=`, `>=`, or `<>`.
+        for (sql, op) in [
+            ("a <= b", ast::Operator::LessEquals),
+            ("a >= b", ast::Operator::GreaterEquals),
+            ("a <> b", ast::Operator::NotEquals),
+        ] {
+            assert_eq!(
+                parse_expr(sql).unwrap(),
+                ast::Expr::binary(col("a"), op, col("b")),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
