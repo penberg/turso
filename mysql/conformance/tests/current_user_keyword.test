@@ -1,0 +1,22 @@
+# The parenthesis-less CURRENT_USER keyword.
+#
+# CURRENT_USER is a SQL-standard niladic keyword, valid in MySQL without
+# parentheses (unlike USER / SESSION_USER / SYSTEM_USER, which require them). The
+# front-end previously treated the bare keyword as a column reference ("no such
+# column: CURRENT_USER"); it now folds it to the same value as CURRENT_USER().
+#
+# The actual user value is server-specific, so the test asserts the bare form
+# equals the parenthesized form and is non-empty -- relationships that hold on
+# both turso-mysql-server and a real mysqld. This test needs no tables.
+
+# The bare keyword equals the parenthesized function form.
+query
+SELECT CURRENT_USER = CURRENT_USER(), CURRENT_USER IS NOT NULL, LENGTH(CURRENT_USER) > 0
+----
+1	1	1
+
+# Usable as a bare keyword inside an expression / WHERE.
+query
+SELECT id FROM (SELECT 1 AS id) x WHERE CURRENT_USER = CURRENT_USER()
+----
+1

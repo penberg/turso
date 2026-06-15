@@ -2899,6 +2899,15 @@ impl Parser {
                             vec![ast::Expr::Literal(ast::Literal::String(requote("now")))],
                         ))
                     }
+                    // `CURRENT_USER` is likewise a SQL-standard niladic keyword,
+                    // valid without parentheses; it folds to the same literal as
+                    // `CURRENT_USER()`. (`USER`/`SESSION_USER`/`SYSTEM_USER` require
+                    // parentheses in MySQL, so they stay function-only.)
+                    "CURRENT_USER" if self.peek_nth(1) != Some(&Token::LParen) => {
+                        self.advance();
+                        Ok(introspection_literal("CURRENT_USER")
+                            .expect("CURRENT_USER is an introspection keyword"))
+                    }
                     // A bare identifier followed by `(` is a function call;
                     // otherwise it is a column reference.
                     _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
@@ -8098,6 +8107,29 @@ mod tests {
             parse_expr("CURRENT_TIMESTAMP").unwrap(),
             parse_expr("CURRENT_TIMESTAMP()").unwrap()
         );
+    }
+
+    #[test]
+    fn bare_current_user_folds_like_the_function() {
+        // `CURRENT_USER` works without parentheses and folds to the same literal
+        // as `CURRENT_USER()`.
+        assert_eq!(
+            parse_expr("CURRENT_USER").unwrap(),
+            parse_expr("CURRENT_USER()").unwrap()
+        );
+        assert!(matches!(
+            parse_expr("CURRENT_USER").unwrap(),
+            ast::Expr::Literal(ast::Literal::String(_))
+        ));
+
+        // `USER` / `SESSION_USER` / `SYSTEM_USER` require parentheses in MySQL, so
+        // the bare forms stay column references (not the user literal).
+        for input in ["USER", "SESSION_USER", "SYSTEM_USER"] {
+            assert!(
+                matches!(parse_expr(input).unwrap(), ast::Expr::Id(_)),
+                "expected bare `{input}` to be a column reference"
+            );
+        }
     }
 
     #[test]
