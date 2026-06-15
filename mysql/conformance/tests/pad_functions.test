@@ -1,0 +1,69 @@
+# LPAD(str, len, pad) / RPAD(str, len, pad) conformance.
+#
+# LPAD/RPAD pad str to len characters using pad on the left/right; if str is
+# longer than len it is truncated to its left len characters. The engine has no
+# lpad/rpad, so the front-end synthesizes them from REPEAT, substr and ||:
+#   RPAD -> substr(str || REPEAT(pad, len), 1, len)
+#   LPAD -> substr(substr(REPEAT(pad, len), 1, len - length(str)) || str, 1, len)
+# Padding cycles pad as needed, and NULL in any argument propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name; results are bracketed with CONCAT so padding is visible.
+
+# Padding cycles the fill string to reach the length.
+query
+SELECT RPAD('hi', 5, 'ab'), LPAD('hi', 5, 'ab')
+----
+hiaba	abahi
+
+# A common zero-pad of a number.
+query
+SELECT RPAD('7', 3, '0'), LPAD('7', 3, '0')
+----
+700	007
+
+# When str is longer than len it is truncated to its left len characters (both
+# directions truncate the same way, as in MySQL).
+query
+SELECT RPAD('hello', 3, 'x'), LPAD('hello', 3, 'x')
+----
+hel	hel
+
+# A length equal to the string length leaves it unchanged.
+query
+SELECT RPAD('hi', 2, 'x'), LPAD('hi', 2, 'x')
+----
+hi	hi
+
+# Single-character fill, bracketed so the padding is visible.
+query
+SELECT CONCAT('[', RPAD('a', 4, '-'), ']'), CONCAT('[', LPAD('a', 4, '-'), ']')
+----
+[a---]	[---a]
+
+# A length of zero gives the empty string.
+query
+SELECT CONCAT('[', RPAD('hi', 0, 'x'), ']'), CONCAT('[', LPAD('hi', 0, 'x'), ']')
+----
+[]	[]
+
+# NULL in any argument propagates -- including a NULL fill when str would be
+# truncated (LPAD('hello', 3, NULL)).
+query
+SELECT RPAD(NULL, 5, 'x'), LPAD('hi', NULL, 'x'), RPAD('hi', 5, NULL), LPAD('hello', 3, NULL)
+----
+NULL	NULL	NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS pad_demo (id INT PRIMARY KEY, code VARCHAR(10))
+
+statement ok
+INSERT INTO pad_demo (id, code) VALUES (1, '5'), (2, '42'), (3, '999')
+
+query
+SELECT id, LPAD(code, 4, '0') FROM pad_demo ORDER BY id
+----
+1	0005
+2	0042
+3	0999

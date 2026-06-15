@@ -2601,6 +2601,15 @@ impl Parser {
             return self.space_call();
         }
 
+        // `LPAD`/`RPAD` pad a string to a length with a fill string; synthesize
+        // them from `REPEAT`, `substr`, and `||` (see `pad_expr`).
+        if upper == "LPAD" {
+            return self.pad_call(true);
+        }
+        if upper == "RPAD" {
+            return self.pad_call(false);
+        }
+
         // `INSTR(str, substr)` and `LOCATE(substr, str)` (note the swapped
         // operand order) find the 1-based position of a substring. MySQL's are
         // case-insensitive under the default collation, so both lower to
@@ -3582,6 +3591,19 @@ impl Parser {
         Ok(repeat_expr(space, n))
     }
 
+    /// Lowers `LPAD(str, len, pad)` / `RPAD(str, len, pad)` (the name and `(` are
+    /// already consumed) via [`pad_expr`]; `left` is true for `LPAD`. Exactly
+    /// three arguments are required.
+    fn pad_call(&mut self, left: bool) -> Result<ast::Expr> {
+        let target = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let len = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let pad = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(pad_expr(left, target, len, pad))
+    }
+
     /// Lowers `LAST_DAY(d)` (the name and `(` are already consumed) to
     /// `date(d, 'start of month', '+1 month', '-1 day')`, which the engine's
     /// date modifiers evaluate to the last day of `d`'s month — matching MySQL,
@@ -3980,6 +4002,53 @@ fn repeat_expr(s: ast::Expr, n: ast::Expr) -> ast::Expr {
         )],
         else_expr: Some(Box::new(repeated)),
     }
+}
+
+/// Builds `substr(s, start, len)`.
+fn substr_fn(s: ast::Expr, start: ast::Expr, len: ast::Expr) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string("substr"),
+        distinctness: None,
+        args: vec![Box::new(s), Box::new(start), Box::new(len)],
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// Builds the lowering for `LPAD`/`RPAD`: pad `target` to `len` characters using
+/// `pad`, on the left when `left` is true, otherwise the right.
+///
+/// `REPEAT(pad, len)` makes at least `len` characters of padding (each copy of
+/// `pad` is one or more chars). For `RPAD`, `substr(target || REPEAT(pad, len),
+/// 1, len)` appends the padding then keeps the first `len` chars — which also
+/// truncates a too-long `target` to its left `len` chars, like MySQL. For
+/// `LPAD`, `substr(substr(REPEAT(pad, len), 1, len - length(target)) || target,
+/// 1, len)` takes exactly the missing number of pad chars, prepends them, and
+/// the same outer `substr` truncates when `target` is too long (the inner length
+/// goes non-positive, contributing no padding). NULL in any argument propagates,
+/// because the padding is always concatenated with `target` before truncation.
+/// `length()` here is the engine's character count, matching MySQL's per-char
+/// padding. (A negative `len` yields the empty string rather than MySQL's NULL,
+/// and an empty `pad` yields `target` unchanged — minor documented edges.)
+fn pad_expr(left: bool, target: ast::Expr, len: ast::Expr, pad: ast::Expr) -> ast::Expr {
+    let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+    let filler = repeat_expr(pad, len.clone());
+    let body = if left {
+        let fill_len = ast::Expr::binary(
+            len.clone(),
+            ast::Operator::Subtract,
+            unary_fn("length", target.clone()),
+        );
+        let fill = substr_fn(filler, one(), fill_len);
+        ast::Expr::binary(fill, ast::Operator::Concat, target)
+    } else {
+        ast::Expr::binary(target, ast::Operator::Concat, filler)
+    };
+    substr_fn(body, one(), len)
 }
 
 /// Builds `a - b * CAST(a / b AS INTEGER)` — the MySQL remainder, which takes
@@ -6414,6 +6483,32 @@ mod tests {
             parse_expr("SPACE(n)").unwrap(),
             parse_expr("REPEAT(' ', n)").unwrap()
         );
+    }
+
+    #[test]
+    fn pad_lowers_to_substr_of_repeat() {
+        // Both LPAD and RPAD lower to an outer substr(..., 1, len) over a
+        // concatenation involving REPEAT(pad, len).
+        for sql in ["LPAD(s, n, p)", "RPAD(s, n, p)"] {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a function call");
+            };
+            assert_eq!(name.as_str(), "substr", "{sql}");
+            assert_eq!(args.len(), 3, "{sql}");
+            // substr starts at 1 and runs for `len`.
+            assert_eq!(*args[1], num("1"), "{sql}");
+            assert_eq!(*args[2], col("n"), "{sql}");
+        }
+
+        // LPAD prepends, RPAD appends, so the two differ.
+        assert_ne!(
+            parse_expr("LPAD(s, n, p)").unwrap(),
+            parse_expr("RPAD(s, n, p)").unwrap()
+        );
+
+        // Both require exactly three arguments.
+        assert!(parse_expr("LPAD(s, n)").is_err());
+        assert!(parse_expr("RPAD(s, n)").is_err());
     }
 
     #[test]
