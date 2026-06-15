@@ -50,6 +50,37 @@ impl Parser {
         Ok(stmt)
     }
 
+    /// Parses the input into one or more statements. This differs from
+    /// [`Self::parse_statement`] only for a multi-table `DROP TABLE a, b, ...`,
+    /// which has no single-statement engine form and is expanded into one
+    /// `DROP TABLE` per table for the caller to run in sequence; every other
+    /// input yields exactly one statement.
+    pub fn parse_statement_list(&mut self) -> Result<Vec<ast::Stmt>> {
+        let stmts = self.statement_list()?;
+        while self.eat(&Token::Semicolon) {}
+        if self.pos < self.tokens.len() {
+            return Err(self.unexpected("end of input"));
+        }
+        Ok(stmts)
+    }
+
+    fn statement_list(&mut self) -> Result<Vec<ast::Stmt>> {
+        // `DROP [TEMPORARY] TABLE` may list several tables; expand it. Everything
+        // else is a single statement.
+        if self.is_keyword("DROP") {
+            let temp = matches!(self.peek_nth(1), Some(Token::Word(w)) if w.eq_ignore_ascii_case("TEMPORARY"));
+            let table_at = if temp { 2 } else { 1 };
+            if matches!(self.peek_nth(table_at), Some(Token::Word(w)) if w.eq_ignore_ascii_case("TABLE"))
+            {
+                self.advance(); // DROP
+                let temporary = self.eat_keyword("TEMPORARY");
+                self.expect_keyword("TABLE")?;
+                return self.drop_table_list(temporary);
+            }
+        }
+        Ok(vec![self.statement()?])
+    }
+
     // === Statement dispatch ===
 
     fn statement(&mut self) -> Result<ast::Stmt> {
@@ -927,7 +958,7 @@ impl Parser {
             false
         };
 
-        let mut tbl_name = self.qualified_name()?;
+        let tbl_name = self.qualified_name()?;
 
         if self.is(&Token::Comma) {
             return Err(ParseError::Unsupported(
@@ -940,21 +971,36 @@ impl Parser {
             ));
         }
 
-        if temporary {
-            if tbl_name.db_name.is_some() {
-                return Err(ParseError::Unsupported(
-                    "DROP TEMPORARY TABLE with a schema qualifier is not supported yet".to_string(),
-                ));
-            }
-            // Resolve against the temp schema only, so a base table of the same
-            // name is never dropped.
-            tbl_name = ast::QualifiedName::fullname(ast::Name::from_string("temp"), tbl_name.name);
-        }
+        make_drop_table(temporary, if_exists, tbl_name)
+    }
 
-        Ok(ast::Stmt::DropTable {
-            if_exists,
-            tbl_name,
-        })
+    /// Parses the comma-separated table list of a multi-table `DROP [TEMPORARY]
+    /// TABLE [IF EXISTS] a, b, ...` (the `DROP [TEMPORARY] TABLE` keywords already
+    /// consumed) into one [`ast::Stmt::DropTable`] per table — MySQL drops them
+    /// in one statement, but the engine has no multi-table `DROP`, so the caller
+    /// (the statement-list entry point) runs the produced statements in sequence.
+    fn drop_table_list(&mut self, temporary: bool) -> Result<Vec<ast::Stmt>> {
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let mut stmts = Vec::new();
+        loop {
+            let tbl_name = self.qualified_name()?;
+            stmts.push(make_drop_table(temporary, if_exists, tbl_name)?);
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        if self.is_keyword("RESTRICT") || self.is_keyword("CASCADE") {
+            return Err(ParseError::Unsupported(
+                "DROP TABLE RESTRICT / CASCADE is not supported yet".to_string(),
+            ));
+        }
+        Ok(stmts)
     }
 
     // === INSERT ===
@@ -4796,6 +4842,30 @@ fn coalesce_truthiness(expr: ast::Expr, op: ast::Operator, default: &str) -> ast
             over_clause: None,
         },
     }
+}
+
+/// Builds a single `DROP TABLE` statement, applying MySQL's `DROP TEMPORARY
+/// TABLE` semantics: a temporary drop is qualified onto the engine's `temp`
+/// schema so it never touches a base table of the same name (a schema qualifier
+/// on a temporary drop is rejected). Shared by the single- and multi-table
+/// `DROP TABLE` paths.
+fn make_drop_table(
+    temporary: bool,
+    if_exists: bool,
+    mut tbl_name: ast::QualifiedName,
+) -> Result<ast::Stmt> {
+    if temporary {
+        if tbl_name.db_name.is_some() {
+            return Err(ParseError::Unsupported(
+                "DROP TEMPORARY TABLE with a schema qualifier is not supported yet".to_string(),
+            ));
+        }
+        tbl_name = ast::QualifiedName::fullname(ast::Name::from_string("temp"), tbl_name.name);
+    }
+    Ok(ast::Stmt::DropTable {
+        if_exists,
+        tbl_name,
+    })
 }
 
 /// Maps a MySQL date/time interval unit to the engine's `datetime()` modifier
@@ -8992,6 +9062,8 @@ mod tests {
 
     #[test]
     fn drop_table_unsupported_variants() {
+        // `parse` is single-statement: a multi-table drop has no single engine
+        // form, so it is rejected here (it is expanded by `parse_statement_list`).
         for sql in [
             "DROP TABLE a, b",
             "DROP TABLE t RESTRICT",
@@ -9004,6 +9076,47 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn multi_table_drop_expands_to_one_per_table() {
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+
+        // `DROP TABLE a, b, c` -> three DropTable statements.
+        let stmts = parse_all("DROP TABLE a, b, c").unwrap();
+        assert_eq!(stmts.len(), 3);
+        let names: Vec<_> = stmts
+            .iter()
+            .map(|s| match s {
+                ast::Stmt::DropTable {
+                    if_exists,
+                    tbl_name,
+                } => {
+                    assert!(!if_exists);
+                    tbl_name.name.as_str().to_string()
+                }
+                _ => panic!("expected DropTable"),
+            })
+            .collect();
+        assert_eq!(names, ["a", "b", "c"]);
+
+        // IF EXISTS applies to every table.
+        let stmts = parse_all("DROP TABLE IF EXISTS a, b").unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts.iter().all(|s| matches!(
+            s,
+            ast::Stmt::DropTable {
+                if_exists: true,
+                ..
+            }
+        )));
+
+        // A single-table drop yields one statement; a non-DROP yields one too.
+        assert_eq!(parse_all("DROP TABLE a").unwrap().len(), 1);
+        assert_eq!(parse_all("SELECT 1").unwrap().len(), 1);
+
+        // RESTRICT/CASCADE on a multi-table drop is still rejected.
+        assert!(parse_all("DROP TABLE a, b RESTRICT").is_err());
     }
 
     #[test]

@@ -41,3 +41,11 @@ pub use parser::Parser;
 pub fn parse(sql: &str) -> Result<ast::Stmt> {
     Parser::new(sql.as_bytes())?.parse_statement()
 }
+
+/// Parses MySQL into one or more statements. Identical to [`parse`] except that a
+/// multi-table `DROP TABLE a, b, ...` — which has no single-statement engine form
+/// — is expanded into one `DROP TABLE` per table for the caller to run in
+/// sequence. Every other input yields a single-element vector.
+pub fn parse_all(sql: &str) -> Result<Vec<ast::Stmt>> {
+    Parser::new(sql.as_bytes())?.parse_statement_list()
+}

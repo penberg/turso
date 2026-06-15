@@ -274,11 +274,27 @@ fn run_query(
         };
     }
 
-    let stmt = match turso_mysql_parser::parse(sql) {
-        Ok(stmt) => stmt,
+    let mut stmts = match turso_mysql_parser::parse_all(sql) {
+        Ok(stmts) => stmts,
         Err(e) => return parse_error_response(first_seq, &e),
     };
     debug!(%sql, "parsed by mysql front-end");
+
+    // More than one statement comes only from a multi-table `DROP TABLE a, b`,
+    // which the front-end expands into one `DROP TABLE` per table (the engine has
+    // no multi-table drop). Run each for side effects and reply with a single OK;
+    // a failure on any table returns its error.
+    if stmts.len() != 1 {
+        for stmt in stmts {
+            if let Err(e) = run_for_side_effects(conn, stmt) {
+                return error_response(first_seq, &e);
+            }
+        }
+        let mut out = Vec::new();
+        encode_frame(&mut out, first_seq, &OkPacket::default().encode());
+        return out;
+    }
+    let stmt = stmts.pop().expect("exactly one statement");
 
     // `SELECT SQL_CALC_FOUND_ROWS ... LIMIT n` returns the limited rows, but
     // also sets `FOUND_ROWS()` to the count the query would return without its

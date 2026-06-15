@@ -237,7 +237,7 @@ incomplete.
 | DROP TABLE *tbl_name* (single table)   | ✅     |         |
 | DROP TABLE ... IF EXISTS               | ✅     | Dropping a non-existent table is a no-op success, as in MySQL. |
 | DROP TEMPORARY TABLE [IF EXISTS]       | ✅     | Qualified onto the engine's temp schema so it drops only the temporary table, never a base table of the same name. A schema-qualified name (`db.t`) is rejected. |
-| DROP TABLE *t1, t2, ...* (multiple)    | ❌     | **Not supported** — only a single table per statement. |
+| DROP TABLE *t1, t2, ...* (multiple)    | ✅     | The front-end expands the list into one `DROP TABLE` per table, which the server runs in sequence (the engine has no multi-table drop). `IF EXISTS` applies to every table. Matches MySQL's non-atomic semantics — tables before a failing one are still dropped. |
 | DROP TABLE ... RESTRICT / CASCADE      | ❌     | **Not supported** — rejected as unsupported (no-ops in MySQL). |
 | DROP TABLESPACE                        | ❌     |         |
 | DROP TRIGGER                           | ❌     |         |

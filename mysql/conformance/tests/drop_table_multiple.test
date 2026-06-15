@@ -1,0 +1,57 @@
+# Multi-table DROP TABLE conformance.
+#
+# MySQL drops several tables in one statement: DROP TABLE a, b, c. The engine has
+# no multi-table DROP, so the front-end expands the list into one DROP TABLE per
+# table, which the server runs in sequence (matching MySQL's non-atomic drop --
+# tables before a failing one are still dropped). IF EXISTS applies to every
+# table. WordPress uninstall routines and dbDelta drop multiple tables this way.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS mdt_a (x INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS mdt_b (x INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS mdt_c (x INT)
+
+statement ok
+INSERT INTO mdt_c (x) VALUES (1)
+
+# Drop two of the three in one statement.
+statement ok
+DROP TABLE mdt_a, mdt_b
+
+# The dropped tables are gone.
+statement error
+SELECT * FROM mdt_a
+
+statement error
+SELECT * FROM mdt_b
+
+# The third table is untouched.
+query
+SELECT x FROM mdt_c
+----
+1
+
+# IF EXISTS applies to every table: the existing one is dropped and the missing
+# one is silently skipped.
+statement ok
+DROP TABLE IF EXISTS mdt_c, mdt_never_existed
+
+statement error
+SELECT * FROM mdt_c
+
+# A single-table DROP still works after the multi-table path.
+statement ok
+CREATE TABLE IF NOT EXISTS mdt_d (x INT)
+
+statement ok
+DROP TABLE mdt_d
+
+statement error
+SELECT * FROM mdt_d
