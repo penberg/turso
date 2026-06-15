@@ -2233,6 +2233,12 @@ impl Parser {
             return self.date_format_call();
         }
 
+        // `DATEDIFF(a, b)` is the whole-day difference `a - b`, ignoring the time
+        // parts, which is `CAST(julianday(date(a)) - julianday(date(b)) AS INTEGER)`.
+        if upper == "DATEDIFF" {
+            return self.datediff_call();
+        }
+
         // Current date/time functions (`NOW()`, `CURDATE()`, ...) lower to the
         // engine's `datetime('now')` / `date('now')` / `time('now')`.
         if let Some(engine_fn) = current_time_function(&upper) {
@@ -2776,6 +2782,33 @@ impl Parser {
         })
     }
 
+    /// Lowers `DATEDIFF(a, b)` (the name and `(` are already consumed) to
+    /// `CAST(julianday(date(a)) - julianday(date(b)) AS INTEGER)`. MySQL's
+    /// `DATEDIFF` is the whole-day count `a - b` using only the date parts, so
+    /// each operand is reduced to its date with `date()` before taking the
+    /// Julian-day difference; both dates land on midnight, so the difference is
+    /// an exact integer. NULL propagates. Exactly two arguments are required.
+    fn datediff_call(&mut self) -> Result<ast::Expr> {
+        let a = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let b = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let diff = ast::Expr::binary(
+            unary_fn("julianday", unary_fn("date", a)),
+            ast::Operator::Subtract,
+            unary_fn("julianday", unary_fn("date", b)),
+        );
+        Ok(ast::Expr::Cast {
+            expr: Box::new(diff),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        })
+    }
+
     /// Lowers `UNIX_TIMESTAMP([d])` to the engine's `unixepoch(...)`: with an
     /// argument, the epoch of that datetime; with none, the current epoch
     /// (`unixepoch('now')`). The engine treats the datetime as UTC (see
@@ -2998,6 +3031,21 @@ fn named(constraint: ast::ColumnConstraint) -> ast::NamedColumnConstraint {
 
 fn numeric_expr(value: &str) -> Box<ast::Expr> {
     Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())))
+}
+
+/// Builds a single-argument engine function call, e.g. `julianday(arg)`.
+fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: vec![Box::new(arg)],
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
 }
 
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
@@ -4566,6 +4614,28 @@ mod tests {
                 parse_expr(&format!("WEEK(d, {mode})")).is_err(),
                 "WEEK mode {mode} should be unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn datediff_lowers_to_julianday_difference() {
+        // DATEDIFF(a, b) -> CAST(julianday(date(a)) - julianday(date(b)) AS INTEGER).
+        let ast::Expr::Cast { expr, type_name } = parse_expr("DATEDIFF(d1, d2)").unwrap() else {
+            panic!("expected DATEDIFF to lower to a CAST");
+        };
+        assert_eq!(type_name.unwrap().name, "INTEGER");
+        let ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) = expr.as_ref() else {
+            panic!("expected a subtraction inside the cast");
+        };
+        for side in [lhs.as_ref(), rhs.as_ref()] {
+            let ast::Expr::FunctionCall { name, args, .. } = side else {
+                panic!("expected julianday(...) on each side");
+            };
+            assert_eq!(name.as_str(), "julianday");
+            assert!(matches!(
+                args[0].as_ref(),
+                ast::Expr::FunctionCall { name, .. } if name.as_str() == "date"
+            ));
         }
     }
 

@@ -1,0 +1,53 @@
+# DATEDIFF(a, b) conformance.
+#
+# MySQL's DATEDIFF(a, b) is the whole-day difference a - b, using only the date
+# parts of its arguments (the time of day is ignored). The front-end lowers it
+# to CAST(julianday(date(a)) - julianday(date(b)) AS INTEGER): reducing each
+# operand to its date lands both on midnight, so the Julian-day difference is an
+# exact integer. NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS dd_demo (a INT PRIMARY KEY, d1 DATETIME, d2 DATETIME)
+
+statement ok
+INSERT INTO dd_demo (a, d1, d2) VALUES
+  (1, '2020-01-03', '2020-01-01'),
+  (2, '2020-01-01', '2020-01-03'),
+  (3, '2020-01-01', '2020-01-01'),
+  (4, '2021-01-01', '2020-01-01')
+
+query
+SELECT a, DATEDIFF(d1, d2) FROM dd_demo ORDER BY a
+----
+1	2
+2	-2
+3	0
+4	366
+
+# The time of day is ignored: only the date parts count.
+query
+SELECT DATEDIFF('2020-01-03 23:59:59', '2020-01-01 00:00:01')
+----
+2
+
+# Literal forms, including a single-day difference and a month boundary.
+query
+SELECT DATEDIFF('2020-03-01', '2020-02-28'), DATEDIFF('2020-02-29', '2020-03-01')
+----
+2	-1
+
+# NULL in either argument yields NULL.
+query
+SELECT DATEDIFF(NULL, '2020-01-01'), DATEDIFF('2020-01-01', NULL)
+----
+NULL	NULL
+
+# Usable in a WHERE predicate.
+query
+SELECT a FROM dd_demo WHERE DATEDIFF(d1, d2) > 0 ORDER BY a
+----
+1
+4
