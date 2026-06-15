@@ -1,0 +1,59 @@
+# Table-option ALTER TABLE statements (accepted as no-ops).
+#
+# A pure table-option ALTER -- ENGINE=, CONVERT TO CHARACTER SET, DEFAULT
+# CHARSET=, ROW_FORMAT=, AUTO_INCREMENT=, COMMENT=, ... -- has no effect on the
+# engine's fixed storage and single (UTF-8) charset, exactly as the same options
+# are ignored on CREATE TABLE. The front-end previously rejected these; it now
+# accepts them as a no-op (the statement succeeds and the table is unchanged).
+# WordPress's upgrade path issues `ALTER TABLE ... CONVERT TO CHARACTER SET
+# utf8mb4`, and plugins set `ENGINE=`.
+#
+# Each statement succeeds and leaves the data intact on both turso-mysql-server
+# and a real mysqld (AUTO_INCREMENT= is ignored rather than reseating the
+# counter -- a documented divergence not exercised here). Uses its own table.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ato (id INT PRIMARY KEY, c INT)
+
+statement ok
+INSERT INTO ato (id, c) VALUES (1, 10), (2, 20)
+
+statement ok
+ALTER TABLE ato ENGINE=InnoDB
+
+statement ok
+ALTER TABLE ato CONVERT TO CHARACTER SET utf8mb4
+
+statement ok
+ALTER TABLE ato CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+
+statement ok
+ALTER TABLE ato DEFAULT CHARSET=utf8mb4
+
+statement ok
+ALTER TABLE ato ROW_FORMAT=DYNAMIC
+
+statement ok
+ALTER TABLE ato AUTO_INCREMENT=1000
+
+statement ok
+ALTER TABLE ato COMMENT='a demo table'
+
+statement ok
+ALTER TABLE ato ENGINE=InnoDB ROW_FORMAT=DYNAMIC
+
+# The table and its data are unchanged after all the no-op options.
+query
+SELECT id, c FROM ato ORDER BY id
+----
+1	10
+2	20
+
+# Real column operations still work afterwards.
+statement ok
+ALTER TABLE ato ADD COLUMN note VARCHAR(20) DEFAULT 'n'
+
+query
+SELECT id, note FROM ato WHERE id = 1
+----
+1	n

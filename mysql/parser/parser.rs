@@ -92,6 +92,22 @@ impl Parser {
             self.advance(); // ALTER
             self.expect_keyword("TABLE")?;
             let name = self.qualified_name()?;
+
+            // A pure table-option ALTER -- `ENGINE=`, `CONVERT TO CHARACTER SET`,
+            // `DEFAULT CHARSET=`, `ROW_FORMAT=`, `AUTO_INCREMENT=`, `COMMENT=`, ...
+            // -- has no effect on the engine's fixed storage and single charset,
+            // exactly as the same options are ignored on `CREATE TABLE`. WordPress
+            // issues `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4` (and
+            // plugins set `ENGINE=`). Accept it as a no-op: consume the rest and
+            // emit no statements, so the server replies OK without touching the
+            // table. (`AUTO_INCREMENT=` is also ignored, a documented divergence.)
+            if matches!(self.peek(), Some(Token::Word(w)) if is_table_option_keyword(w)) {
+                while self.pos < self.tokens.len() && !self.is(&Token::Semicolon) {
+                    self.advance();
+                }
+                return Ok(Vec::new());
+            }
+
             let mut stmts = vec![self.alter_operation(name.clone())?];
             while self.eat(&Token::Comma) {
                 stmts.push(self.alter_operation(name.clone())?);
@@ -5857,6 +5873,41 @@ fn is_column_constraint_keyword(word: &str) -> bool {
     )
 }
 
+/// Whether `word` begins a table-level option in `ALTER TABLE` (`ENGINE=`,
+/// `CONVERT TO CHARACTER SET`, `DEFAULT CHARSET=`, `ROW_FORMAT=`,
+/// `AUTO_INCREMENT=`, `COMMENT=`, and the storage/statistics knobs). These have
+/// no effect on the engine and are accepted as a no-op when they make up the
+/// whole `ALTER TABLE` (the same options are ignored on `CREATE TABLE`). None of
+/// these overlaps the column-operation keywords (`ADD`/`DROP`/`RENAME`/`CHANGE`/
+/// `MODIFY`/`ALTER`), so a leading one unambiguously marks a table-option ALTER.
+fn is_table_option_keyword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "ENGINE"
+            | "CONVERT"
+            | "DEFAULT"
+            | "CHARSET"
+            | "CHARACTER"
+            | "COLLATE"
+            | "ROW_FORMAT"
+            | "AUTO_INCREMENT"
+            | "COMMENT"
+            | "PACK_KEYS"
+            | "CHECKSUM"
+            | "DELAY_KEY_WRITE"
+            | "MAX_ROWS"
+            | "MIN_ROWS"
+            | "AVG_ROW_LENGTH"
+            | "KEY_BLOCK_SIZE"
+            | "STATS_AUTO_RECALC"
+            | "STATS_PERSISTENT"
+            | "STATS_SAMPLE_PAGES"
+            | "TABLESPACE"
+            | "COMPRESSION"
+            | "ENCRYPTION"
+    )
+}
+
 /// Whether `word` is a keyword that may legitimately follow a table reference
 /// in a `FROM` clause, and therefore is **not** a bare table alias.
 fn is_reserved_after_table(word: &str) -> bool {
@@ -10300,6 +10351,33 @@ mod tests {
             parse("ALTER TABLE t ADD a INT, ADD b INT").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn table_option_alter_is_a_noop() {
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+
+        // A pure table-option ALTER expands to no statements (the server replies
+        // OK without touching the table).
+        for sql in [
+            "ALTER TABLE t ENGINE=InnoDB",
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4",
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            "ALTER TABLE t DEFAULT CHARSET=utf8mb4",
+            "ALTER TABLE t ROW_FORMAT=DYNAMIC",
+            "ALTER TABLE t AUTO_INCREMENT=100",
+            "ALTER TABLE t COMMENT='hi'",
+            "ALTER TABLE t ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        ] {
+            assert!(
+                parse_all(sql).unwrap().is_empty(),
+                "expected `{sql}` to be a no-op (no statements)"
+            );
+        }
+
+        // Column operations are unaffected -- they still expand normally.
+        assert_eq!(parse_all("ALTER TABLE t ADD a INT").unwrap().len(), 1);
+        assert_eq!(parse_all("ALTER TABLE t DROP COLUMN a").unwrap().len(), 1);
     }
 
     #[test]
