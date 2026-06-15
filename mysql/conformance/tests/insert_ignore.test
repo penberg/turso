@@ -1,0 +1,53 @@
+# INSERT IGNORE conformance.
+#
+# MySQL's INSERT IGNORE downgrades row-level errors — most importantly a
+# duplicate value on a PRIMARY KEY or UNIQUE index — to warnings and skips the
+# offending row instead of aborting the statement. That is exactly the engine's
+# INSERT OR IGNORE, so the front-end lowers the IGNORE modifier to it. The INTO
+# keyword stays optional and multi-row inserts keep the non-conflicting rows.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ins_ignore (id INT PRIMARY KEY, name VARCHAR(32) UNIQUE)
+
+statement ok
+INSERT IGNORE INTO ins_ignore (id, name) VALUES (1, 'a')
+
+# A duplicate PRIMARY KEY is ignored rather than rejected; the original row stays.
+statement ok
+INSERT IGNORE INTO ins_ignore (id, name) VALUES (1, 'b')
+
+query
+SELECT id, name FROM ins_ignore ORDER BY id
+----
+1	a
+
+# The INTO keyword is optional. A duplicate on the UNIQUE key is also ignored.
+statement ok
+INSERT IGNORE ins_ignore (id, name) VALUES (2, 'a')
+
+query
+SELECT id, name FROM ins_ignore ORDER BY id
+----
+1	a
+
+# In a multi-row insert, conflicting rows are skipped and fresh rows still land.
+# (1,'x') duplicates PK 1 and is ignored; the other three keys/names are free —
+# id 2 was never taken because the earlier (2,'a') lost on the UNIQUE name — so
+# they all insert.
+statement ok
+INSERT IGNORE INTO ins_ignore (id, name) VALUES (1, 'x'), (3, 'c'), (2, 'y'), (4, 'd')
+
+query
+SELECT id, name FROM ins_ignore ORDER BY id
+----
+1	a
+2	y
+3	c
+4	d
+
+# Without IGNORE, the same duplicate-key insert is an error.
+statement error
+INSERT INTO ins_ignore (id, name) VALUES (1, 'z')

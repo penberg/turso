@@ -644,8 +644,9 @@ impl Parser {
     // === INSERT ===
 
     /// Parses the basic `INSERT INTO tbl [(cols)] VALUES (...)[, (...)]` form.
-    /// `INSERT ... SELECT`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE`, and the
-    /// priority/`IGNORE` modifiers are rejected as unsupported.
+    /// `INSERT ... SELECT`, `INSERT ... SET`, and the priority modifiers
+    /// (`LOW_PRIORITY`/`DELAYED`/`HIGH_PRIORITY`) are rejected as unsupported;
+    /// `INSERT IGNORE` lowers to `INSERT OR IGNORE`.
     /// Parses an `INSERT ... VALUES` statement, or — when `or_conflict` is
     /// `Some(ResolveType::Replace)` — a `REPLACE ... VALUES` statement. MySQL's
     /// `REPLACE` deletes any row that conflicts on a primary/unique key before
@@ -657,13 +658,23 @@ impl Parser {
         } else {
             "INSERT"
         };
-        for modifier in ["LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE"] {
+        for modifier in ["LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY"] {
             if self.is_keyword(modifier) {
                 return Err(ParseError::Unsupported(format!(
                     "{kw} {modifier} is not supported yet"
                 )));
             }
         }
+
+        // `INSERT IGNORE` downgrades row-level errors — notably duplicate-key
+        // conflicts — to warnings and skips the offending row, which is exactly
+        // the engine's `INSERT OR IGNORE`. `REPLACE IGNORE` is not valid MySQL,
+        // so the modifier only applies when no conflict resolution is set yet.
+        let or_conflict = if or_conflict.is_none() && self.eat_keyword("IGNORE") {
+            Some(ast::ResolveType::Ignore)
+        } else {
+            or_conflict
+        };
 
         self.eat_keyword("INTO"); // `INTO` is optional in MySQL
         let tbl_name = self.qualified_name()?;
@@ -3595,13 +3606,27 @@ mod tests {
         for sql in [
             "INSERT INTO t SET a = 1",
             "INSERT INTO t SELECT * FROM u",
-            "INSERT IGNORE INTO t VALUES (1)",
             "INSERT DELAYED INTO t VALUES (1)",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn insert_ignore_lowers_to_insert_or_ignore() {
+        // `INSERT IGNORE [INTO]` becomes an INSERT with IGNORE conflict
+        // resolution; the optional `INTO` keyword does not change that.
+        for sql in [
+            "INSERT IGNORE INTO t (a) VALUES (1)",
+            "INSERT IGNORE t (a) VALUES (1)",
+        ] {
+            let ast::Stmt::Insert { or_conflict, .. } = parse(sql).unwrap() else {
+                panic!("expected Insert for `{sql}`");
+            };
+            assert_eq!(or_conflict, Some(ast::ResolveType::Ignore), "{sql}");
         }
     }
 
