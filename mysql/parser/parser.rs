@@ -53,6 +53,11 @@ impl Parser {
     // === Statement dispatch ===
 
     fn statement(&mut self) -> Result<ast::Stmt> {
+        // A statement beginning with `(` is a parenthesized leading select branch,
+        // e.g. `(SELECT ...) UNION (SELECT ...)`.
+        if self.is(&Token::LParen) {
+            return self.paren_select_statement();
+        }
         let keyword = match self.peek() {
             Some(Token::Word(w)) => w.to_ascii_uppercase(),
             None => return Err(ParseError::Empty),
@@ -1267,10 +1272,41 @@ impl Parser {
     /// subqueries.
     fn parse_select(&mut self) -> Result<ast::Select> {
         let first = self.parse_one_select()?;
+        self.finish_compound_select(first)
+    }
 
-        // Set-operation compounds. Each branch starts a fresh `SELECT`; the
-        // operators map straight onto the engine's identical semantics (`UNION`
-        // and `INTERSECT`/`EXCEPT` deduplicate; `UNION ALL` does not).
+    /// Parses a single compound-select branch — either a bare `SELECT ...` or a
+    /// parenthesized `(SELECT ...)`. MySQL allows each `UNION` branch to be
+    /// parenthesized (often the whole query is `(SELECT ...) UNION (SELECT ...)`);
+    /// the parentheses are purely grouping here and are stripped. A per-branch
+    /// `ORDER BY` / `LIMIT` inside the parentheses cannot be represented in the
+    /// engine's flat compound model and is rejected.
+    fn parse_compound_branch(&mut self) -> Result<ast::OneSelect> {
+        if self.eat(&Token::LParen) {
+            self.expect_keyword("SELECT")?;
+            let select = self.parse_one_select()?;
+            if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+                return Err(ParseError::Unsupported(
+                    "ORDER BY / LIMIT inside a parenthesized UNION branch is not supported yet"
+                        .to_string(),
+                ));
+            }
+            self.expect(&Token::RParen, "`)`")?;
+            Ok(select)
+        } else {
+            self.expect_keyword("SELECT")?;
+            self.parse_one_select()
+        }
+    }
+
+    /// Completes a compound select given its already-parsed first branch: the
+    /// `UNION`/`INTERSECT`/`EXCEPT` set-operation branches and the trailing
+    /// whole-result `ORDER BY` / `LIMIT`. Shared by the bare and the
+    /// leading-parenthesis (`(SELECT ...) UNION ...`) entry points.
+    fn finish_compound_select(&mut self, first: ast::OneSelect) -> Result<ast::Select> {
+        // Set-operation compounds. The operators map straight onto the engine's
+        // identical semantics (`UNION` and `INTERSECT`/`EXCEPT` deduplicate;
+        // `UNION ALL` does not). Each branch may be parenthesized.
         let mut compounds = Vec::new();
         loop {
             let operator = if self.eat_keyword("UNION") {
@@ -1286,8 +1322,7 @@ impl Parser {
             } else {
                 break;
             };
-            self.expect_keyword("SELECT")?;
-            let select = self.parse_one_select()?;
+            let select = self.parse_compound_branch()?;
             compounds.push(ast::CompoundSelect { operator, select });
         }
 
@@ -1310,6 +1345,23 @@ impl Parser {
             order_by,
             limit,
         })
+    }
+
+    /// Parses a statement that begins with `(` — a parenthesized leading select
+    /// branch, as in `(SELECT ...) UNION (SELECT ...)`. The first branch's parens
+    /// are stripped, then the rest of the compound is parsed normally.
+    fn paren_select_statement(&mut self) -> Result<ast::Stmt> {
+        self.expect(&Token::LParen, "`(`")?;
+        self.expect_keyword("SELECT")?;
+        let first = self.parse_one_select()?;
+        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+            return Err(ParseError::Unsupported(
+                "ORDER BY / LIMIT inside a parenthesized UNION branch is not supported yet"
+                    .to_string(),
+            ));
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Stmt::Select(self.finish_compound_select(first)?))
     }
 
     /// Consumes and discards an optional trailing row-locking clause —
@@ -7263,6 +7315,38 @@ mod tests {
             parse_expr("a <> b").unwrap(),
             ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
         );
+    }
+
+    #[test]
+    fn parenthesized_union_branches_parse() {
+        // A leading parenthesized branch parses as a compound Select, equivalent
+        // to the unparenthesized form.
+        let ast::Stmt::Select(paren) = parse("(SELECT a FROM t) UNION (SELECT b FROM u)").unwrap()
+        else {
+            panic!("expected a compound Select");
+        };
+        assert_eq!(paren.body.compounds.len(), 1);
+        assert_eq!(
+            paren.body.compounds[0].operator,
+            ast::CompoundOperator::Union
+        );
+        let ast::Stmt::Select(bare) = parse("SELECT a FROM t UNION SELECT b FROM u").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(paren.body, bare.body);
+
+        // A trailing ORDER BY applies to the whole result (one compound, ordered).
+        let ast::Stmt::Select(ordered) =
+            parse("(SELECT a FROM t) UNION (SELECT b FROM u) ORDER BY a").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(!ordered.order_by.is_empty());
+
+        // An inner ORDER BY / LIMIT in a parenthesized branch is rejected.
+        assert!(parse("(SELECT a FROM t ORDER BY a) UNION (SELECT b FROM u)").is_err());
+        assert!(parse("(SELECT a FROM t LIMIT 1) UNION (SELECT b FROM u)").is_err());
     }
 
     #[test]

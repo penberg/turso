@@ -1,0 +1,66 @@
+# Parenthesized UNION branches conformance.
+#
+# MySQL allows each branch of a UNION (or INTERSECT/EXCEPT) to be parenthesized,
+# and the whole query commonly looks like (SELECT ...) UNION (SELECT ...). The
+# parentheses are purely grouping when a branch has no inner ORDER BY/LIMIT, so
+# the front-end strips them and parses an ordinary compound select. A leading
+# parenthesis is also recognized at statement level.
+#
+# Scope: a per-branch ORDER BY/LIMIT inside the parentheses cannot be represented
+# in the engine's flat compound model and is rejected (covered by a parser unit
+# test).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS pu_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO pu_demo (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+# Both branches parenthesized.
+query
+(SELECT id FROM pu_demo WHERE id = 1) UNION (SELECT id FROM pu_demo WHERE id = 3) ORDER BY id
+----
+1
+3
+
+# A trailing ORDER BY applies to the whole result.
+query
+(SELECT id FROM pu_demo WHERE id <= 2) UNION (SELECT id FROM pu_demo WHERE id >= 3) ORDER BY id DESC
+----
+4
+3
+2
+1
+
+# UNION ALL keeps duplicates across parenthesized branches.
+query
+(SELECT id FROM pu_demo WHERE id <= 2) UNION ALL (SELECT id FROM pu_demo WHERE id = 2) ORDER BY id
+----
+1
+2
+2
+
+# Mixed: a bare first branch with a parenthesized second.
+query
+SELECT id FROM pu_demo WHERE id = 1 UNION (SELECT id FROM pu_demo WHERE id = 4) ORDER BY id
+----
+1
+4
+
+# Three parenthesized branches.
+query
+(SELECT id FROM pu_demo WHERE id = 1) UNION (SELECT id FROM pu_demo WHERE id = 2) UNION (SELECT id FROM pu_demo WHERE id = 3) ORDER BY id
+----
+1
+2
+3
+
+# EXCEPT between parenthesized branches.
+query
+(SELECT id FROM pu_demo WHERE id <= 3) EXCEPT (SELECT id FROM pu_demo WHERE id = 2) ORDER BY id
+----
+1
+3
