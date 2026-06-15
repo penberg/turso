@@ -1981,20 +1981,37 @@ impl Parser {
         }
         // `REGEXP` and its synonym `RLIKE` map onto the engine's `REGEXP`
         // operator (the `regexp` function, backed by the Rust regex crate).
-        // MySQL's REGEXP is case-insensitive by default, while the engine's is
-        // case-sensitive, so prepend the regex crate's inline `(?i)` flag to the
-        // pattern — `pattern` becomes `'(?i)' || pattern`. `(?i)` at the start of
-        // a pattern applies case-insensitivity to the whole expression (including
-        // character classes), and a NULL pattern stays NULL through `||`.
+        // MySQL's REGEXP is case-insensitive under the default collation, while
+        // the engine's is case-sensitive, so prepend the regex crate's inline
+        // `(?i)` flag to the pattern — `pattern` becomes `'(?i)' || pattern`.
+        // `(?i)` at the start of a pattern applies case-insensitivity to the
+        // whole expression (including character classes), and a NULL pattern
+        // stays NULL through `||`.
+        //
+        // A `BINARY` subject (MySQL `CAST(x AS BINARY)`, which lowers to a BLOB
+        // cast) forces a case-sensitive match. Detect it, unwrap the cast so the
+        // match runs on the text value, and skip the `(?i)` flag. WordPress's
+        // `WP_Meta_Query` uses this for case-sensitive `compare_key` REGEXPs.
         if self.eat_keyword("REGEXP") || self.eat_keyword("RLIKE") {
             let rhs = self.additive_expr()?;
-            let pattern = ast::Expr::binary(
-                ast::Expr::Literal(ast::Literal::String(requote("(?i)"))),
-                ast::Operator::Concat,
-                rhs,
-            );
+            let (subject, case_insensitive) = match lhs {
+                ast::Expr::Cast {
+                    expr,
+                    type_name: Some(ref t),
+                } if t.name == "BLOB" => (*expr, false),
+                other => (other, true),
+            };
+            let pattern = if case_insensitive {
+                ast::Expr::binary(
+                    ast::Expr::Literal(ast::Literal::String(requote("(?i)"))),
+                    ast::Operator::Concat,
+                    rhs,
+                )
+            } else {
+                rhs
+            };
             return Ok(ast::Expr::like(
-                lhs,
+                subject,
                 not,
                 ast::LikeOperator::Regexp,
                 pattern,
@@ -6111,6 +6128,20 @@ mod tests {
                 "for `{sql}`"
             );
         }
+
+        // A BINARY subject (CAST AS BINARY) forces a case-sensitive match: the
+        // cast is unwrapped to its text operand and the `(?i)` flag is dropped.
+        let ast::Expr::Like { lhs, rhs, .. } =
+            parse_expr("CAST(name AS BINARY) REGEXP '^a'").unwrap()
+        else {
+            panic!("expected a Regexp expression");
+        };
+        assert_eq!(*lhs, col("name"));
+        assert!(
+            matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'^a'"),
+            "BINARY REGEXP pattern should not get the (?i) flag"
+        );
+
         let expr = parse_expr("name LIKE 'a%'").unwrap();
         let ast::Expr::Like {
             lhs, not, escape, ..

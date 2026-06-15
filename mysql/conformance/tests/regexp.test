@@ -3,9 +3,11 @@
 # MySQL's REGEXP (and its synonym RLIKE) matches a string against a regular
 # expression. The front-end maps it to the engine's REGEXP operator, backed by
 # the `regexp` function (the Rust regex crate). MySQL's REGEXP is
-# case-insensitive by default; the front-end reproduces that by prepending the
-# regex crate's inline `(?i)` flag to the pattern, so matching — including
-# character classes — folds case the same way.
+# case-insensitive under the default collation; the front-end reproduces that by
+# prepending the regex crate's inline `(?i)` flag to the pattern, so matching —
+# including character classes — folds case the same way. A BINARY subject
+# (`CAST(x AS BINARY)`) forces a case-sensitive match instead — the front-end
+# drops the `(?i)` for it (WordPress's WP_Meta_Query uses this).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -73,3 +75,24 @@ query
 SELECT 'abc' REGEXP NULL
 ----
 NULL
+
+# A BINARY subject forces a case-sensitive match: only the exact case matches.
+query
+SELECT CAST('AAA_FOO' AS BINARY) REGEXP 'AAA_foo.*', CAST('AAA_FOO' AS BINARY) REGEXP 'AAA_FOO.*'
+----
+0	1
+
+# The default (non-BINARY) match of the same data stays case-insensitive.
+query
+SELECT 'AAA_FOO' REGEXP 'aaa_foo.*'
+----
+1
+
+# Case-sensitive matching against table data via a BINARY compare.
+statement ok
+INSERT INTO re_demo (a, b) VALUES (10, 'Alpha'), (11, 'alpha')
+
+query
+SELECT a FROM re_demo WHERE CAST(b AS BINARY) REGEXP '^Alpha$' ORDER BY a
+----
+10
