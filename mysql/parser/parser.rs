@@ -2649,6 +2649,12 @@ impl Parser {
             return self.concat_call();
         }
 
+        // `CHAR(n, ...)` builds a string from character codes, mapping to the
+        // engine's `char()` (see `char_call`).
+        if upper == "CHAR" {
+            return self.char_call();
+        }
+
         // MySQL's `LENGTH(x)` is a BYTE count. The engine's `length()` counts
         // characters, but `length()` of a BLOB counts bytes, so lower it to
         // `length(CAST(x AS BLOB))`.
@@ -2998,6 +3004,29 @@ impl Parser {
             acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
         }
         Ok(acc)
+    }
+
+    /// Parses a `CHAR(n1, n2, ...)` call (the name and `(` are already consumed)
+    /// and lowers it to the engine's `char()`, which builds a string from the
+    /// Unicode code points of its integer arguments. For the common ASCII and
+    /// control-character codes (e.g. `CHAR(10)` newline, `CHAR(72, 73)` -> `HI`)
+    /// this matches MySQL exactly. Two documented divergences: MySQL skips NULL
+    /// arguments whereas the engine stops at the first NULL, and for code points
+    /// above 127 MySQL emits raw bytes (a number can span several) while the
+    /// engine emits the single UTF-8 code point. The `CHAR(... USING charset)`
+    /// form is rejected (the `USING` clause is left unparsed). At least one
+    /// argument is required.
+    fn char_call(&mut self) -> Result<ast::Expr> {
+        let mut args = Vec::new();
+        loop {
+            args.push(self.expr()?);
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(call_fn("char", args))
     }
 
     /// Parses a `FIELD(x, a, b, ...)` call (the name and `(` are already
@@ -7153,6 +7182,20 @@ mod tests {
 
         // A direction keyword without FROM is a syntax error.
         assert!(parse_expr("TRIM(LEADING 'x')").is_err());
+    }
+
+    #[test]
+    fn char_lowers_to_engine_char() {
+        // CHAR(72, 73) -> char(72, 73).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("CHAR(72, 73)").unwrap() else {
+            panic!("expected CHAR to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "char");
+        assert_eq!(args.len(), 2);
+        assert_eq!(*args[0], num("72"));
+
+        // The `USING charset` form is rejected.
+        assert!(parse_expr("CHAR(72 USING utf8)").is_err());
     }
 
     #[test]

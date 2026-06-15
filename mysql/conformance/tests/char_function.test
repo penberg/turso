@@ -1,0 +1,59 @@
+# CHAR(n1, n2, ...) conformance.
+#
+# CHAR builds a string from the character codes of its integer arguments. The
+# front-end maps it to the engine's char(), which is exact for the ASCII and
+# control-character codes that are the common use (e.g. CHAR(10) newline,
+# CHAR(72, 73) -> 'HI').
+#
+# Two divergences, not exercised here: MySQL skips NULL arguments whereas the
+# engine stops at the first NULL, and for codes above 127 MySQL emits raw bytes
+# (one number can span several) while the engine emits a single UTF-8 code point.
+# The CHAR(... USING charset) form is rejected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Printable ASCII codes build the corresponding string.
+query
+SELECT CHAR(72, 73), CHAR(65, 66, 67), CHAR(105)
+----
+HI	ABC	i
+
+# Digits, and a single punctuation code.
+query
+SELECT CHAR(48, 49, 50), CHAR(124)
+----
+012	|
+
+# Control characters are produced as single bytes (checked by length to avoid
+# embedding them): tab, newline, carriage return.
+query
+SELECT LENGTH(CHAR(10)), LENGTH(CHAR(9, 10, 13))
+----
+1	3
+
+# CHAR composes with CONCAT (here joining with code 124, a pipe).
+query
+SELECT CONCAT('a', CHAR(124), 'b')
+----
+a|b
+
+# Round-trips against a string literal.
+query
+SELECT CHAR(104, 105) = 'hi'
+----
+1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS char_demo (id INT PRIMARY KEY, code INT)
+
+statement ok
+INSERT INTO char_demo (id, code) VALUES (1, 88), (2, 89), (3, 90)
+
+query
+SELECT id, CHAR(code) FROM char_demo ORDER BY id
+----
+1	X
+2	Y
+3	Z
