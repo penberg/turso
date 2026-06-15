@@ -2568,6 +2568,11 @@ impl Parser {
             return self.repeat_call();
         }
 
+        // `SPACE(n)` is `REPEAT(' ', n)` — a run of `n` spaces.
+        if upper == "SPACE" {
+            return self.space_call();
+        }
+
         // `INSTR(str, substr)` and `LOCATE(substr, str)` (note the swapped
         // operand order) find the 1-based position of a substring. MySQL's are
         // case-insensitive under the default collation, so both lower to
@@ -3419,46 +3424,25 @@ impl Parser {
         Ok(modulo(a, b))
     }
 
-    /// Lowers `REPEAT(s, n)` (the name and `(` are already consumed) to
-    /// `CASE WHEN n IS NULL THEN NULL ELSE replace(hex(zeroblob(n)), '00', s) END`.
-    ///
-    /// The engine has no `repeat()`. But `zeroblob(n)` is `n` zero bytes, whose
-    /// `hex()` is the text `'00'` repeated `n` times, so replacing every `'00'`
-    /// with `s` yields `s` repeated `n` times. A non-positive `n` makes an empty
-    /// blob and thus the empty string (matching MySQL), and a NULL `s` propagates
-    /// through `replace`. The `CASE` guard is needed only because `zeroblob(NULL)`
-    /// is an empty blob rather than NULL, so without it a NULL count would wrongly
-    /// yield `''` instead of NULL. Exactly two arguments are required.
+    /// Lowers `REPEAT(s, n)` (the name and `(` are already consumed) via
+    /// [`repeat_expr`]. Exactly two arguments are required.
     fn repeat_call(&mut self) -> Result<ast::Expr> {
         let s = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
         let n = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
+        Ok(repeat_expr(s, n))
+    }
 
-        let blob_hex = unary_fn("hex", unary_fn("zeroblob", n.clone()));
-        let repeated = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("replace"),
-            distinctness: None,
-            args: vec![
-                Box::new(blob_hex),
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote("00")))),
-                Box::new(s),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        Ok(ast::Expr::Case {
-            base: None,
-            when_then_pairs: vec![(
-                Box::new(ast::Expr::is_null(n)),
-                Box::new(ast::Expr::Literal(ast::Literal::Null)),
-            )],
-            else_expr: Some(Box::new(repeated)),
-        })
+    /// Lowers `SPACE(n)` (the name and `(` are already consumed) to `REPEAT(' ',
+    /// n)` via [`repeat_expr`] — a string of `n` spaces, the empty string for a
+    /// non-positive `n`, and NULL for a NULL `n`, matching MySQL. Exactly one
+    /// argument is required.
+    fn space_call(&mut self) -> Result<ast::Expr> {
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let space = ast::Expr::Literal(ast::Literal::String(requote(" ")));
+        Ok(repeat_expr(space, n))
     }
 
     /// Lowers `LAST_DAY(d)` (the name and `(` are already consumed) to
@@ -3805,6 +3789,43 @@ fn integer_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
             size: None,
             array_dimensions: 0,
         }),
+    }
+}
+
+/// Builds the lowering that repeats string `s` `n` times:
+/// `CASE WHEN n IS NULL THEN NULL ELSE replace(hex(zeroblob(n)), '00', s) END`.
+///
+/// The engine has no `repeat()`. But `zeroblob(n)` is `n` zero bytes, whose
+/// `hex()` is the text `'00'` repeated `n` times, so replacing every `'00'` with
+/// `s` yields `s` repeated `n` times. A non-positive `n` makes an empty blob and
+/// thus the empty string (matching MySQL), and a NULL `s` propagates through
+/// `replace`. The `CASE` guard is needed only because `zeroblob(NULL)` is an
+/// empty blob rather than NULL, so without it a NULL count would wrongly yield
+/// `''` instead of NULL. Shared by `REPEAT(s, n)` and `SPACE(n)`.
+fn repeat_expr(s: ast::Expr, n: ast::Expr) -> ast::Expr {
+    let blob_hex = unary_fn("hex", unary_fn("zeroblob", n.clone()));
+    let repeated = ast::Expr::FunctionCall {
+        name: ast::Name::from_string("replace"),
+        distinctness: None,
+        args: vec![
+            Box::new(blob_hex),
+            Box::new(ast::Expr::Literal(ast::Literal::String(requote("00")))),
+            Box::new(s),
+        ],
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    };
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(ast::Expr::is_null(n)),
+            Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        )],
+        else_expr: Some(Box::new(repeated)),
     }
 }
 
@@ -6150,6 +6171,12 @@ mod tests {
         assert_eq!(
             *args[1],
             ast::Expr::Literal(ast::Literal::String("'00'".to_string()))
+        );
+
+        // SPACE(n) is REPEAT(' ', n) and lowers identically.
+        assert_eq!(
+            parse_expr("SPACE(n)").unwrap(),
+            parse_expr("REPEAT(' ', n)").unwrap()
         );
     }
 
