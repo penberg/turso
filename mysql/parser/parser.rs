@@ -421,6 +421,14 @@ impl Parser {
             ));
         }
 
+        // A trailing `FIRST` / `AFTER col` clause positions the new column. The
+        // engine always appends, so the position is consumed and ignored
+        // (WordPress's `dbDelta()` emits `ADD COLUMN ... AFTER ...`; column order
+        // does not affect name-based access). `FIRST` takes no argument.
+        if !self.eat_keyword("FIRST") && self.eat_keyword("AFTER") {
+            let _ = self.name()?;
+        }
+
         Ok(ast::Stmt::AlterTable(ast::AlterTable {
             name,
             body: ast::AlterTableBody::AddColumn(column),
@@ -7650,10 +7658,14 @@ mod tests {
 
     #[test]
     fn alter_table_add_column_lowers_to_add_column() {
-        // `ADD COLUMN` and the COLUMN-elided `ADD` both lower to AddColumn.
+        // `ADD COLUMN` and the COLUMN-elided `ADD` both lower to AddColumn; a
+        // trailing `FIRST` / `AFTER col` position clause is consumed and ignored.
         for sql in [
             "ALTER TABLE t ADD COLUMN c INT DEFAULT 0",
             "ALTER TABLE t ADD c INT DEFAULT 0",
+            "ALTER TABLE t ADD COLUMN c INT DEFAULT 0 FIRST",
+            "ALTER TABLE t ADD COLUMN c INT DEFAULT 0 AFTER other",
+            "ALTER TABLE t ADD c INT AFTER other",
         ] {
             let ast::Stmt::AlterTable(alter) = parse(sql).unwrap() else {
                 panic!("expected `{sql}` to parse as ALTER TABLE");
@@ -7662,7 +7674,7 @@ mod tests {
             let ast::AlterTableBody::AddColumn(col) = &alter.body else {
                 panic!("expected an ADD COLUMN body for `{sql}`");
             };
-            assert_eq!(col.col_name.as_str(), "c");
+            assert_eq!(col.col_name.as_str(), "c", "for `{sql}`");
         }
     }
 

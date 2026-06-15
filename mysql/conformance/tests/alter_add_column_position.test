@@ -1,0 +1,45 @@
+# ALTER TABLE ... ADD COLUMN with a FIRST / AFTER position.
+#
+# MySQL's ADD COLUMN accepts a trailing `FIRST` or `AFTER col` clause that
+# positions the new column. The front-end previously rejected it with a syntax
+# error; it now consumes and ignores the position (the engine always appends a
+# new column). WordPress's dbDelta() emits `ADD COLUMN ... AFTER ...`, and column
+# access is by name, so the result is equivalent.
+#
+# Because the engine appends regardless of the clause, the *physical* column
+# order differs from MySQL (SHOW COLUMNS / SELECT * would list them in a
+# different order). This test references columns by name only, so it passes
+# against both turso-mysql-server and a real mysqld. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS acp (id INT PRIMARY KEY, c INT)
+
+# AFTER an existing column.
+statement ok
+ALTER TABLE acp ADD COLUMN y INT DEFAULT 7 AFTER c
+
+# FIRST (before all columns).
+statement ok
+ALTER TABLE acp ADD COLUMN z VARCHAR(10) DEFAULT 'zz' FIRST
+
+# AFTER the primary key.
+statement ok
+ALTER TABLE acp ADD COLUMN w INT AFTER id
+
+statement ok
+INSERT INTO acp (id, c, w) VALUES (1, 5, 99)
+
+# Every column is present and accessible by name; the AFTER/FIRST defaults apply.
+query
+SELECT id, c, y, z, w FROM acp WHERE id = 1
+----
+1	5	7	zz	99
+
+# The positioned columns work in WHERE and updates.
+statement ok
+UPDATE acp SET y = y + 1 WHERE z = 'zz'
+
+query
+SELECT y FROM acp WHERE id = 1
+----
+8
