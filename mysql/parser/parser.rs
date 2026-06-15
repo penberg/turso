@@ -2744,6 +2744,15 @@ impl Parser {
             return self.timestampdiff_call();
         }
 
+        // `TIME_TO_SEC(t)` is the seconds since midnight of the time part;
+        // `SEC_TO_TIME(s)` is the inverse.
+        if upper == "TIME_TO_SEC" {
+            return self.time_to_sec_call();
+        }
+        if upper == "SEC_TO_TIME" {
+            return self.sec_to_time_call();
+        }
+
         // `LAST_DAY(d)` is the last day of `d`'s month, which the engine's date
         // modifiers compute as `date(d, 'start of month', '+1 month', '-1 day')`.
         if upper == "LAST_DAY" {
@@ -3689,6 +3698,57 @@ impl Parser {
                 size: None,
                 array_dimensions: 0,
             }),
+        })
+    }
+
+    /// Lowers `TIME_TO_SEC(t)` (the name and `(` are already consumed) to the
+    /// seconds since midnight of `t`'s time part:
+    /// `H*3600 + M*60 + S`, each part being `CAST(strftime(code, t) AS INTEGER)`.
+    /// NULL propagates. MySQL `TIME` values outside `00:00:00`..`23:59:59` (it
+    /// allows up to 838 hours and negatives) wrap or fail in the engine, so only
+    /// the normal time-of-day range matches — a documented divergence. Exactly one
+    /// argument is required.
+    fn time_to_sec_call(&mut self) -> Result<ast::Expr> {
+        let t = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let hours = ast::Expr::binary(
+            cast_strftime_int("%H", t.clone()),
+            ast::Operator::Multiply,
+            ast::Expr::Literal(ast::Literal::Numeric("3600".to_string())),
+        );
+        let minutes = ast::Expr::binary(
+            cast_strftime_int("%M", t.clone()),
+            ast::Operator::Multiply,
+            ast::Expr::Literal(ast::Literal::Numeric("60".to_string())),
+        );
+        let seconds = cast_strftime_int("%S", t);
+        let hm = ast::Expr::binary(hours, ast::Operator::Add, minutes);
+        Ok(ast::Expr::binary(hm, ast::Operator::Add, seconds))
+    }
+
+    /// Lowers `SEC_TO_TIME(s)` (the name and `(` are already consumed) to
+    /// `time(s, 'unixepoch')` — the `'HH:MM:SS'` time `s` seconds after midnight.
+    /// NULL propagates. The engine wraps at 24 hours, so only `0`..`86399` matches
+    /// MySQL (which would render e.g. `25:00:00`) — a documented divergence.
+    /// Exactly one argument is required.
+    fn sec_to_time_call(&mut self) -> Result<ast::Expr> {
+        let s = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("time"),
+            distinctness: None,
+            args: vec![
+                Box::new(s),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(
+                    "unixepoch",
+                )))),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
         })
     }
 
@@ -6074,6 +6134,27 @@ mod tests {
         // A non-literal interval value, or a non-numeric string, is rejected.
         assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
         assert!(parse_expr("DATE_ADD(d, INTERVAL 'abc' DAY)").is_err());
+    }
+
+    #[test]
+    fn time_to_sec_and_sec_to_time_lower() {
+        // TIME_TO_SEC(t) is an addition (H*3600 + M*60 + S), so the top is a `+`.
+        assert!(matches!(
+            parse_expr("TIME_TO_SEC(t)").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Add, _)
+        ));
+
+        // SEC_TO_TIME(s) -> time(s, 'unixepoch').
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("SEC_TO_TIME(s)").unwrap()
+        else {
+            panic!("expected SEC_TO_TIME to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "time");
+        assert_eq!(args.len(), 2);
+        assert_eq!(*args[0], col("s"));
+        assert!(
+            matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'unixepoch'")
+        );
     }
 
     #[test]

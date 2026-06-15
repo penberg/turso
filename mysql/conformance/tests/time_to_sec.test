@@ -1,0 +1,58 @@
+# TIME_TO_SEC(t) / SEC_TO_TIME(s) conformance.
+#
+# TIME_TO_SEC returns the seconds since midnight of t's time part; SEC_TO_TIME is
+# the inverse, formatting a second count as 'HH:MM:SS'. The front-end lowers
+# TIME_TO_SEC to H*3600 + M*60 + S (each part CAST(strftime(code, t) AS INTEGER))
+# and SEC_TO_TIME to time(s, 'unixepoch'). NULL propagates.
+#
+# Scope: the normal time-of-day range only. MySQL's TIME allows up to 838 hours
+# and negatives, and SEC_TO_TIME would render hours past 24 (e.g. 25:00:00); the
+# engine wraps at 24 hours, so only 00:00:00..23:59:59 / 0..86399 is exercised (a
+# documented divergence).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Seconds since midnight, across the normal range.
+query
+SELECT TIME_TO_SEC('01:02:03'), TIME_TO_SEC('00:00:00'), TIME_TO_SEC('23:59:59')
+----
+3723	0	86399
+
+# The time part of a DATETIME is used.
+query
+SELECT TIME_TO_SEC('2020-06-15 10:00:00')
+----
+36000
+
+# SEC_TO_TIME formats a second count as HH:MM:SS.
+query
+SELECT SEC_TO_TIME(3723), SEC_TO_TIME(0), SEC_TO_TIME(86399)
+----
+01:02:03	00:00:00	23:59:59
+
+# The two are inverses over the supported range.
+query
+SELECT TIME_TO_SEC(SEC_TO_TIME(12345))
+----
+12345
+
+# NULL propagates through both.
+query
+SELECT TIME_TO_SEC(NULL), SEC_TO_TIME(NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS tts_demo (id INT PRIMARY KEY, t TIME)
+
+statement ok
+INSERT INTO tts_demo (id, t) VALUES (1, '00:01:00'), (2, '01:00:00'), (3, '12:30:15')
+
+query
+SELECT id, TIME_TO_SEC(t) FROM tts_demo ORDER BY id
+----
+1	60
+2	3600
+3	45015
