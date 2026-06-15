@@ -1,0 +1,40 @@
+# The OCT() function.
+#
+# OCT(n) returns the octal string of n, treating n as an unsigned 64-bit value
+# (as in MySQL). The front-end synthesizes it as printf('%o', n) with a NULL
+# guard (printf('%o', NULL) is '0', not NULL).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Positive values.
+query
+SELECT OCT(8), OCT(255), OCT(0), OCT(64), OCT(511)
+----
+10	377	0	100	777
+
+# A negative value is the octal of its unsigned 64-bit representation, as in
+# MySQL.
+query
+SELECT OCT(-8)
+----
+1777777777777777777770
+
+# NULL propagates.
+query
+SELECT OCT(NULL) IS NULL
+----
+1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS oc (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO oc (id, n) VALUES (1, 9), (2, 73)
+
+query
+SELECT id, OCT(n) FROM oc ORDER BY id
+----
+1	11
+2	111

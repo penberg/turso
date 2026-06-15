@@ -3218,6 +3218,11 @@ impl Parser {
             return self.hex_call();
         }
 
+        // `OCT(n)` is the octal string of `n` (see `oct_call`).
+        if upper == "OCT" {
+            return self.oct_call();
+        }
+
         // `LOG(x)` is the natural log in MySQL (the engine's 1-arg `log` is
         // base-10), while `LOG(b, x)` is the base-`b` log on both (see `log_call`).
         if upper == "LOG" {
@@ -4122,6 +4127,27 @@ impl Parser {
                 (Box::new(greater), numeric_expr("1")),
             ],
             else_expr: Some(numeric_expr("0")),
+        })
+    }
+
+    /// Parses MySQL `OCT(n)` (the name and `(` are already consumed): the octal
+    /// string of `n`, synthesized as `printf('%o', n)`. The engine's `printf`
+    /// formats `%o` from the unsigned 64-bit value, so a negative `n` matches
+    /// MySQL (`OCT(-8)` → `1777777777777777777770`). A NULL guard is needed since
+    /// `printf('%o', NULL)` is `'0'`, not NULL.
+    fn oct_call(&mut self) -> Result<ast::Expr> {
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(n.clone())),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(call_fn(
+                "printf",
+                vec![ast::Expr::Literal(ast::Literal::String(requote("%o"))), n],
+            ))),
         })
     }
 
@@ -10189,6 +10215,33 @@ mod tests {
             panic!("expected hex for the else branch");
         };
         assert_eq!(name.as_str(), "hex");
+    }
+
+    #[test]
+    fn oct_lowers_to_printf_with_null_guard() {
+        // OCT(n) -> CASE WHEN n IS NULL THEN NULL ELSE printf('%o', n) END.
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("OCT(n)").unwrap()
+        else {
+            panic!("expected OCT to lower to a CASE");
+        };
+        assert_eq!(when_then_pairs.len(), 1);
+        assert!(matches!(
+            *when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        let else_expr = else_expr.unwrap();
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.as_ref() else {
+            panic!("expected printf in the else branch");
+        };
+        assert_eq!(name.as_str(), "printf");
+        assert!(matches!(
+            args[0].as_ref(),
+            ast::Expr::Literal(ast::Literal::String(s)) if s == "'%o'"
+        ));
     }
 
     #[test]
