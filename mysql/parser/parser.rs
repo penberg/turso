@@ -107,13 +107,17 @@ impl Parser {
                 self.advance();
                 self.alter()
             }
+            "RENAME" => {
+                self.advance();
+                self.rename_table()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SAVEPOINT"
-            | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE"
-            | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK"
-            | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(
-                ParseError::Unsupported(format!("{keyword} is not supported yet")),
-            ),
+            "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SAVEPOINT" | "GRANT"
+            | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE"
+            | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
+            | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(
+                format!("{keyword} is not supported yet"),
+            )),
             other => Err(ParseError::Unsupported(format!(
                 "unrecognized statement starting with `{other}`"
             ))),
@@ -367,6 +371,31 @@ impl Parser {
         Ok(ast::Stmt::AlterTable(ast::AlterTable {
             name,
             body: ast::AlterTableBody::RenameTo(new_table.name),
+        }))
+    }
+
+    /// Parses the standalone `RENAME TABLE old_name TO new_name` statement
+    /// (`RENAME` already consumed) and lowers it to the engine's
+    /// `ALTER TABLE old RENAME TO new`, which it executes natively. MySQL's
+    /// comma-separated multi-rename (`RENAME TABLE a TO b, c TO d`) is rejected,
+    /// as is the `RENAME {DATABASE|USER}` form (only `TABLE` is recognized here).
+    fn rename_table(&mut self) -> Result<ast::Stmt> {
+        if !self.eat_keyword("TABLE") {
+            return Err(ParseError::Unsupported(
+                "only RENAME TABLE is supported yet".to_string(),
+            ));
+        }
+        let old = self.qualified_name()?;
+        self.expect_keyword("TO")?;
+        let new = self.qualified_name()?;
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "RENAME TABLE with multiple tables is not supported yet".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::AlterTable(ast::AlterTable {
+            name: old,
+            body: ast::AlterTableBody::RenameTo(new.name),
         }))
     }
 
@@ -4470,6 +4499,27 @@ mod tests {
             assert_eq!(idx_name.name.as_str(), want_name, "{sql}");
             assert_eq!(tbl_name.as_str(), "t", "{sql}");
             assert_eq!(columns.len(), want_cols, "{sql}");
+        }
+    }
+
+    #[test]
+    fn rename_table_lowers_to_alter_rename() {
+        // RENAME TABLE old TO new -> ALTER TABLE old RENAME TO new.
+        let ast::Stmt::AlterTable(alter) = parse("RENAME TABLE old_t TO new_t").unwrap() else {
+            panic!("expected RENAME TABLE to parse as ALTER TABLE");
+        };
+        assert_eq!(alter.name.name.as_str(), "old_t");
+        let ast::AlterTableBody::RenameTo(new) = &alter.body else {
+            panic!("expected a RENAME TO body");
+        };
+        assert_eq!(new.as_str(), "new_t");
+
+        // The multi-table form and non-TABLE renames are rejected.
+        for sql in ["RENAME TABLE a TO b, c TO d", "RENAME USER u1 TO u2"] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
         }
     }
 

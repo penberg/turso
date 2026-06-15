@@ -1,0 +1,43 @@
+# RENAME TABLE conformance.
+#
+# MySQL's RENAME TABLE old_name TO new_name renames a table. The engine (like
+# SQLite) renames in place, so the front-end lowers it to the same operation as
+# ALTER TABLE old RENAME TO new.
+#
+# Scope: the comma-separated multi-rename (RENAME TABLE a TO b, c TO d) is
+# rejected by the front-end and covered by a parser unit test, not here, because
+# a real mysqld accepts it.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ren_old (id INT PRIMARY KEY, v VARCHAR(10))
+
+statement ok
+INSERT INTO ren_old (id, v) VALUES (1, 'a'), (2, 'b')
+
+# After the rename, the new name carries the rows.
+statement ok
+RENAME TABLE ren_old TO ren_new
+
+query
+SELECT id, v FROM ren_new ORDER BY id
+----
+1	a
+2	b
+
+# The old name no longer exists.
+statement error
+SELECT id FROM ren_old
+
+# The renamed table still accepts writes under its new name.
+statement ok
+INSERT INTO ren_new (id, v) VALUES (3, 'c')
+
+query
+SELECT id, v FROM ren_new ORDER BY id
+----
+1	a
+2	b
+3	c
