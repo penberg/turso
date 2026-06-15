@@ -23,7 +23,7 @@
 //! assert!(matches!(stmt, ast::Stmt::Select(_)));
 //!
 //! // Unsupported statements (and sub-clauses) are reported, not forwarded.
-//! assert!(parse("SELECT a FROM t1 RIGHT JOIN t2 ON t1.id = t2.id").is_err());
+//! assert!(parse("SELECT a FROM t1 FULL JOIN t2 ON t1.id = t2.id").is_err());
 //! ```
 
 pub mod error;

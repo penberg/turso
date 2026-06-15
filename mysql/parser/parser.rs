@@ -1471,12 +1471,19 @@ impl Parser {
                 ast::JoinType::LEFT | ast::JoinType::OUTER,
             ))));
         }
+        if self.eat_keyword("RIGHT") {
+            self.eat_keyword("OUTER");
+            self.expect_keyword("JOIN")?;
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::RIGHT | ast::JoinType::OUTER,
+            ))));
+        }
         if self.eat_keyword("JOIN") {
             return Ok(Some(ast::JoinOperator::TypedJoin(Some(
                 ast::JoinType::INNER,
             ))));
         }
-        for kw in ["RIGHT", "FULL", "CROSS", "NATURAL", "STRAIGHT_JOIN"] {
+        for kw in ["FULL", "CROSS", "NATURAL", "STRAIGHT_JOIN"] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
                     "{kw} join is not supported yet"
@@ -4486,8 +4493,8 @@ mod tests {
     fn select_unsupported_variants() {
         for sql in [
             "SELECT DISTINCTROW a FROM t",
-            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
             "SELECT * FROM a CROSS JOIN b",
+            "SELECT * FROM a FULL JOIN b ON a.id = b.id",
             "SELECT * FROM a JOIN b USING (id)",
             "SELECT * FROM a JOIN b",
             "SELECT * FROM (SELECT 1)",
@@ -4497,6 +4504,29 @@ mod tests {
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn right_join_parses() {
+        // RIGHT [OUTER] JOIN parses into the engine's RIGHT join type.
+        for sql in [
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
+            "SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.id",
+        ] {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select {
+                from: Some(from), ..
+            } = &select.body.select
+            else {
+                panic!("expected a FROM clause for `{sql}`");
+            };
+            let ast::JoinOperator::TypedJoin(Some(t)) = from.joins[0].operator else {
+                panic!("expected a typed join for `{sql}`");
+            };
+            assert!(t.contains(ast::JoinType::RIGHT), "for `{sql}`");
         }
     }
 

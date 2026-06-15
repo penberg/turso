@@ -1,0 +1,52 @@
+# RIGHT [OUTER] JOIN conformance.
+#
+# A RIGHT JOIN keeps every row of the right-hand table, filling unmatched
+# left-hand columns with NULL — the mirror of LEFT JOIN. The engine supports it
+# natively, so the front-end just parses RIGHT [OUTER] JOIN into the engine's
+# RIGHT join type. The OUTER keyword is optional, as in MySQL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS rj_left (id INT PRIMARY KEY, ref INT, lv INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS rj_right (id INT PRIMARY KEY, rv INT)
+
+statement ok
+INSERT INTO rj_left (id, ref, lv) VALUES (1, 10, 100), (2, 20, 200)
+
+statement ok
+INSERT INTO rj_right (id, rv) VALUES (10, 1), (20, 2), (30, 3)
+
+# Every right row appears; the unmatched right row (30) gets NULL left columns.
+query
+SELECT rj_right.id, rj_left.lv FROM rj_left RIGHT JOIN rj_right ON rj_left.ref = rj_right.id ORDER BY rj_right.id
+----
+10	100
+20	200
+30	NULL
+
+# RIGHT OUTER JOIN is the same; the OUTER keyword is optional.
+query
+SELECT rj_right.id, rj_left.lv FROM rj_left RIGHT OUTER JOIN rj_right ON rj_left.ref = rj_right.id ORDER BY rj_right.id
+----
+10	100
+20	200
+30	NULL
+
+# A RIGHT JOIN is the mirror of the LEFT JOIN with the tables swapped.
+query
+SELECT rj_right.id, rj_left.lv FROM rj_right LEFT JOIN rj_left ON rj_left.ref = rj_right.id ORDER BY rj_right.id
+----
+10	100
+20	200
+30	NULL
+
+# Filtering on a right-only column still keeps the unmatched-left rows that pass.
+query
+SELECT rj_right.id FROM rj_left RIGHT JOIN rj_right ON rj_left.ref = rj_right.id WHERE rj_right.rv >= 2 ORDER BY rj_right.id
+----
+20
+30
