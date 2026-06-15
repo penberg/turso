@@ -58,6 +58,9 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     if let Some(parsed) = parse_show_index(sql) {
         return Some(build_index(conn, &parsed));
     }
+    if let Some(parsed) = parse_show_variables(sql) {
+        return Some(Ok(ShowOutcome::Columns(build_variables(&parsed))));
+    }
     None
 }
 
@@ -746,6 +749,106 @@ fn parse_show_tables(sql: &str) -> Option<ShowTables> {
     Some(ShowTables { full, like })
 }
 
+/// The parsed form of a `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern']`
+/// statement: the optional `LIKE` pattern (`None` for the bare form).
+struct ShowVariables {
+    like: Option<String>,
+}
+
+/// Parses `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern']`, returning `None`
+/// for any other statement — including the `SHOW VARIABLES WHERE ...` form,
+/// which carries an arbitrary predicate and is left to fall through.
+fn parse_show_variables(sql: &str) -> Option<ShowVariables> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let mut k = 0;
+    let kw = |t: &str, kw: &str| t.eq_ignore_ascii_case(kw);
+
+    if !toks.get(k).is_some_and(|t| kw(t, "SHOW")) {
+        return None;
+    }
+    k += 1;
+    // An optional `GLOBAL`/`SESSION` scope; the front-end keeps a single set of
+    // values, so the scope is consumed and ignored.
+    if toks.get(k).is_some_and(|t| kw(t, "GLOBAL") || kw(t, "SESSION")) {
+        k += 1;
+    }
+    if !toks.get(k).is_some_and(|t| kw(t, "VARIABLES")) {
+        return None;
+    }
+    k += 1;
+
+    // Optional `LIKE 'pattern'`.
+    let like = if toks.get(k).is_some_and(|t| kw(t, "LIKE")) {
+        k += 1;
+        let pat = toks.get(k)?;
+        let unquoted = pat
+            .strip_prefix('\'')
+            .and_then(|p| p.strip_suffix('\''))
+            .or_else(|| pat.strip_prefix('"').and_then(|p| p.strip_suffix('"')))?;
+        k += 1;
+        Some(unquoted.to_string())
+    } else {
+        None
+    };
+
+    // Any trailing tokens (e.g. WHERE) are not handled here.
+    if k != toks.len() {
+        return None;
+    }
+    Some(ShowVariables { like })
+}
+
+/// Builds the `SHOW VARIABLES` result set (`Variable_name`, `Value`) from the
+/// shared system-variable table, filtered by the optional `LIKE` pattern and
+/// ordered by name as MySQL reports it.
+fn build_variables(show: &ShowVariables) -> ColumnsResult {
+    let mut rows: Vec<Vec<Option<String>>> = crate::session::SYSTEM_VARIABLES
+        .iter()
+        .filter(|(name, _)| match &show.like {
+            Some(pattern) => like_match(pattern, name),
+            None => true,
+        })
+        .map(|(name, value)| vec![Some((*name).to_string()), Some((*value).to_string())])
+        .collect();
+    rows.sort_by(|a, b| a[0].cmp(&b[0]));
+    ColumnsResult {
+        columns: vec!["Variable_name", "Value"],
+        rows,
+    }
+}
+
+/// Case-insensitive SQL `LIKE` match for `SHOW ... LIKE` patterns: `%` matches
+/// any sequence (including empty) and `_` matches any single character. There is
+/// no escape handling — variable-name patterns never need it.
+fn like_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    // Classic two-pointer wildcard match with backtracking on `%`.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Splits a statement into tokens, unquoting backtick identifiers and keeping
 /// `.` as its own token. Quoted strings are kept verbatim (quotes included).
 fn tokenize(s: &str) -> Vec<String> {
@@ -829,6 +932,60 @@ mod tests {
         // Not SHOW TABLES, or an unhandled WHERE form.
         assert!(parse_show_tables("SHOW COLUMNS FROM t").is_none());
         assert!(parse_show_tables("SHOW TABLES WHERE 1").is_none());
+    }
+
+    #[test]
+    fn parses_show_variables() {
+        assert_eq!(parse_show_variables("SHOW VARIABLES").unwrap().like, None);
+        assert_eq!(
+            parse_show_variables("SHOW VARIABLES LIKE 'max_allowed_packet'")
+                .unwrap()
+                .like
+                .as_deref(),
+            Some("max_allowed_packet")
+        );
+        // The GLOBAL / SESSION scope is accepted.
+        assert!(parse_show_variables("SHOW GLOBAL VARIABLES LIKE 'autocommit'").is_some());
+        assert!(parse_show_variables("SHOW SESSION VARIABLES").is_some());
+        // Unrelated statements and the WHERE form fall through.
+        assert!(parse_show_variables("SHOW TABLES").is_none());
+        assert!(parse_show_variables("SHOW VARIABLES WHERE Variable_name = 'x'").is_none());
+    }
+
+    #[test]
+    fn build_variables_filters_and_orders() {
+        // An exact name yields one row.
+        let one = build_variables(&ShowVariables {
+            like: Some("autocommit".to_string()),
+        });
+        assert_eq!(one.rows.len(), 1);
+        assert_eq!(one.rows[0][0].as_deref(), Some("autocommit"));
+        assert_eq!(one.rows[0][1].as_deref(), Some("1"));
+
+        // A `%` wildcard matches several, ordered by name; `_` matches one char;
+        // matching is case-insensitive.
+        let many = build_variables(&ShowVariables {
+            like: Some("CHARACTER_SET_C%".to_string()),
+        });
+        let names: Vec<_> = many.rows.iter().map(|r| r[0].clone().unwrap()).collect();
+        assert_eq!(names, ["character_set_client", "character_set_connection"]);
+
+        // An unknown variable yields no rows.
+        let none = build_variables(&ShowVariables {
+            like: Some("no_such_xyzzy".to_string()),
+        });
+        assert!(none.rows.is_empty());
+    }
+
+    #[test]
+    fn like_match_semantics() {
+        assert!(like_match("autocommit", "autocommit"));
+        assert!(like_match("AUTO%", "autocommit"));
+        assert!(like_match("autocommi_", "autocommit"));
+        assert!(like_match("%commit", "autocommit"));
+        assert!(like_match("%", "anything"));
+        assert!(!like_match("autocommi_", "autocommit_extra"));
+        assert!(!like_match("xyz", "autocommit"));
     }
 
     #[test]

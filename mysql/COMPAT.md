@@ -554,7 +554,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | SHOW TABLE STATUS          | ❌     |         |
 | SHOW [FULL] TABLES [LIKE]  | ✅     | Base table names synthesized from the schema, optionally filtered by a `LIKE` pattern; `FULL` adds a `Table_type` column (`BASE TABLE`). The result column header is a fixed `Tables_in_database`, not MySQL's `Tables_in_<db>` (clients read it positionally). The `WHERE` filter form is rejected. |
 | SHOW TRIGGERS              | ❌     |         |
-| SHOW VARIABLES             | ❌     | Frequently probed by clients/ORMs; currently errors. |
+| SHOW [GLOBAL\|SESSION] VARIABLES [LIKE *pat*] | ✅ | Answered from a fixed table of plausible system-variable values (the same table that backs `SELECT @@var`), returned as MySQL's `Variable_name` / `Value` result set ordered by name. The optional `GLOBAL`/`SESSION` scope is accepted and ignored, the `LIKE` pattern uses case-insensitive SQL wildcards (`%`, `_`), and an unknown variable yields an empty result set. Used by WordPress Site Health (`WP_Debug_Data::get_mysql_var`). Only the listed variables are reported (a real mysqld exposes hundreds more), and values are front-end constants, so the bare `SHOW VARIABLES` row set and individual values may differ from a given server. The `WHERE` filter form is not handled (rejected). |
 | SHOW WARNINGS              | ❌     |         |
 
 #### Other Administrative Statements

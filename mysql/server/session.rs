@@ -84,40 +84,54 @@ fn eval(expr: &str) -> Option<Option<String>> {
 
 const SERVER_VERSION: &str = "8.0.0-turso";
 
+/// The MySQL system variables the front-end reports plausible constant values
+/// for, as `(name, value)` pairs. Values are rendered as text (the text protocol
+/// sends everything as strings). This is the single source of truth for both
+/// `SELECT @@var` (here) and `SHOW VARIABLES [LIKE ...]` (in `show.rs`).
+pub const SYSTEM_VARIABLES: &[(&str, &str)] = &[
+    ("autocommit", "1"),
+    ("character_set_client", "utf8mb4"),
+    ("character_set_connection", "utf8mb4"),
+    ("character_set_database", "utf8mb4"),
+    ("character_set_results", "utf8mb4"),
+    ("character_set_server", "utf8mb4"),
+    ("collation_connection", "utf8mb4_general_ci"),
+    ("collation_database", "utf8mb4_general_ci"),
+    ("collation_server", "utf8mb4_general_ci"),
+    ("hostname", "turso"),
+    ("init_connect", ""),
+    ("interactive_timeout", "28800"),
+    ("license", "MIT"),
+    ("lower_case_table_names", "0"),
+    ("max_allowed_packet", "67108864"),
+    ("max_execution_time", "0"),
+    ("net_read_timeout", "30"),
+    ("net_write_timeout", "60"),
+    ("performance_schema", "0"),
+    ("protocol_version", "10"),
+    ("sql_mode", ""),
+    ("system_time_zone", "UTC"),
+    ("time_zone", "SYSTEM"),
+    ("transaction_isolation", "REPEATABLE-READ"),
+    ("transaction_read_only", "0"),
+    ("tx_isolation", "REPEATABLE-READ"),
+    ("tx_read_only", "0"),
+    ("version", SERVER_VERSION),
+    ("version_comment", "Turso MySQL front-end"),
+    ("version_compile_os", "Linux"),
+    ("wait_timeout", "28800"),
+];
+
 /// Returns a plausible value for a MySQL system variable. Values are rendered as
 /// text (the text protocol sends everything as strings); unknown variables yield
 /// an empty string.
 fn system_variable(name: &str) -> String {
-    let value = match name.to_ascii_lowercase().as_str() {
-        "max_allowed_packet" => "67108864",
-        "wait_timeout" | "interactive_timeout" => "28800",
-        "net_write_timeout" => "60",
-        "net_read_timeout" => "30",
-        "max_execution_time"
-        | "lower_case_table_names"
-        | "performance_schema"
-        | "transaction_read_only"
-        | "tx_read_only" => "0",
-        "autocommit" => "1",
-        "version" => SERVER_VERSION,
-        "version_comment" => "Turso MySQL front-end",
-        "version_compile_os" => "Linux",
-        "protocol_version" => "10",
-        "sql_mode" | "init_connect" => "",
-        "time_zone" => "SYSTEM",
-        "system_time_zone" => "UTC",
-        "character_set_client"
-        | "character_set_connection"
-        | "character_set_results"
-        | "character_set_server"
-        | "character_set_database" => "utf8mb4",
-        "collation_connection" | "collation_server" | "collation_database" => "utf8mb4_general_ci",
-        "transaction_isolation" | "tx_isolation" => "REPEATABLE-READ",
-        "license" => "MIT",
-        "hostname" => "turso",
-        _ => "",
-    };
-    value.to_string()
+    let lower = name.to_ascii_lowercase();
+    SYSTEM_VARIABLES
+        .iter()
+        .find(|(n, _)| *n == lower)
+        .map(|(_, v)| (*v).to_string())
+        .unwrap_or_default()
 }
 
 /// Drops a trailing `LIMIT ...` clause (clients append `LIMIT 1` to some probes).

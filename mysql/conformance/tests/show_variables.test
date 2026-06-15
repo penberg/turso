@@ -1,0 +1,56 @@
+# SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern'] conformance.
+#
+# WordPress's Site Health (WP_Debug_Data::get_mysql_var) issues
+# `SHOW VARIABLES LIKE '<name>'` and reads the `Value` column. The front-end
+# answers it server-side from a fixed table of plausible system-variable values
+# (the same table that backs `SELECT @@var`), returning the MySQL-shaped
+# `Variable_name` / `Value` result set ordered by name. The `LIKE` pattern uses
+# SQL wildcards (`%`, `_`) and is case-insensitive; an unknown variable yields an
+# empty result set (so get_mysql_var returns null). The `WHERE` form is not
+# handled and is left to the parser (rejected).
+#
+# The asserted values are front-end constants chosen to also match a
+# WordPress-configured mysqld (autocommit on, utf8mb4 client charset). Bare
+# `SHOW VARIABLES` is intentionally not asserted (a real mysqld returns hundreds
+# of rows). This test needs no tables.
+
+# An exact name returns a single Variable_name / Value row.
+query
+SHOW VARIABLES LIKE 'autocommit'
+----
+autocommit	1
+
+# The GLOBAL / SESSION scope is accepted (and ignored).
+query
+SHOW SESSION VARIABLES LIKE 'autocommit'
+----
+autocommit	1
+
+query
+SHOW GLOBAL VARIABLES LIKE 'max_allowed_packet'
+----
+max_allowed_packet	67108864
+
+# A `%` wildcard can match several variables; rows are ordered by name.
+query
+SHOW VARIABLES LIKE 'character_set_c%'
+----
+character_set_client	utf8mb4
+character_set_connection	utf8mb4
+
+# The match is case-insensitive.
+query
+SHOW VARIABLES LIKE 'AUTOCOMMIT'
+----
+autocommit	1
+
+# A `_` wildcard matches a single character.
+query
+SHOW VARIABLES LIKE 'autocommi_'
+----
+autocommit	1
+
+# An unknown variable yields an empty result set.
+query
+SHOW VARIABLES LIKE 'no_such_variable_xyzzy'
+----
