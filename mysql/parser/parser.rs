@@ -3649,16 +3649,7 @@ impl Parser {
     fn dayname_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        const DAYS: [&str; 7] = [
-            "Sunday",
-            "Monday",
-            "Tuesday",
-            "Wednesday",
-            "Thursday",
-            "Friday",
-            "Saturday",
-        ];
-        Ok(name_from_date("%w", &DAYS, 0, arg))
+        Ok(name_from_date("%w", &WEEKDAY_NAMES, 0, arg))
     }
 
     /// Parses a `MONTHNAME(d)` call (the name and `(` are already consumed) and
@@ -3668,21 +3659,7 @@ impl Parser {
     fn monthname_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        const MONTHS: [&str; 12] = [
-            "January",
-            "February",
-            "March",
-            "April",
-            "May",
-            "June",
-            "July",
-            "August",
-            "September",
-            "October",
-            "November",
-            "December",
-        ];
-        Ok(name_from_date("%m", &MONTHS, 1, arg))
+        Ok(name_from_date("%m", &MONTH_NAMES, 1, arg))
     }
 
     /// Parses a `DAYOFWEEK(d)` / `WEEKDAY(d)` call (the name and `(` are already
@@ -3955,10 +3932,11 @@ impl Parser {
         })
     }
 
-    /// Parses `DATE_FORMAT(x, 'fmt')` (the name and `(` are already consumed)
-    /// and lowers it to the engine's `strftime(translated_fmt, x)`. The format
-    /// must be a string literal so its MySQL specifiers can be translated to
-    /// strftime spelling at parse time (see [`translate_date_format`]).
+    /// Parses `DATE_FORMAT(x, 'fmt')` (the name and `(` are already consumed) and
+    /// lowers it via [`date_format_expr`] — a `strftime` over `x` for the
+    /// directly-translatable specifiers, with month/weekday name specifiers
+    /// expanded to `CASE` lookups and concatenated. The format must be a string
+    /// literal so it can be translated at parse time.
     fn date_format_call(&mut self) -> Result<ast::Expr> {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
@@ -3969,23 +3947,7 @@ impl Parser {
         self.advance();
         self.expect(&Token::RParen, "`)`")?;
 
-        let translated = translate_date_format(&fmt)?;
-        Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("strftime"),
-            distinctness: None,
-            args: vec![
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote(
-                    &translated,
-                )))),
-                Box::new(target),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        })
+        date_format_expr(&fmt, target)
     }
 
     /// Lowers a MySQL current date/time function (`NOW()`, `CURDATE()`, ...) to
@@ -4738,6 +4700,43 @@ fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
     }
 }
 
+/// English weekday names, indexed by `strftime('%w')` (0 = Sunday). Used by
+/// `DAYNAME` and `DATE_FORMAT`'s `%W`.
+const WEEKDAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// Abbreviated English weekday names, for `DATE_FORMAT`'s `%a`.
+const WEEKDAY_NAMES_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// English month names, indexed by `strftime('%m')` (with start = 1). Used by
+/// `MONTHNAME` and `DATE_FORMAT`'s `%M`.
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// Abbreviated English month names, for `DATE_FORMAT`'s `%b`.
+const MONTH_NAMES_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 /// Builds `CASE CAST(strftime(fmt, arg) AS INTEGER) WHEN start THEN names[0] ...
 /// END` — a date component (a weekday or month number) mapped to its English
 /// name. The `CASE` has no `ELSE`, so a NULL date (which makes the integer NULL,
@@ -4934,42 +4933,76 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
     })
 }
 
-/// Translates a MySQL `DATE_FORMAT` format string into the engine's `strftime`
-/// spelling. Only specifiers with a direct strftime equivalent are accepted;
-/// `%i`/`%s` (MySQL minutes/seconds) become `%M`/`%S`, the shared codes
-/// (`%Y %m %d %H`) and `%%` pass through, and literal characters are copied.
-/// Any other specifier (e.g. `%M` month name, `%h`, `%p`, `%W`) is rejected so
-/// the front-end never silently produces a different string than MySQL.
-fn translate_date_format(mysql_fmt: &str) -> Result<String> {
-    let mut out = String::new();
+/// Lowers a MySQL `DATE_FORMAT(target, fmt)` to an expression over `target`.
+///
+/// Specifiers with a direct strftime equivalent are translated into strftime
+/// format runs (`%i`/`%s` → `%M`/`%S`; `%Y %m %d %H %j %w %U` pass through; `%v`
+/// → `%V`; `%T` → `%H:%M:%S`; `%%` and literal characters copied), each rendered
+/// as `strftime(run, target)`. The name specifiers — `%M` (month name), `%b`
+/// (abbreviated month), `%W` (weekday name), `%a` (abbreviated weekday) — have no
+/// strftime form, so each becomes a `CASE`-over-`strftime` name lookup (see
+/// [`name_from_date`]). The pieces are concatenated with `||`. A NULL `target`
+/// makes every piece NULL, so the whole result is NULL, as in MySQL. Any other
+/// specifier (`%h`, `%p`, `%D`, the `%u`/`%V` week modes, …) is rejected rather
+/// than silently mistranslated.
+fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
+    // A piece is either a strftime format run or a name lookup over `target`.
+    enum Piece {
+        Fmt(String),
+        Name(&'static str, &'static [&'static str], i64),
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, pieces: &mut Vec<Piece>| {
+        if !run.is_empty() {
+            pieces.push(Piece::Fmt(std::mem::take(run)));
+        }
+    };
+
     let mut chars = mysql_fmt.chars();
     while let Some(c) = chars.next() {
         if c != '%' {
-            out.push(c);
+            run.push(c);
             continue;
         }
         match chars.next() {
-            Some('Y') => out.push_str("%Y"),
-            Some('m') => out.push_str("%m"),
-            Some('d') => out.push_str("%d"),
-            Some('H') => out.push_str("%H"),
-            Some('i') => out.push_str("%M"),
-            Some('s') => out.push_str("%S"),
+            Some('Y') => run.push_str("%Y"),
+            Some('m') => run.push_str("%m"),
+            Some('d') => run.push_str("%d"),
+            Some('H') => run.push_str("%H"),
+            Some('i') => run.push_str("%M"),
+            Some('s') => run.push_str("%S"),
             // `%j` (day of year, 001-366) and `%w` (weekday, 0=Sunday..6) have
-            // the same name, range, and zero-padding in MySQL and strftime, so
-            // they pass straight through.
-            Some('j') => out.push_str("%j"),
-            Some('w') => out.push_str("%w"),
+            // the same name, range, and zero-padding in MySQL and strftime.
+            Some('j') => run.push_str("%j"),
+            Some('w') => run.push_str("%w"),
             // Week numbers: MySQL `%U` (Sunday-first, mode 0) is strftime `%U`,
             // and MySQL `%v` (Monday-first ISO, mode 3) is strftime `%V` — the
             // same mode-to-format mapping the `WEEK()` function uses (and which
             // its conformance test verifies). MySQL `%u`/`%V` (modes 1/2) have no
             // matching strftime format and stay rejected.
-            Some('U') => out.push_str("%U"),
-            Some('v') => out.push_str("%V"),
+            Some('U') => run.push_str("%U"),
+            Some('v') => run.push_str("%V"),
             // `%T` is the 24-hour `HH:MM:SS` time, i.e. `%H:%i:%s`.
-            Some('T') => out.push_str("%H:%M:%S"),
-            Some('%') => out.push_str("%%"),
+            Some('T') => run.push_str("%H:%M:%S"),
+            Some('%') => run.push_str("%%"),
+            // The name specifiers have no strftime form; each is a CASE lookup.
+            Some('M') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Name("%m", &MONTH_NAMES, 1));
+            }
+            Some('b') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Name("%m", &MONTH_NAMES_ABBR, 1));
+            }
+            Some('W') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Name("%w", &WEEKDAY_NAMES, 0));
+            }
+            Some('a') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Name("%w", &WEEKDAY_NAMES_ABBR, 0));
+            }
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
                     "DATE_FORMAT specifier %{other} is not supported yet"
@@ -4982,7 +5015,39 @@ fn translate_date_format(mysql_fmt: &str) -> Result<String> {
             }
         }
     }
-    Ok(out)
+    flush(&mut run, &mut pieces);
+
+    let mut exprs = pieces.into_iter().map(|piece| match piece {
+        Piece::Fmt(fmt) => strftime_text(&fmt, target.clone()),
+        Piece::Name(fmt, names, start) => name_from_date(fmt, names, start, target.clone()),
+    });
+    // An empty format renders strftime('', target) — the empty string for a
+    // valid target, NULL for a NULL one, matching MySQL.
+    let Some(mut acc) = exprs.next() else {
+        return Ok(strftime_text("", target));
+    };
+    for next in exprs {
+        acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
+    }
+    Ok(acc)
+}
+
+/// Builds `strftime(fmt, arg)` (the text form, not cast to an integer).
+fn strftime_text(fmt: &str, arg: ast::Expr) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string("strftime"),
+        distinctness: None,
+        args: vec![
+            Box::new(ast::Expr::Literal(ast::Literal::String(requote(fmt)))),
+            Box::new(arg),
+        ],
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
 }
 
 /// The canned literal a server/connection introspection function folds to, or
@@ -6610,13 +6675,30 @@ mod tests {
         assert!(
             matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%j-%w %U %V %H:%M:%S'")
         );
-        // A specifier without a strftime equivalent is rejected (`%W` is the
-        // weekday *name* in MySQL but the *week number* in strftime, so it is not
-        // silently mistranslated).
+        // The name specifiers `%M`/`%W`/`%b`/`%a` have no strftime form, so they
+        // lower to a CASE name lookup; `%W` alone is therefore a bare CASE.
         assert!(matches!(
-            parse_expr("DATE_FORMAT(d, '%W')").unwrap_err(),
-            ParseError::Unsupported(_)
+            parse_expr("DATE_FORMAT(d, '%W')").unwrap(),
+            ast::Expr::Case { .. }
         ));
+        // A name specifier mixed with strftime runs becomes a concatenation
+        // (`||`) of strftime segments and CASE lookups.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%Y %M')").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Concat, _)
+        ));
+        // Specifiers with neither a strftime form nor a name lowering are still
+        // rejected (12-hour `%h`, AM/PM `%p`, day-with-suffix `%D`).
+        for fmt in [
+            "DATE_FORMAT(d, '%h')",
+            "DATE_FORMAT(d, '%p')",
+            "DATE_FORMAT(d, '%D')",
+        ] {
+            assert!(matches!(
+                parse_expr(fmt).unwrap_err(),
+                ParseError::Unsupported(_)
+            ));
+        }
         // A non-literal format is rejected.
         assert!(parse_expr("DATE_FORMAT(d, f)").is_err());
     }

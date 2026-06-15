@@ -1,13 +1,14 @@
 # DATE_FORMAT(d, fmt) conformance.
 #
 # MySQL's DATE_FORMAT formats a datetime with format specifiers. The front-end
-# lowers it to the engine's strftime(), translating the MySQL specifiers that
-# have a direct strftime equivalent: %Y %m %d %H, %i (minutes -> %M),
-# %s (seconds -> %S), %j (day of year), %w (weekday number), %U (Sunday-first
-# week), %v (ISO week -> %V), %T (-> %H:%M:%S), and %%. Literal characters pass
-# through. The format must be a string literal; specifiers without a strftime
-# equivalent (e.g. %M month name, %p, %W weekday name, %h) are rejected. See
-# mysql/COMPAT.md.
+# lowers it to strftime() for the directly-translatable specifiers -- %Y %m %d
+# %H, %i (minutes -> %M), %s (seconds -> %S), %j (day of year), %w (weekday
+# number), %U (Sunday-first week), %v (ISO week -> %V), %T (-> %H:%M:%S), %% --
+# and expands the name specifiers (%M month name, %b abbreviated month, %W
+# weekday name, %a abbreviated weekday) to CASE lookups, concatenating the
+# pieces. Literal characters pass through. The format must be a string literal;
+# specifiers without either form (e.g. %h 12-hour, %p AM/PM, %D day-with-suffix)
+# are rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -83,3 +84,28 @@ query
 SELECT DATE_FORMAT('2020-01-06', '%v'), DATE_FORMAT('2021-01-01', '%v')
 ----
 02	53
+
+# %M is the full month name, %W the full weekday name (2020-03-15 is a Sunday in
+# March). These have no strftime form and expand to CASE lookups.
+query
+SELECT DATE_FORMAT(d, '%W, %M %d, %Y') FROM df_demo
+----
+Sunday, March 15, 2020
+
+# %b is the abbreviated month, %a the abbreviated weekday.
+query
+SELECT DATE_FORMAT(d, '%a %b %d') FROM df_demo
+----
+Sun Mar 15
+
+# A name specifier alone, and names across the calendar.
+query
+SELECT DATE_FORMAT('2020-01-01', '%M'), DATE_FORMAT('2020-12-31', '%W')
+----
+January	Thursday
+
+# A NULL date still propagates through the concatenated name lowering.
+query
+SELECT DATE_FORMAT(NULL, '%W %M')
+----
+NULL
