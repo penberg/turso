@@ -544,7 +544,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | SHOW DATABASES             | ❌     |         |
 | SHOW ENGINE                | ❌     |         |
 | SHOW ENGINES               | ❌     |         |
-| SHOW ERRORS                | ❌     |         |
+| SHOW ERRORS                | 🚧     | Always returns an empty result set (MySQL's `Level`/`Code`/`Message` columns, no rows) — the engine keeps no diagnostics area, so this matches a real mysqld only when the last statement produced no warnings/errors. A trailing `LIMIT` is accepted; the `SHOW COUNT(*) WARNINGS` form is not. |
 | SHOW EVENTS                | ❌     |         |
 | SHOW FUNCTION CODE         | ❌     |         |
 | SHOW FUNCTION STATUS       | ❌     |         |
@@ -566,7 +566,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | SHOW [FULL] TABLES [LIKE]  | ✅     | Base table names synthesized from the schema, optionally filtered by a `LIKE` pattern; `FULL` adds a `Table_type` column (`BASE TABLE`). The result column header is a fixed `Tables_in_database`, not MySQL's `Tables_in_<db>` (clients read it positionally). The `WHERE` filter form is rejected. |
 | SHOW TRIGGERS              | ❌     |         |
 | SHOW [GLOBAL\|SESSION] VARIABLES [LIKE *pat*] | ✅ | Answered from a fixed table of plausible system-variable values (the same table that backs `SELECT @@var`), returned as MySQL's `Variable_name` / `Value` result set ordered by name. The optional `GLOBAL`/`SESSION` scope is accepted and ignored, the `LIKE` pattern uses case-insensitive SQL wildcards (`%`, `_`), and an unknown variable yields an empty result set. Used by WordPress Site Health (`WP_Debug_Data::get_mysql_var`). Only the listed variables are reported (a real mysqld exposes hundreds more), and values are front-end constants, so the bare `SHOW VARIABLES` row set and individual values may differ from a given server. The `WHERE` filter form is not handled (rejected). |
-| SHOW WARNINGS              | ❌     |         |
+| SHOW WARNINGS              | 🚧     | Always returns an empty result set (MySQL's `Level`/`Code`/`Message` columns, no rows) — the engine keeps no diagnostics area, so this matches a real mysqld only when the last statement produced no warnings/errors. A trailing `LIMIT` is accepted; the `SHOW COUNT(*) WARNINGS` form is not. |
 
 #### Other Administrative Statements
 

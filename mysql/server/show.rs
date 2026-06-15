@@ -64,7 +64,35 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     if let Some(parsed) = parse_show_variables(sql) {
         return Some(Ok(ShowOutcome::Columns(build_variables(&parsed))));
     }
+    if let Some(result) = parse_show_warnings(sql) {
+        return Some(Ok(ShowOutcome::Columns(result)));
+    }
     None
+}
+
+/// Handles `SHOW {WARNINGS | ERRORS} [LIMIT ...]`. The engine raises no
+/// persistent warnings or errors, so the diagnostics area is always empty: the
+/// result is MySQL's `Level` / `Code` / `Message` columns with no rows, which
+/// matches a real mysqld after a statement that produced no warnings. Clients
+/// (e.g. `mysqli` with warning reporting on) issue this after each statement. A
+/// trailing `LIMIT` is accepted and irrelevant on an empty set. Returns `None`
+/// for any other statement.
+fn parse_show_warnings(sql: &str) -> Option<ColumnsResult> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let kw = |i: usize, kw: &str| toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case(kw));
+    if !kw(0, "SHOW") || !(kw(1, "WARNINGS") || kw(1, "ERRORS")) {
+        return None;
+    }
+    // Only an optional `LIMIT ...` may follow; reject the `COUNT(*)` form and
+    // anything else so it falls through.
+    if toks.len() > 2 && !kw(2, "LIMIT") {
+        return None;
+    }
+    Some(ColumnsResult {
+        columns: vec!["Level", "Code", "Message"],
+        rows: Vec::new(),
+    })
 }
 
 /// The parsed form of a `SHOW [FULL] COLUMNS FROM tbl` statement.
@@ -1082,6 +1110,24 @@ mod tests {
         // Not SHOW TABLES, or an unhandled WHERE form.
         assert!(parse_show_tables("SHOW COLUMNS FROM t").is_none());
         assert!(parse_show_tables("SHOW TABLES WHERE 1").is_none());
+    }
+
+    #[test]
+    fn parses_show_warnings_and_errors() {
+        for sql in [
+            "SHOW WARNINGS",
+            "SHOW ERRORS",
+            "SHOW WARNINGS LIMIT 5",
+            "SHOW WARNINGS LIMIT 1, 5",
+            "show warnings;",
+        ] {
+            let result = parse_show_warnings(sql).unwrap_or_else(|| panic!("`{sql}` should parse"));
+            assert_eq!(result.columns, vec!["Level", "Code", "Message"]);
+            assert!(result.rows.is_empty(), "`{sql}` should have no rows");
+        }
+        // The `COUNT(*)` form and unrelated SHOWs fall through.
+        assert!(parse_show_warnings("SHOW COUNT(*) WARNINGS").is_none());
+        assert!(parse_show_warnings("SHOW TABLES").is_none());
     }
 
     #[test]

@@ -1,0 +1,33 @@
+# SHOW WARNINGS / SHOW ERRORS.
+#
+# MySQL clients (e.g. mysqli with warning reporting enabled) issue SHOW WARNINGS
+# after statements to read the diagnostics area. The engine raises no persistent
+# warnings or errors, so the result is MySQL's Level / Code / Message columns
+# with no rows -- which matches a real mysqld after a statement that produced no
+# warnings. The front-end previously rejected these ("SHOW is not supported
+# yet"). A trailing LIMIT is accepted (and irrelevant on an empty set).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (run right
+# after clean statements, as here). This test needs no tables.
+
+# A successful statement leaves no warnings.
+statement ok
+CREATE TABLE IF NOT EXISTS sw (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO sw (id) VALUES (1)
+
+# SHOW WARNINGS returns an empty result set.
+query
+SHOW WARNINGS
+----
+
+# SHOW ERRORS likewise.
+query
+SHOW ERRORS
+----
+
+# A trailing LIMIT is accepted.
+query
+SHOW WARNINGS LIMIT 10
+----
