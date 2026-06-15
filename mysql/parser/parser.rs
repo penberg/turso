@@ -1998,6 +1998,16 @@ impl Parser {
             return self.date_part_call(fmt);
         }
 
+        // `DAYOFWEEK` (1=Sunday..7=Saturday) and `WEEKDAY` (0=Monday..6=Sunday)
+        // lower to integer arithmetic over `strftime('%w', d)`, which yields
+        // 0=Sunday..6=Saturday: `%w + 1` and `(%w + 6) % 7` respectively.
+        if upper == "DAYOFWEEK" {
+            return self.day_of_week_call(1, false);
+        }
+        if upper == "WEEKDAY" {
+            return self.day_of_week_call(6, true);
+        }
+
         // `FIELD(x, a, b, ...)` (the 1-based index of `x` in the list, else 0)
         // lowers to a `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0 END`.
         if upper == "FIELD" {
@@ -2329,6 +2339,53 @@ impl Parser {
                 size: None,
                 array_dimensions: 0,
             }),
+        })
+    }
+
+    /// Parses a `DAYOFWEEK(d)` / `WEEKDAY(d)` call (the name and `(` are already
+    /// consumed) and lowers it to integer arithmetic over the engine's
+    /// `strftime('%w', d)`, which yields 0=Sunday..6=Saturday. The result is
+    /// `(strftime('%w', d) + add)`, optionally taken `% 7`: `DAYOFWEEK` uses
+    /// `add = 1` (1=Sunday..7=Saturday) and `WEEKDAY` uses `add = 6` with the
+    /// modulo (0=Monday..6=Sunday). NULL propagates through both.
+    fn day_of_week_call(&mut self, add: i64, modulo: bool) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let strftime = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("strftime"),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("%w")))),
+                Box::new(arg),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let dow = ast::Expr::Cast {
+            expr: Box::new(strftime),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        };
+        let shifted = ast::Expr::binary(
+            dow,
+            ast::Operator::Add,
+            ast::Expr::Literal(ast::Literal::Numeric(add.to_string())),
+        );
+        Ok(if modulo {
+            ast::Expr::binary(
+                shifted,
+                ast::Operator::Modulus,
+                ast::Expr::Literal(ast::Literal::Numeric("7".to_string())),
+            )
+        } else {
+            shifted
         })
     }
 
@@ -4080,6 +4137,31 @@ mod tests {
                 "wrong format code for `{sql}`"
             );
         }
+    }
+
+    #[test]
+    fn day_of_week_functions_lower_to_weekday_arithmetic() {
+        // DAYOFWEEK(d) -> CAST(strftime('%w', d) AS INTEGER) + 1.
+        let ast::Expr::Binary(lhs, ast::Operator::Add, rhs) = parse_expr("DAYOFWEEK(d)").unwrap()
+        else {
+            panic!("expected DAYOFWEEK to lower to an addition");
+        };
+        assert!(matches!(lhs.as_ref(), ast::Expr::Cast { .. }));
+        assert!(matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1"));
+
+        // WEEKDAY(d) -> (CAST(strftime('%w', d) AS INTEGER) + 6) % 7.
+        let ast::Expr::Binary(inner, ast::Operator::Modulus, modulus) =
+            parse_expr("WEEKDAY(d)").unwrap()
+        else {
+            panic!("expected WEEKDAY to lower to a modulo");
+        };
+        assert!(
+            matches!(modulus.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "7")
+        );
+        let ast::Expr::Binary(_, ast::Operator::Add, six) = inner.as_ref() else {
+            panic!("expected an addition inside the modulo");
+        };
+        assert!(matches!(six.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "6"));
     }
 
     #[test]

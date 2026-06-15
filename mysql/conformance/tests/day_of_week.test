@@ -1,0 +1,69 @@
+# DAYOFWEEK / WEEKDAY conformance.
+#
+# MySQL numbers weekdays two different ways:
+#   DAYOFWEEK(d) -> 1=Sunday, 2=Monday, ..., 7=Saturday  (ODBC, 1-based)
+#   WEEKDAY(d)   -> 0=Monday, 1=Tuesday, ..., 6=Sunday
+# The engine's strftime('%w', d) yields 0=Sunday..6=Saturday, so the front-end
+# lowers DAYOFWEEK to (strftime('%w', d) + 1) and WEEKDAY to
+# ((strftime('%w', d) + 6) % 7). WordPress's WP_Date_Query uses both for
+# day-of-week filters. NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS dow_demo (a INT PRIMARY KEY, d DATE)
+
+# A full week: 2020-01-01 is a Wednesday through 2020-01-07 (Tuesday).
+statement ok
+INSERT INTO dow_demo (a, d) VALUES
+  (1, '2020-01-01'), (2, '2020-01-02'), (3, '2020-01-03'),
+  (4, '2020-01-04'), (5, '2020-01-05'), (6, '2020-01-06'), (7, '2020-01-07')
+
+# DAYOFWEEK: Sunday is 1, Saturday is 7.
+query
+SELECT a, DAYOFWEEK(d) FROM dow_demo ORDER BY a
+----
+1	4
+2	5
+3	6
+4	7
+5	1
+6	2
+7	3
+
+# WEEKDAY: Monday is 0, Sunday is 6.
+query
+SELECT a, WEEKDAY(d) FROM dow_demo ORDER BY a
+----
+1	2
+2	3
+3	4
+4	5
+5	6
+6	0
+7	1
+
+# Literal forms.
+query
+SELECT DAYOFWEEK('2020-01-05'), WEEKDAY('2020-01-05')
+----
+1	6
+
+# NULL propagates through both.
+query
+SELECT DAYOFWEEK(NULL), WEEKDAY(NULL)
+----
+NULL	NULL
+
+# Usable in a WHERE predicate: which rows fall on a Saturday (DAYOFWEEK = 7)?
+query
+SELECT a FROM dow_demo WHERE DAYOFWEEK(d) = 7 ORDER BY a
+----
+4
+
+# WEEKDAY = 0 selects Mondays.
+query
+SELECT a FROM dow_demo WHERE WEEKDAY(d) = 0 ORDER BY a
+----
+6
