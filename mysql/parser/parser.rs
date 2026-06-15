@@ -1698,7 +1698,14 @@ impl Parser {
         let columns = self.select_list()?;
 
         let from = if self.eat_keyword("FROM") {
-            Some(self.from_clause()?)
+            let from = self.from_clause()?;
+            // MySQL's dummy `DUAL` table (`SELECT 1 FROM DUAL`) is equivalent to
+            // having no `FROM` at all; drop it (the engine has no `DUAL` table).
+            if from_is_dual(&from) {
+                None
+            } else {
+                Some(from)
+            }
         } else {
             None
         };
@@ -5931,6 +5938,18 @@ fn requote(value: &str) -> String {
 }
 
 /// Keywords that, appearing where a column type would, mean the type is absent.
+/// Whether a `FROM` clause is just MySQL's dummy `DUAL` table — `SELECT expr
+/// FROM DUAL`, equivalent to a `FROM`-less select — so the front-end can drop it
+/// (the engine has no `DUAL` table). Only a single unaliased, unqualified `DUAL`
+/// with no joins qualifies. (As in MySQL, an unquoted `dual` is always the dummy;
+/// a real table actually named `dual` would be shadowed — but such a table is
+/// never created in practice.)
+fn from_is_dual(from: &ast::FromClause) -> bool {
+    from.joins.is_empty()
+        && matches!(from.select.as_ref(), ast::SelectTable::Table(tbl, None, _)
+            if tbl.db_name.is_none() && tbl.name.as_str().eq_ignore_ascii_case("DUAL"))
+}
+
 fn is_column_constraint_keyword(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
@@ -6690,6 +6709,31 @@ mod tests {
         };
         assert_eq!(columns.len(), 2);
         assert!(where_clause.is_some());
+    }
+
+    #[test]
+    fn from_dual_is_dropped() {
+        // `FROM DUAL` is MySQL's dummy table; it lowers to a FROM-less select.
+        for sql in ["SELECT 1 FROM DUAL", "SELECT 1 FROM dual WHERE 1 = 1"] {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select { from, .. } = select.body.select else {
+                panic!("expected OneSelect::Select for `{sql}`");
+            };
+            assert!(from.is_none(), "expected `{sql}` to drop the FROM clause");
+        }
+
+        // A real table is kept, and DUAL with an alias is treated as a table.
+        for sql in ["SELECT 1 FROM users", "SELECT 1 FROM dual d"] {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                unreachable!()
+            };
+            let ast::OneSelect::Select { from, .. } = select.body.select else {
+                unreachable!()
+            };
+            assert!(from.is_some(), "expected `{sql}` to keep the FROM clause");
+        }
     }
 
     #[test]

@@ -1,0 +1,48 @@
+# SELECT ... FROM DUAL.
+#
+# MySQL provides a dummy single-row table named DUAL so a select that has no real
+# table can still be written with a FROM clause -- `SELECT expr FROM DUAL` is the
+# same as `SELECT expr`. It is also used in conditional-insert idioms
+# (`INSERT ... SELECT ... FROM DUAL WHERE NOT EXISTS (...)`). The front-end has no
+# DUAL table ("no such table: DUAL"); it now drops a lone unaliased DUAL from the
+# FROM clause, leaving a FROM-less select.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# A constant select FROM DUAL returns the one row.
+query
+SELECT 1 + 1, 'x'
+----
+2	x
+
+query
+SELECT 1 + 1, 'x' FROM DUAL
+----
+2	x
+
+# Case-insensitive, and a WHERE clause still filters the single row.
+query
+SELECT 7 FROM dual WHERE 1 = 1
+----
+7
+
+query
+SELECT 7 FROM DUAL WHERE 1 = 0
+----
+
+# The conditional-insert idiom: insert only if the row does not exist.
+statement ok
+CREATE TABLE IF NOT EXISTS fd (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO fd (id, v) SELECT 1, 100 FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM fd WHERE id = 1)
+
+# Running it again is a no-op (the row now exists).
+statement ok
+INSERT INTO fd (id, v) SELECT 1, 200 FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM fd WHERE id = 1)
+
+query
+SELECT id, v FROM fd
+----
+1	100
