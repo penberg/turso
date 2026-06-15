@@ -374,14 +374,42 @@ fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResu
     Ok(ColumnsResult { columns, rows })
 }
 
+/// A single-predicate filter on the `SHOW INDEX` output, from a trailing
+/// `WHERE col {= | LIKE} value` clause.
+struct IndexFilter {
+    /// The output column matched against (one of [`INDEX_COLUMNS`]).
+    column: String,
+    /// `true` for `LIKE` (wildcard match), `false` for `=` (exact match).
+    like: bool,
+    value: String,
+}
+
 /// The parsed form of a `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} tbl` statement.
 struct ShowIndex {
     table: String,
+    filter: Option<IndexFilter>,
 }
 
-/// Parses `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} tbl [{FROM|IN} db]`. Returns
-/// `None` for any other statement, including the `... WHERE`/`LIKE` filter form
-/// (not handled), so those fall through to the parser.
+/// Strips the surrounding quotes from a string-literal token (`'a_key'` /
+/// `"a_key"`), un-doubling any escaped inner quote; returns `None` if the token
+/// is not quoted.
+fn unquote_token(tok: &str) -> Option<String> {
+    tok.strip_prefix('\'')
+        .and_then(|p| p.strip_suffix('\''))
+        .map(|s| s.replace("''", "'"))
+        .or_else(|| {
+            tok.strip_prefix('"')
+                .and_then(|p| p.strip_suffix('"'))
+                .map(|s| s.replace("\"\"", "\""))
+        })
+}
+
+/// Parses `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} tbl [{FROM|IN} db]`, with an
+/// optional trailing `WHERE col {= | LIKE} value` filter (MySQL filters the
+/// output rows; WordPress's `dbDelta()` issues `... WHERE Key_name='a_key'`).
+/// Only a single `=`/`LIKE` predicate over one known output column is
+/// recognized; a more complex `WHERE` (or an unknown column) returns `None`, so
+/// it falls through to the parser as unsupported rather than silently matching.
 fn parse_show_index(sql: &str) -> Option<ShowIndex> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = tokenize(trimmed);
@@ -418,11 +446,40 @@ fn parse_show_index(sql: &str) -> Option<ShowIndex> {
         toks.get(k)?;
         k += 1;
     }
-    // A trailing `WHERE`/`LIKE` is not handled here.
+    // Optional `WHERE col {= | LIKE} value` filter over a single output column.
+    let filter = if toks.get(k).is_some_and(|t| kw(t, "WHERE")) {
+        k += 1;
+        let column = toks.get(k)?.clone();
+        // Only a known output column is accepted; anything else falls through.
+        if !INDEX_COLUMNS.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+            return None;
+        }
+        k += 1;
+        let like = match toks.get(k)?.as_str() {
+            "=" => false,
+            t if kw(t, "LIKE") => true,
+            _ => return None,
+        };
+        k += 1;
+        let raw = toks.get(k)?;
+        // A quoted value is unquoted; a bare token (e.g. `Non_unique = 0`) is
+        // taken verbatim, matching the string form the row holds.
+        let value = unquote_token(raw).unwrap_or_else(|| raw.clone());
+        k += 1;
+        Some(IndexFilter {
+            column,
+            like,
+            value,
+        })
+    } else {
+        None
+    };
+
+    // Any further tokens (a compound `WHERE ... AND ...`, etc.) are unsupported.
     if k != toks.len() {
         return None;
     }
-    Some(ShowIndex { table })
+    Some(ShowIndex { table, filter })
 }
 
 /// The 15 columns of MySQL 8's `SHOW INDEX` result set, in order.
@@ -570,6 +627,20 @@ fn build_index(conn: &Arc<Connection>, show: &ShowIndex) -> Result<ShowOutcome, 
         for (i, (_, col)) in pk_cols.iter().enumerate() {
             rows.push(index_row(&show.table, "0", "PRIMARY", i + 1, col, ""));
         }
+    }
+
+    // Apply an optional `WHERE col {= | LIKE} value` filter to the built rows.
+    if let Some(f) = &show.filter {
+        let col_idx = INDEX_COLUMNS
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&f.column))
+            .expect("column validated at parse time");
+        rows.retain(|row| match row[col_idx].as_deref() {
+            // A NULL output column matches neither `=` nor `LIKE`, as in MySQL.
+            None => false,
+            Some(v) if f.like => like_match(&f.value, v),
+            Some(v) => v == f.value,
+        });
     }
 
     Ok(ShowOutcome::Columns(ColumnsResult {
@@ -1063,14 +1134,14 @@ fn tokenize(s: &str) -> Vec<String> {
                 }
             }
             toks.push(s2);
-        } else if matches!(c, '.' | ',' | ';' | '(' | ')') {
+        } else if matches!(c, '.' | ',' | ';' | '(' | ')' | '=') {
             chars.next();
             toks.push(c.to_string());
         } else {
             let mut w = String::new();
             while let Some(&ch) = chars.peek() {
                 if ch.is_whitespace()
-                    || matches!(ch, '`' | '\'' | '"' | '.' | ',' | ';' | '(' | ')')
+                    || matches!(ch, '`' | '\'' | '"' | '.' | ',' | ';' | '(' | ')' | '=')
                 {
                     break;
                 }
@@ -1236,5 +1307,40 @@ mod tests {
         assert!(is_text_type("LONGTEXT"));
         assert!(!is_text_type("INT"));
         assert!(!is_text_type("BIGINT"));
+    }
+
+    #[test]
+    fn parses_show_index_with_where_filter() {
+        // Plain SHOW INDEX has no filter.
+        let p = parse_show_index("SHOW INDEX FROM t").unwrap();
+        assert_eq!(p.table, "t");
+        assert!(p.filter.is_none());
+
+        // `WHERE Key_name='a_key'` (no spaces, as WordPress emits) parses into an
+        // exact-match filter with the value unquoted.
+        let p = parse_show_index("SHOW INDEX FROM t WHERE Key_name='a_key'").unwrap();
+        let f = p.filter.expect("a filter");
+        assert_eq!(f.column, "Key_name");
+        assert!(!f.like);
+        assert_eq!(f.value, "a_key");
+
+        // `LIKE` parses into a wildcard filter; the column match is
+        // case-insensitive.
+        let p = parse_show_index("SHOW INDEXES FROM t WHERE key_name LIKE 'a%'").unwrap();
+        let f = p.filter.expect("a filter");
+        assert!(f.like);
+        assert_eq!(f.value, "a%");
+
+        // A bare (unquoted) value is taken verbatim.
+        let f = parse_show_index("SHOW INDEX FROM t WHERE Non_unique = 0")
+            .unwrap()
+            .filter
+            .expect("a filter");
+        assert_eq!(f.value, "0");
+
+        // An unknown column or a compound predicate falls through (None) so the
+        // statement is reported unsupported rather than silently mis-filtered.
+        assert!(parse_show_index("SHOW INDEX FROM t WHERE Bogus = 'x'").is_none());
+        assert!(parse_show_index("SHOW INDEX FROM t WHERE Key_name = 'a' AND Seq_in_index = 1").is_none());
     }
 }

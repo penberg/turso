@@ -1,0 +1,51 @@
+# SHOW INDEX ... WHERE filtering.
+#
+# MySQL allows `SHOW INDEX FROM tbl WHERE <expr>` to filter the output rows.
+# WordPress's dbDelta() issues `SHOW INDEX FROM tbl WHERE Key_name='a_key'` to
+# check whether a specific index exists. The front-end now recognizes a single
+# `WHERE col {= | LIKE} value` predicate over one output column and filters the
+# built rows accordingly.
+#
+# Like the base SHOW INDEX output (see show_index.test), these rows are the
+# engine's representation (Cardinality NULL, etc.) and are NOT byte-identical to
+# a real mysqld; they exercise the front-end's filtering only.
+
+statement ok
+CREATE TABLE IF NOT EXISTS siw (id INT PRIMARY KEY, a INT, b INT)
+
+statement ok
+CREATE INDEX siw_a ON siw (a)
+
+statement ok
+CREATE UNIQUE INDEX siw_b ON siw (b)
+
+# `WHERE Key_name = 'name'` keeps only that index's rows.
+query
+SHOW INDEX FROM siw WHERE Key_name = 'siw_a'
+----
+siw	1	siw_a	1	a	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+
+# The no-space form WordPress emits, selecting the primary key.
+query
+SHOW INDEX FROM siw WHERE Key_name='PRIMARY'
+----
+siw	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+
+# A `LIKE` pattern matches the two secondary indexes (PRAGMA order).
+query
+SHOW INDEX FROM siw WHERE Key_name LIKE 'siw%'
+----
+siw	0	siw_b	1	b	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+siw	1	siw_a	1	a	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+
+# A filter on a non-string column (the unique indexes plus the primary key).
+query
+SHOW INDEX FROM siw WHERE Non_unique = 0
+----
+siw	0	siw_b	1	b	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+siw	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+
+# A predicate that matches nothing yields an empty result.
+query
+SHOW INDEX FROM siw WHERE Key_name = 'no_such_index'
+----
