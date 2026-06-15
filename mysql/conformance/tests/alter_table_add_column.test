@@ -1,0 +1,68 @@
+# ALTER TABLE ... ADD COLUMN conformance.
+#
+# MySQL's ALTER TABLE ... ADD [COLUMN] adds a column to an existing table;
+# existing rows take the column's DEFAULT (or NULL). This maps directly to the
+# engine's single-operation ALTER TABLE ... ADD COLUMN, so the front-end lowers
+# it through. WordPress's dbDelta() uses ALTER TABLE to evolve schemas.
+#
+# Scope: only a single ADD [COLUMN] per statement is supported. Index/constraint
+# adds (ADD KEY / ADD PRIMARY KEY / ...), CHANGE/MODIFY/DROP, and the
+# multi-operation comma form are rejected by the front-end; those are covered by
+# a parser unit test, not here, because a real mysqld accepts them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS alt_demo (id INT PRIMARY KEY, name VARCHAR(20))
+
+statement ok
+INSERT INTO alt_demo (id, name) VALUES (1, 'a'), (2, 'b')
+
+# Add a column with a default; existing rows take that default.
+statement ok
+ALTER TABLE alt_demo ADD COLUMN age INT DEFAULT 0
+
+query
+SELECT id, name, age FROM alt_demo ORDER BY id
+----
+1	a	0
+2	b	0
+
+# The COLUMN keyword is optional, and a string default works too.
+statement ok
+ALTER TABLE alt_demo ADD status VARCHAR(10) DEFAULT 'new'
+
+query
+SELECT id, status FROM alt_demo ORDER BY id
+----
+1	new
+2	new
+
+# A new row can supply values for the added columns.
+statement ok
+INSERT INTO alt_demo (id, name, age, status) VALUES (3, 'c', 30, 'old')
+
+query
+SELECT id, name, age, status FROM alt_demo ORDER BY id
+----
+1	a	0	new
+2	b	0	new
+3	c	30	old
+
+# A nullable column added without a default is NULL for existing rows.
+statement ok
+ALTER TABLE alt_demo ADD COLUMN note VARCHAR(40)
+
+query
+SELECT id, note FROM alt_demo ORDER BY id
+----
+1	NULL
+2	NULL
+3	NULL
+
+# The added column is usable in a WHERE predicate.
+query
+SELECT id FROM alt_demo WHERE age = 30 ORDER BY id
+----
+3

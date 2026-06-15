@@ -103,11 +103,15 @@ impl Parser {
                 self.advance();
                 self.truncate_table()
             }
+            "ALTER" => {
+                self.advance();
+                self.alter()
+            }
             // Recognized statement keywords that are simply not implemented yet.
-            "ALTER" | "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN"
-            | "SAVEPOINT" | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE"
-            | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE"
-            | "CHECK" | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(
+            "RENAME" | "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SAVEPOINT"
+            | "GRANT" | "REVOKE" | "CALL" | "DO" | "WITH" | "VALUES" | "TABLE" | "PREPARE"
+            | "EXECUTE" | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK"
+            | "REPAIR" | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(
                 ParseError::Unsupported(format!("{keyword} is not supported yet")),
             ),
             other => Err(ParseError::Unsupported(format!(
@@ -190,6 +194,66 @@ impl Parser {
                 options: ast::TableOptions::empty(),
             },
         })
+    }
+
+    // === ALTER TABLE ===
+
+    /// Parses `ALTER TABLE tbl ADD [COLUMN] <column-def>` and lowers it to the
+    /// engine's single-operation `ALTER TABLE ... ADD COLUMN`. `ALTER` has
+    /// already been consumed.
+    ///
+    /// MySQL allows many operations in one `ALTER TABLE` (adding/dropping keys,
+    /// changing column types, ...), most of which the engine — like SQLite —
+    /// cannot do in place. Only a single `ADD COLUMN` is supported; index and
+    /// constraint adds (`ADD KEY`, `ADD PRIMARY KEY`, `ADD UNIQUE`, ...), the
+    /// `CHANGE`/`MODIFY`/`DROP` operations, and the comma-separated
+    /// multi-operation form are all rejected as unsupported.
+    fn alter(&mut self) -> Result<ast::Stmt> {
+        self.expect_keyword("TABLE")?;
+        let name = self.qualified_name()?;
+
+        if !self.eat_keyword("ADD") {
+            return Err(ParseError::Unsupported(
+                "only ALTER TABLE ... ADD COLUMN is supported yet".to_string(),
+            ));
+        }
+        // `COLUMN` is optional after `ADD`. An index/constraint add starts with
+        // one of these keywords instead and has no single-statement engine
+        // equivalent.
+        self.eat_keyword("COLUMN");
+        for kw in [
+            "KEY",
+            "INDEX",
+            "PRIMARY",
+            "UNIQUE",
+            "CONSTRAINT",
+            "FULLTEXT",
+            "SPATIAL",
+            "FOREIGN",
+        ] {
+            if self.is_keyword(kw) {
+                return Err(ParseError::Unsupported(format!(
+                    "ALTER TABLE ... ADD {kw} is not supported yet"
+                )));
+            }
+        }
+
+        let (column, auto_increment) = self.column_def()?;
+        if auto_increment {
+            return Err(ParseError::Unsupported(
+                "ALTER TABLE ... ADD COLUMN with AUTO_INCREMENT is not supported yet".to_string(),
+            ));
+        }
+        if self.is(&Token::Comma) {
+            return Err(ParseError::Unsupported(
+                "ALTER TABLE with multiple operations is not supported yet".to_string(),
+            ));
+        }
+
+        Ok(ast::Stmt::AlterTable(ast::AlterTable {
+            name,
+            body: ast::AlterTableBody::AddColumn(column),
+        }))
     }
 
     /// Resolves MySQL `AUTO_INCREMENT` onto the engine's rowid-alias
@@ -3933,6 +3997,49 @@ mod tests {
         let sql = parse("DROP TABLE t").unwrap().to_string();
         assert!(sql.to_uppercase().contains("DROP TABLE"), "{sql}");
         assert!(sql.contains('t'), "{sql}");
+    }
+
+    #[test]
+    fn alter_table_add_column_lowers_to_add_column() {
+        // `ADD COLUMN` and the COLUMN-elided `ADD` both lower to AddColumn.
+        for sql in [
+            "ALTER TABLE t ADD COLUMN c INT DEFAULT 0",
+            "ALTER TABLE t ADD c INT DEFAULT 0",
+        ] {
+            let ast::Stmt::AlterTable(alter) = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to parse as ALTER TABLE");
+            };
+            assert_eq!(alter.name.name.as_str(), "t");
+            let ast::AlterTableBody::AddColumn(col) = &alter.body else {
+                panic!("expected an ADD COLUMN body for `{sql}`");
+            };
+            assert_eq!(col.col_name.as_str(), "c");
+        }
+    }
+
+    #[test]
+    fn alter_table_unsupported_variants() {
+        // Index/constraint adds, column changes, drops, and the multi-operation
+        // comma form are all rejected (a real mysqld accepts them, but the
+        // engine has no in-place equivalent).
+        for sql in [
+            "ALTER TABLE t ADD KEY idx (c)",
+            "ALTER TABLE t ADD INDEX idx (c)",
+            "ALTER TABLE t ADD PRIMARY KEY (id)",
+            "ALTER TABLE t ADD UNIQUE KEY u (c)",
+            "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
+            "ALTER TABLE t ADD FULLTEXT KEY ft (c)",
+            "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
+            "ALTER TABLE t ADD a INT, ADD b INT",
+            "ALTER TABLE t DROP COLUMN c",
+            "ALTER TABLE t CHANGE COLUMN a b INT",
+            "ALTER TABLE t RENAME TO u",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
+                "expected `{sql}` to be unsupported"
+            );
+        }
     }
 
     /// Parses `input` as a single complete expression.
