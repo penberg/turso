@@ -3336,6 +3336,9 @@ fn is_supported_function(upper_name: &str) -> bool {
         // renamed on emit (see `engine_function_name`).
         | "IF"
         | "SUBSTRING" | "MID" | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
+        // The scalar `GREATEST` / `LEAST` map to the engine's multi-argument
+        // `max` / `min`, which — like MySQL — return NULL if any argument is NULL.
+        | "GREATEST" | "LEAST"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -3442,6 +3445,8 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "LCASE" => "lower",
         "UCASE" => "upper",
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
+        "GREATEST" => "max",
+        "LEAST" => "min",
         _ => return None,
     })
 }
@@ -5236,7 +5241,7 @@ mod tests {
         for input in [
             "SLEEP(1)",
             "ROUND(2.7)",
-            "GREATEST(1, 2)",
+            "SOUNDEX('x')",
             "totally_made_up(1)",
         ] {
             let err = Parser::new(input.as_bytes()).unwrap().expr().unwrap_err();
@@ -5267,6 +5272,8 @@ mod tests {
             ("UCASE('s')", "upper"),
             ("CHAR_LENGTH('s')", "length"),
             ("CHARACTER_LENGTH('s')", "length"),
+            ("GREATEST(1, 2, 3)", "max"),
+            ("LEAST(1, 2, 3)", "min"),
         ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");
