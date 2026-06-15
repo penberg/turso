@@ -188,9 +188,13 @@ impl Parser {
                 self.advance();
                 self.with_select()
             }
+            "TABLE" => {
+                self.advance();
+                self.table_statement()
+            }
             // Recognized statement keywords that are simply not implemented yet.
             "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SAVEPOINT" | "GRANT"
-            | "REVOKE" | "CALL" | "DO" | "VALUES" | "TABLE" | "PREPARE" | "EXECUTE"
+            | "REVOKE" | "CALL" | "DO" | "VALUES" | "PREPARE" | "EXECUTE"
             | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
             | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(
                 format!("{keyword} is not supported yet"),
@@ -1463,6 +1467,26 @@ impl Parser {
         let mut select = self.parse_select()?;
         select.with = Some(with);
         Ok(ast::Stmt::Select(select))
+    }
+
+    /// Parses MySQL 8's `TABLE tbl [ORDER BY ...] [LIMIT ...]` statement (the
+    /// `TABLE` keyword already consumed), shorthand for `SELECT * FROM tbl [...]`.
+    /// It is built as exactly that `SELECT *` and the trailing `ORDER BY`/`LIMIT`
+    /// are parsed by the shared compound-select tail.
+    fn table_statement(&mut self) -> Result<ast::Stmt> {
+        let tbl_name = self.qualified_name()?;
+        let one = ast::OneSelect::Select {
+            distinctness: None,
+            columns: vec![ast::ResultColumn::Star],
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Table(tbl_name, None, None)),
+                joins: Vec::new(),
+            }),
+            where_clause: None,
+            group_by: None,
+            window_clause: Vec::new(),
+        };
+        Ok(ast::Stmt::Select(self.finish_compound_select(one)?))
     }
 
     /// Parses the body of a `WITH [RECURSIVE] cte [, cte]...` clause (the `WITH`
@@ -6709,6 +6733,31 @@ mod tests {
         };
         assert_eq!(columns.len(), 2);
         assert!(where_clause.is_some());
+    }
+
+    #[test]
+    fn table_statement_lowers_to_select_star() {
+        // `TABLE t` -> `SELECT * FROM t`.
+        let ast::Stmt::Select(select) = parse("TABLE t").unwrap() else {
+            panic!("expected TABLE to lower to a SELECT");
+        };
+        let ast::OneSelect::Select { columns, from, .. } = &select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert!(matches!(columns.as_slice(), [ast::ResultColumn::Star]));
+        let Some(from) = from else {
+            panic!("expected a FROM clause");
+        };
+        assert!(matches!(from.select.as_ref(), ast::SelectTable::Table(t, None, _) if t.name.as_str() == "t"));
+
+        // The trailing ORDER BY / LIMIT are honored.
+        let ast::Stmt::Select(select) = parse("TABLE t ORDER BY id DESC LIMIT 2, 3").unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].order, Some(ast::SortOrder::Desc));
+        let limit = select.limit.unwrap();
+        assert!(limit.offset.is_some());
     }
 
     #[test]
