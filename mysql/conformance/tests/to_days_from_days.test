@@ -1,0 +1,59 @@
+# TO_DAYS(d) / FROM_DAYS(n) conformance.
+#
+# TO_DAYS returns the day number (days since year 0) of a date, and FROM_DAYS is
+# its inverse. The engine has neither, but its julianday()/date() differ from
+# MySQL's day number by a constant offset: TO_DAYS(d) is
+# CAST(julianday(date(d)) AS INTEGER) - 1721059 (the date() drops any time part),
+# and FROM_DAYS(n) is date(n + 1721059.5). NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The day number for known dates.
+query
+SELECT TO_DAYS('2020-01-01'), TO_DAYS('2008-10-07'), TO_DAYS('0001-01-01')
+----
+737790	733687	366
+
+# A DATETIME uses only the date part, so the time does not change the count.
+query
+SELECT TO_DAYS('2020-01-01 23:30:00'), TO_DAYS('2020-01-01 06:00:00')
+----
+737790	737790
+
+# FROM_DAYS turns the day number back into a date.
+query
+SELECT FROM_DAYS(737790), FROM_DAYS(733687)
+----
+2020-01-01	2008-10-07
+
+# They round-trip.
+query
+SELECT TO_DAYS(FROM_DAYS(737790)), FROM_DAYS(TO_DAYS('2020-06-15'))
+----
+737790	2020-06-15
+
+# The day-number difference equals DATEDIFF.
+query
+SELECT TO_DAYS('2020-01-10') - TO_DAYS('2020-01-01'), DATEDIFF('2020-01-10', '2020-01-01')
+----
+9	9
+
+# NULL propagates through both.
+query
+SELECT TO_DAYS(NULL), FROM_DAYS(NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS td_demo (id INT PRIMARY KEY, d DATE)
+
+statement ok
+INSERT INTO td_demo (id, d) VALUES (1, '2020-01-01'), (2, '2020-12-31')
+
+query
+SELECT id, TO_DAYS(d) FROM td_demo ORDER BY id
+----
+1	737790
+2	738155

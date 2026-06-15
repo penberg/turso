@@ -2996,6 +2996,15 @@ impl Parser {
             return self.datediff_call();
         }
 
+        // `TO_DAYS(d)` is the day number since year 0; `FROM_DAYS(n)` is its
+        // inverse. Both are offsets of the engine's Julian day.
+        if upper == "TO_DAYS" {
+            return self.to_days_call();
+        }
+        if upper == "FROM_DAYS" {
+            return self.from_days_call();
+        }
+
         // `TIMESTAMPDIFF(unit, a, b)` is `b - a` in whole `unit`s. The
         // fixed-duration units lower to integer division of the epoch-second
         // difference.
@@ -4075,6 +4084,49 @@ impl Parser {
                 array_dimensions: 0,
             }),
         })
+    }
+
+    /// Lowers `TO_DAYS(d)` (the name and `(` are already consumed) to the MySQL
+    /// day number — days since year 0 — as `CAST(julianday(date(d)) AS INTEGER)`
+    /// minus the constant `1721059`. The `date()` wrapper drops any time part (so
+    /// it stays the whole-day count regardless of the hour), and the offset shifts
+    /// the engine's Julian day onto MySQL's proleptic-Gregorian day count. NULL
+    /// propagates. (Like MySQL, only modern Gregorian dates are meaningful.)
+    /// Exactly one argument is required.
+    #[allow(clippy::wrong_self_convention)]
+    fn to_days_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let julian = ast::Expr::Cast {
+            expr: Box::new(unary_fn("julianday", unary_fn("date", arg))),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        };
+        Ok(ast::Expr::binary(
+            julian,
+            ast::Operator::Subtract,
+            ast::Expr::Literal(ast::Literal::Numeric("1721059".to_string())),
+        ))
+    }
+
+    /// Lowers `FROM_DAYS(n)` (the name and `(` are already consumed) — the inverse
+    /// of `TO_DAYS` — to `date(n + 1721059.5)`. Adding the offset (with the `.5`
+    /// for the midnight-vs-noon Julian convention) turns the day number back into
+    /// a Julian day, which `date()` renders as `'YYYY-MM-DD'`. NULL propagates.
+    /// Exactly one argument is required.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_days_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let julian = ast::Expr::binary(
+            arg,
+            ast::Operator::Add,
+            ast::Expr::Literal(ast::Literal::Numeric("1721059.5".to_string())),
+        );
+        Ok(unary_fn("date", julian))
     }
 
     /// Lowers `TIME_TO_SEC(t)` (the name and `(` are already consumed) to the
@@ -7450,6 +7502,32 @@ mod tests {
         // A unit without an engine modifier and a non-literal amount are rejected.
         assert!(parse_expr("TIMESTAMPADD(MICROSECOND, 1, d)").is_err());
         assert!(parse_expr("TIMESTAMPADD(DAY, x, d)").is_err());
+    }
+
+    #[test]
+    fn to_days_and_from_days_lower_to_julian_offset() {
+        // TO_DAYS(d) -> CAST(julianday(date(d)) AS INTEGER) - 1721059.
+        let ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) =
+            parse_expr("TO_DAYS(d)").unwrap()
+        else {
+            panic!("expected TO_DAYS to lower to a subtraction");
+        };
+        assert!(matches!(lhs.as_ref(), ast::Expr::Cast { .. }));
+        assert!(
+            matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1721059")
+        );
+
+        // FROM_DAYS(n) -> date(n + 1721059.5).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("FROM_DAYS(n)").unwrap() else {
+            panic!("expected FROM_DAYS to lower to a date() call");
+        };
+        assert_eq!(name.as_str(), "date");
+        let ast::Expr::Binary(_, ast::Operator::Add, off) = args[0].as_ref() else {
+            panic!("expected `n + offset`");
+        };
+        assert!(
+            matches!(off.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1721059.5")
+        );
     }
 
     #[test]
