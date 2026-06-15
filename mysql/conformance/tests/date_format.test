@@ -7,10 +7,11 @@
 # and expands the name specifiers (%M month name, %b abbreviated month, %W
 # weekday name, %a abbreviated weekday) to CASE lookups, and the no-leading-zero
 # numeric specifiers (%e day, %c month, %k hour) to integer casts, the 12-hour
-# clock (%l no-pad, %h/%I padded) and meridiem (%p) to CASE expressions,
-# concatenating the pieces. Literal characters pass through. The format must be a
-# string literal; specifiers without any of these forms (e.g. %D day-with-suffix,
-# %r 12-hour time, %f microseconds) are rejected. See mysql/COMPAT.md.
+# clock (%l no-pad, %h/%I padded), meridiem (%p), and the day-with-ordinal-suffix
+# %D to CASE expressions, concatenating the pieces. Literal characters pass
+# through. The format must be a string literal; specifiers without any of these
+# forms (e.g. %r 12-hour time, %f microseconds, %X week-year) are rejected. See
+# mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -154,3 +155,26 @@ query
 SELECT DATE_FORMAT(NULL, '%l'), DATE_FORMAT(NULL, '%h'), DATE_FORMAT(NULL, '%p')
 ----
 NULL	NULL	NULL
+
+# %D is the day of month with an English ordinal suffix.
+query
+SELECT DATE_FORMAT('2020-03-01', '%D'), DATE_FORMAT('2020-03-02', '%D'), DATE_FORMAT('2020-03-03', '%D'), DATE_FORMAT('2020-03-04', '%D')
+----
+1st	2nd	3rd	4th
+
+# The teens (11-13) are all 'th', and the rules resume past them.
+query
+SELECT DATE_FORMAT('2020-03-11', '%D'), DATE_FORMAT('2020-03-21', '%D'), DATE_FORMAT('2020-03-22', '%D'), DATE_FORMAT('2020-03-31', '%D')
+----
+11th	21st	22nd	31st
+
+# %D composes with the month name (WordPress 'F jS, Y').
+query
+SELECT DATE_FORMAT(d, '%M %D, %Y') FROM df_demo
+----
+March 15th, 2020
+
+query
+SELECT DATE_FORMAT(NULL, '%D')
+----
+NULL

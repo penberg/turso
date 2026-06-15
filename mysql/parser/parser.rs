@@ -4834,6 +4834,41 @@ fn hour12_expr(target: ast::Expr, padded: bool) -> ast::Expr {
     )
 }
 
+/// Builds the day of month with its English ordinal suffix, for `DATE_FORMAT`'s
+/// `%D`: `day || CASE WHEN day BETWEEN 11 AND 13 THEN 'th' WHEN day % 10 = 1 THEN
+/// 'st' WHEN day % 10 = 2 THEN 'nd' WHEN day % 10 = 3 THEN 'rd' ELSE 'th' END`,
+/// where `day` is `CAST(strftime('%d', target) AS INTEGER)`. The teens (11-13)
+/// are special-cased to `th` before the last-digit rules, matching MySQL. A NULL
+/// day makes the leading `day ||` NULL, so the result is NULL.
+fn ordinal_day_expr(target: ast::Expr) -> ast::Expr {
+    let day = cast_strftime_int("%d", target);
+    let num = |n: &str| ast::Expr::Literal(ast::Literal::Numeric(n.to_string()));
+    let text = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+    let last_digit_is = |n: &str| {
+        ast::Expr::binary(
+            modulo(day.clone(), num("10")),
+            ast::Operator::Equals,
+            num(n),
+        )
+    };
+    let teens = ast::Expr::binary(
+        ast::Expr::binary(day.clone(), ast::Operator::GreaterEquals, num("11")),
+        ast::Operator::And,
+        ast::Expr::binary(day.clone(), ast::Operator::LessEquals, num("13")),
+    );
+    let suffix = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (Box::new(teens), Box::new(text("th"))),
+            (Box::new(last_digit_is("1")), Box::new(text("st"))),
+            (Box::new(last_digit_is("2")), Box::new(text("nd"))),
+            (Box::new(last_digit_is("3")), Box::new(text("rd"))),
+        ],
+        else_expr: Some(Box::new(text("th"))),
+    };
+    ast::Expr::binary(day, ast::Operator::Concat, suffix)
+}
+
 /// Builds `CAST(strftime(fmt, arg) AS INTEGER)`, the lowering shared by the
 /// MySQL date-part extractor functions (`YEAR`, `MONTH`, …) and `EXTRACT`. The
 /// integer cast strips strftime's zero-padding to match MySQL's numeric result.
@@ -5029,6 +5064,7 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Int(&'static str),
         Meridiem,
         Hour12 { padded: bool },
+        OrdinalDay,
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut run = String::new();
@@ -5111,6 +5147,11 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
                 flush(&mut run, &mut pieces);
                 pieces.push(Piece::Hour12 { padded: true });
             }
+            // `%D` is the day of month with an English ordinal suffix (1st, 2nd…).
+            Some('D') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::OrdinalDay);
+            }
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
                     "DATE_FORMAT specifier %{other} is not supported yet"
@@ -5131,6 +5172,7 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Piece::Int(fmt) => cast_strftime_int(fmt, target.clone()),
         Piece::Meridiem => meridiem_expr(target.clone()),
         Piece::Hour12 { padded } => hour12_expr(target.clone(), padded),
+        Piece::OrdinalDay => ordinal_day_expr(target.clone()),
     });
     // An empty format renders strftime('', target) — the empty string for a
     // valid target, NULL for a NULL one, matching MySQL.
@@ -6819,12 +6861,17 @@ mod tests {
             panic!("expected %h to lower to a substr() call");
         };
         assert_eq!(name.as_str(), "substr");
-        // Specifiers still without a lowering are rejected (day-with-suffix `%D`,
-        // 12-hour time `%r`, microseconds `%f`).
+        // `%D` (day with ordinal suffix) is `day || CASE ...`, a concatenation.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%D')").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Concat, _)
+        ));
+        // Specifiers still without a lowering are rejected (12-hour time `%r`,
+        // microseconds `%f`, week-year `%X`).
         for fmt in [
-            "DATE_FORMAT(d, '%D')",
             "DATE_FORMAT(d, '%r')",
             "DATE_FORMAT(d, '%f')",
+            "DATE_FORMAT(d, '%X')",
         ] {
             assert!(matches!(
                 parse_expr(fmt).unwrap_err(),
