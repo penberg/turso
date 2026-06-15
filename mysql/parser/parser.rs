@@ -2010,6 +2010,12 @@ impl Parser {
             return self.rand_call();
         }
 
+        // `LEFT(str, len)` (the leftmost `len` characters) lowers to the engine's
+        // `substr(str, 1, len)`.
+        if upper == "LEFT" {
+            return self.left_call();
+        }
+
         // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
         // `datetime(x, '+n unit')` / `datetime(x, '-n unit')` modifier.
         if upper == "DATE_ADD" {
@@ -2236,6 +2242,32 @@ impl Parser {
             ast::Operator::Divide,
             ast::Expr::Literal(ast::Literal::Numeric("1000000000.0".to_string())),
         ))
+    }
+
+    /// Parses a `LEFT(str, len)` call (the name and `(` are already consumed)
+    /// and lowers it to the engine's `substr(str, 1, len)`, which returns the
+    /// same leftmost `len` characters and propagates NULL the same way. Exactly
+    /// two arguments are required.
+    fn left_call(&mut self) -> Result<ast::Expr> {
+        let str_arg = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let len_arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("substr"),
+            distinctness: None,
+            args: vec![
+                Box::new(str_arg),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+                Box::new(len_arg),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
     }
 
     /// Parses the single argument of a `LENGTH(x)` call (the name and `(` are
@@ -4053,6 +4085,20 @@ mod tests {
             panic!("expected the argument to be a CAST");
         };
         assert_eq!(type_name.as_ref().unwrap().name, "BLOB");
+    }
+
+    #[test]
+    fn left_lowers_to_substr() {
+        // LEFT(b, 4) becomes substr(b, 1, 4).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("LEFT(b, 4)").unwrap() else {
+            panic!("expected LEFT to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "substr");
+        assert_eq!(args.len(), 3);
+        assert!(matches!(
+            args[1].as_ref(),
+            ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1"
+        ));
     }
 
     #[test]
