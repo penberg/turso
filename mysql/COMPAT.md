@@ -343,7 +343,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `REPLACE`                              | ✅     | Replaces every occurrence, case-sensitively. |
 | `SUBSTR`                               | ✅     | 1-indexed, optional length, negative position from the end. |
 | `INSTR` / `LOCATE`                     | 🚧     | 1-indexed position of the first match, or 0. `LOCATE(substr, str)` reverses `INSTR`'s operands. Lowered to `instr(lower(str), lower(substr))` so the match is case-insensitive like MySQL's default collation — exact for ASCII; non-ASCII case folding and the 3-arg `LOCATE(substr, str, pos)` form are not modeled. |
-| `TRIM`                                 | ✅     | `TRIM(str)` (leading/trailing spaces); the `TRIM(... FROM ...)` form is not parsed. |
+| `TRIM`                                 | 🚧     | `TRIM(str)` and the `TRIM([{BOTH\|LEADING\|TRAILING}] [remstr] FROM str)` forms, lowered to the engine's `trim`/`ltrim`/`rtrim` (with `remstr` as the second argument). The two-argument engine trim removes any of the *characters* in `remstr`, so it matches MySQL for the default space or a single-character `remstr`; a multi-character `remstr` (which MySQL strips as a whole substring) diverges. |
 | `COUNT(*)` / `COUNT(expr)`             | ✅     | aggregate |
 | `SUM` / `MIN` / `MAX`                  | ✅     | aggregate |
 | `COUNT/SUM/MIN/MAX(DISTINCT expr)`     | ✅     | The `DISTINCT` quantifier on an aggregate; `ALL` is the default and ignored. `DISTINCT` on a scalar function or with `*` is rejected. |

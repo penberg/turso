@@ -2535,6 +2535,13 @@ impl Parser {
             return self.bit_length_call();
         }
 
+        // `TRIM([{BOTH|LEADING|TRAILING}] [remstr] FROM str)` (and the bare
+        // `TRIM(str)`) lower to the engine's `trim`/`ltrim`/`rtrim`. The `FROM`
+        // form needs dedicated parsing, so all TRIM spellings are handled here.
+        if upper == "TRIM" {
+            return self.trim_call();
+        }
+
         // MySQL date-part extractors (`YEAR`, `MONTH`, `DAY`, ...) lower to the
         // engine's `strftime()`, cast to an integer to match MySQL's numeric
         // return (no zero-padding).
@@ -3115,6 +3122,67 @@ impl Parser {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(byte_length_expr(arg))
+    }
+
+    /// Parses a `TRIM(...)` call (the name and `(` are already consumed) in any
+    /// of its MySQL forms and lowers it to the engine's `trim`/`ltrim`/`rtrim`:
+    ///
+    ///   - `TRIM(str)` / `TRIM([BOTH] FROM str)`   → `trim(str)`
+    ///   - `TRIM(LEADING FROM str)`                → `ltrim(str)`
+    ///   - `TRIM(TRAILING FROM str)`               → `rtrim(str)`
+    ///   - `TRIM([BOTH] remstr FROM str)`          → `trim(str, remstr)`
+    ///   - `TRIM(LEADING remstr FROM str)`         → `ltrim(str, remstr)`
+    ///   - `TRIM(TRAILING remstr FROM str)`        → `rtrim(str, remstr)`
+    ///
+    /// The engine's two-argument trim removes any of the *characters* in `remstr`
+    /// from the end(s); this matches MySQL only when `remstr` is a single
+    /// character (or the default space). For a multi-character `remstr` MySQL
+    /// strips the whole substring instead — a documented divergence (see
+    /// `mysql/COMPAT.md`). NULL propagates. A direction keyword requires `FROM`.
+    fn trim_call(&mut self) -> Result<ast::Expr> {
+        let (engine_fn, has_direction) = if self.eat_keyword("LEADING") {
+            ("ltrim", true)
+        } else if self.eat_keyword("TRAILING") {
+            ("rtrim", true)
+        } else if self.eat_keyword("BOTH") {
+            ("trim", true)
+        } else {
+            ("trim", false)
+        };
+
+        let (remstr, target) = if self.eat_keyword("FROM") {
+            // `[direction] FROM str` — no remove-string.
+            (None, self.expr()?)
+        } else {
+            let first = self.expr()?;
+            if self.eat_keyword("FROM") {
+                // `[direction] remstr FROM str`.
+                (Some(first), self.expr()?)
+            } else if has_direction {
+                // `TRIM(LEADING str)` without `FROM` is not valid MySQL.
+                return Err(self.unexpected("`FROM` in TRIM(...)"));
+            } else {
+                // The bare `TRIM(str)` form.
+                (None, first)
+            }
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        let args = match remstr {
+            Some(remstr) => vec![Box::new(target), Box::new(remstr)],
+            None => vec![Box::new(target)],
+        };
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string(engine_fn),
+            distinctness: None,
+            args,
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
     }
 
     /// Lowers `OCTET_LENGTH(x)` (the name and `(` are already consumed). In MySQL
@@ -4064,8 +4132,10 @@ fn is_supported_function(upper_name: &str) -> bool {
         "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
         // `LTRIM`/`RTRIM` strip leading/trailing spaces (their one-argument
-        // MySQL form), like the engine's same-named functions.
-        | "REPLACE" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
+        // MySQL form), like the engine's same-named functions. (`TRIM` is handled
+        // separately by `trim_call`, which also parses the `TRIM(... FROM ...)`
+        // forms.)
+        | "REPLACE" | "SUBSTR" | "LTRIM" | "RTRIM"
         // `CONCAT_WS(sep, ...)` joins the non-NULL arguments with `sep`, skipping
         // NULLs (and yielding NULL only for a NULL separator) — exactly the
         // engine's `concat_ws`. (Distinct from `CONCAT`, which is lowered to `||`
@@ -6216,6 +6286,33 @@ mod tests {
             parse_expr("ISNULL(v)").unwrap(),
             ast::Expr::is_null(col("v"))
         );
+    }
+
+    #[test]
+    fn trim_forms_lower_to_engine_trims() {
+        // Direction selects trim/ltrim/rtrim; an optional remove-string becomes a
+        // second argument (target first, remove-string second).
+        let cases = [
+            ("TRIM(s)", "trim", 1),
+            ("TRIM(BOTH FROM s)", "trim", 1),
+            ("TRIM(LEADING FROM s)", "ltrim", 1),
+            ("TRIM(TRAILING FROM s)", "rtrim", 1),
+            ("TRIM('x' FROM s)", "trim", 2),
+            ("TRIM(LEADING 'x' FROM s)", "ltrim", 2),
+            ("TRIM(TRAILING 'x' FROM s)", "rtrim", 2),
+        ];
+        for (sql, want_fn, want_args) in cases {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a function call");
+            };
+            assert_eq!(name.as_str(), want_fn, "{sql}");
+            assert_eq!(args.len(), want_args, "{sql}");
+            // The target (the trimmed string) is always the first argument.
+            assert_eq!(*args[0], col("s"), "{sql}");
+        }
+
+        // A direction keyword without FROM is a syntax error.
+        assert!(parse_expr("TRIM(LEADING 'x')").is_err());
     }
 
     #[test]

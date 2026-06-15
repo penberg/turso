@@ -1,0 +1,65 @@
+# TRIM(... FROM ...) conformance.
+#
+# MySQL's TRIM has direction and remove-string forms beyond the bare TRIM(str):
+#   TRIM([BOTH] FROM str)            -> both ends, spaces
+#   TRIM(LEADING FROM str)           -> left, spaces
+#   TRIM(TRAILING FROM str)          -> right, spaces
+#   TRIM([{BOTH|LEADING|TRAILING}] remstr FROM str) -> remove remstr from the end(s)
+# The front-end lowers these to the engine's trim/ltrim/rtrim (with the optional
+# remove-string as the second argument).
+#
+# The two-argument engine trim removes any of the *characters* in remstr, which
+# matches MySQL only for a single-character remstr (or the default space); a
+# multi-character remstr is a documented divergence and is not exercised here.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name; results are bracketed with CONCAT so kept spaces are visible.
+
+# Bare TRIM and the BOTH/FROM space forms all strip both ends.
+query
+SELECT CONCAT('[', TRIM('  hi  '), ']'), CONCAT('[', TRIM(BOTH FROM '  hi  '), ']')
+----
+[hi]	[hi]
+
+# LEADING / TRAILING strip only one end.
+query
+SELECT CONCAT('[', TRIM(LEADING FROM '  hi  '), ']'), CONCAT('[', TRIM(TRAILING FROM '  hi  '), ']')
+----
+[hi  ]	[  hi]
+
+# A single-character remove-string, default (both ends).
+query
+SELECT TRIM('x' FROM 'xxhixx')
+----
+hi
+
+# Single-character remove-string with an explicit direction.
+query
+SELECT TRIM(LEADING 'x' FROM 'xxhixx'), TRIM(TRAILING 'x' FROM 'xxhixx')
+----
+hixx	xxhi
+
+# A common case: stripping slashes from a path.
+query
+SELECT TRIM(BOTH '/' FROM '//a/b//')
+----
+a/b
+
+# NULL propagates from either the remove-string or the target.
+query
+SELECT TRIM(NULL FROM 'abc'), TRIM('x' FROM NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS trimf_demo (id INT PRIMARY KEY, w VARCHAR(20))
+
+statement ok
+INSERT INTO trimf_demo (id, w) VALUES (1, '--a--'), (2, '--bc-')
+
+query
+SELECT id, TRIM(BOTH '-' FROM w) FROM trimf_demo ORDER BY id
+----
+1	a
+2	bc
