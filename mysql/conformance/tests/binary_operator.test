@@ -1,0 +1,54 @@
+# BINARY operator conformance.
+#
+# MySQL's `BINARY expr` prefix forces a binary (case- and accent-sensitive)
+# comparison, which WordPress uses to make string comparisons case-sensitive
+# (e.g. exact slug matching). The engine compares with binary collation by
+# default, so `BINARY` is exactly what it already does: the front-end drops the
+# operator and the comparison is case-sensitive on both sides.
+#
+# Note: this is portable precisely because BINARY matches the engine's default;
+# an ordinary (non-BINARY) string comparison is case-insensitive in MySQL but
+# case-sensitive in the engine, which is a separate documented divergence and is
+# not exercised here.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+# BINARY makes the comparison case-sensitive: different case is not equal.
+query
+SELECT BINARY 'abc' = 'ABC', BINARY 'abc' = 'abc'
+----
+0	1
+
+# The operator may prefix either operand.
+query
+SELECT 'abc' = BINARY 'ABC', 'abc' = BINARY 'abc'
+----
+0	1
+
+# A trailing COLLATE alongside BINARY is also accepted (and dropped).
+query
+SELECT BINARY 'x' COLLATE utf8mb4_bin = 'x'
+----
+1
+
+statement ok
+CREATE TABLE IF NOT EXISTS bin_demo (id INT PRIMARY KEY, slug VARCHAR(20))
+
+statement ok
+INSERT INTO bin_demo (id, slug) VALUES (1, 'Hello'), (2, 'hello'), (3, 'HELLO')
+
+# A case-sensitive WHERE: only the exact-case row matches.
+query
+SELECT id FROM bin_demo WHERE BINARY slug = 'hello' ORDER BY id
+----
+2
+
+# Case-sensitive ordering via BINARY in ORDER BY (uppercase sorts before
+# lowercase under a binary collation).
+query
+SELECT slug FROM bin_demo ORDER BY BINARY slug, id
+----
+HELLO
+Hello
+hello

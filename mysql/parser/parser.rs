@@ -2079,14 +2079,23 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// A primary expression optionally followed by a `COLLATE collation_name`
-    /// postfix. MySQL's `COLLATE` overrides the collation used for comparison and
-    /// sorting; the engine is effectively single-collation (binary), so the
-    /// clause is parsed and discarded and the underlying value is unchanged.
-    /// This is an intentional divergence (collation is not honored); see
-    /// `mysql/COMPAT.md`. `COLLATE` binds tighter than the arithmetic operators,
-    /// so it is applied here at the primary tier.
+    /// A primary expression optionally wrapped by the `BINARY` prefix operator
+    /// and/or followed by a `COLLATE collation_name` postfix.
+    ///
+    /// MySQL's `COLLATE` overrides the collation used for comparison and sorting,
+    /// and the `BINARY expr` prefix forces a binary (case- and accent-sensitive)
+    /// comparison. The engine is effectively single-collation (binary), which is
+    /// already what `BINARY` asks for, so the operator is dropped and the value
+    /// returned unchanged; `COLLATE` is likewise parsed and discarded. Honoring a
+    /// case-insensitive collation would need engine support — an intentional
+    /// divergence (see `mysql/COMPAT.md`). Both bind tighter than the arithmetic
+    /// operators, so they are applied here at the primary tier.
     fn collate_expr(&mut self) -> Result<ast::Expr> {
+        // `BINARY expr` — drop the operator; the engine compares binary already.
+        if self.is_keyword("BINARY") {
+            self.advance();
+            return self.collate_expr();
+        }
         let expr = self.primary_expr()?;
         while self.eat_keyword("COLLATE") {
             // The collation name is an identifier (e.g. `utf8mb4_general_ci`);
@@ -5569,6 +5578,26 @@ mod tests {
         assert_eq!(
             parse_expr("a + b COLLATE utf8mb4_general_ci").unwrap(),
             ast::Expr::binary(col("a"), ast::Operator::Add, col("b"))
+        );
+    }
+
+    #[test]
+    fn binary_operator_is_parsed_and_dropped() {
+        // `BINARY expr` parses to just `expr` (the engine is binary already), on
+        // either operand, and composes with a trailing COLLATE.
+        assert_eq!(parse_expr("BINARY a").unwrap(), col("a"));
+        // Composes with a trailing COLLATE (both dropped).
+        assert_eq!(
+            parse_expr("BINARY a COLLATE utf8mb4_bin").unwrap(),
+            col("a")
+        );
+        assert_eq!(
+            parse_expr("BINARY a = b").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::Equals, col("b"))
+        );
+        assert_eq!(
+            parse_expr("a = BINARY b").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::Equals, col("b"))
         );
     }
 
