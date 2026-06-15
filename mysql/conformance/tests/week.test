@@ -1,0 +1,72 @@
+# WEEK(d[, mode]) conformance.
+#
+# MySQL's WEEK has eight numbering modes (the optional second argument; the
+# default is `default_week_format`, normally 0). The front-end supports the
+# three modes whose definition matches an engine strftime week format and lowers
+# WEEK to CAST(strftime(fmt, d) AS INTEGER):
+#   mode 0 -> %U  (Sunday-first, 0-53, week 1 = first week with a Sunday)
+#   mode 3 -> %V  (ISO 8601, Monday-first, 1-53)
+#   mode 5 -> %W  (Monday-first, 0-53, week 1 = first week with a Monday)
+# WordPress's WP_Date_Query / calendar widgets use WEEK for week filters.
+#
+# Scope: only modes 0, 3, and 5 are tested here, since they map exactly to the
+# engine and therefore match a real mysqld. Modes 1/2/4/6/7 have no exact
+# strftime equivalent and are rejected by the front-end (covered by a unit test,
+# not here, because a real mysqld would accept them). NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS wk_demo (a INT PRIMARY KEY, d DATE)
+
+statement ok
+INSERT INTO wk_demo (a, d) VALUES
+  (1, '2020-01-01'), (2, '2020-06-15'), (3, '2020-12-31'), (4, '2021-01-01')
+
+# A bare WEEK(d) defaults to mode 0 (Sunday-first), like MySQL.
+query
+SELECT a, WEEK(d) FROM wk_demo ORDER BY a
+----
+1	0
+2	24
+3	52
+4	0
+
+# Mode 0 explicitly is the same as the default.
+query
+SELECT WEEK('2020-01-01', 0), WEEK('2020-06-15', 0)
+----
+0	24
+
+# Mode 3 is the ISO 8601 week: 2020-01-01 is week 1, and 2021-01-01 belongs to
+# ISO week 53 of the previous year.
+query
+SELECT a, WEEK(d, 3) FROM wk_demo ORDER BY a
+----
+1	1
+2	25
+3	53
+4	53
+
+# Mode 5 is Monday-first with a week 0 for the leading partial week.
+query
+SELECT a, WEEK(d, 5) FROM wk_demo ORDER BY a
+----
+1	0
+2	24
+3	52
+4	0
+
+# NULL propagates through every form.
+query
+SELECT WEEK(NULL), WEEK(NULL, 0), WEEK(NULL, 3), WEEK(NULL, 5)
+----
+NULL	NULL	NULL	NULL
+
+# Usable in a WHERE predicate.
+query
+SELECT a FROM wk_demo WHERE WEEK(d, 3) = 53 ORDER BY a
+----
+3
+4

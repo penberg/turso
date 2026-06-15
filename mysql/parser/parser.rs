@@ -2008,6 +2008,12 @@ impl Parser {
             return self.day_of_week_call(6, true);
         }
 
+        // `WEEK(d[, mode])` lowers to `CAST(strftime(fmt, d) AS INTEGER)` for the
+        // three modes whose definition matches an engine strftime week format.
+        if upper == "WEEK" {
+            return self.week_call();
+        }
+
         // `FIELD(x, a, b, ...)` (the 1-based index of `x` in the list, else 0)
         // lowers to a `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0 END`.
         if upper == "FIELD" {
@@ -2386,6 +2392,70 @@ impl Parser {
             )
         } else {
             shifted
+        })
+    }
+
+    /// Parses `WEEK(d[, mode])` (the name and `(` are already consumed) and
+    /// lowers it to `CAST(strftime(fmt, d) AS INTEGER)`. MySQL's week `mode`
+    /// (default `0`, MySQL's `default_week_format`) selects among eight week
+    /// numbering schemes; only the three whose definition matches an engine
+    /// strftime format are supported:
+    ///   - mode 0 → `%U` (Sunday-first, 0–53, week 1 = first week with a Sunday),
+    ///   - mode 3 → `%V` (ISO 8601, Monday-first, 1–53),
+    ///   - mode 5 → `%W` (Monday-first, 0–53, week 1 = first week with a Monday).
+    /// The other modes (1/2/4/6/7) have no exact strftime equivalent and are
+    /// rejected. The `mode` must be an integer literal.
+    fn week_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        let mode = if self.eat(&Token::Comma) {
+            match self.expr()? {
+                ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<i64>().map_err(|_| {
+                    ParseError::Unsupported("WEEK() mode must be an integer literal".to_string())
+                })?,
+                _ => {
+                    return Err(ParseError::Unsupported(
+                        "WEEK() mode must be an integer literal".to_string(),
+                    ))
+                }
+            }
+        } else {
+            0
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        let fmt = match mode {
+            0 => "%U",
+            3 => "%V",
+            5 => "%W",
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "WEEK() mode {other} is not supported yet \
+                     (only modes 0, 3, and 5 map to an engine week format)"
+                )))
+            }
+        };
+
+        let strftime = ast::Expr::FunctionCall {
+            name: ast::Name::from_string("strftime"),
+            distinctness: None,
+            args: vec![
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(fmt)))),
+                Box::new(arg),
+            ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        Ok(ast::Expr::Cast {
+            expr: Box::new(strftime),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
         })
     }
 
@@ -4162,6 +4232,37 @@ mod tests {
             panic!("expected an addition inside the modulo");
         };
         assert!(matches!(six.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "6"));
+    }
+
+    #[test]
+    fn week_lowers_to_cast_strftime() {
+        // WEEK(d) defaults to mode 0 (%U); modes 3 and 5 map to %V and %W.
+        for (sql, fmt) in [
+            ("WEEK(d)", "'%U'"),
+            ("WEEK(d, 0)", "'%U'"),
+            ("WEEK(d, 3)", "'%V'"),
+            ("WEEK(d, 5)", "'%W'"),
+        ] {
+            let ast::Expr::Cast { expr, type_name } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a CAST");
+            };
+            assert_eq!(type_name.unwrap().name, "INTEGER");
+            let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+                panic!("expected strftime call inside the cast for `{sql}`");
+            };
+            assert_eq!(name.as_str(), "strftime");
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == fmt),
+                "wrong format code for `{sql}`"
+            );
+        }
+        // Modes with no exact engine equivalent are rejected.
+        for mode in [1, 2, 4, 6, 7] {
+            assert!(
+                parse_expr(&format!("WEEK(d, {mode})")).is_err(),
+                "WEEK mode {mode} should be unsupported"
+            );
+        }
     }
 
     #[test]
