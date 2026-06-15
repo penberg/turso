@@ -351,6 +351,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | `IFNULL`                               | ✅     |         |
 | `ISNULL`                               | ✅     | The single-argument test: lowered to the `x IS NULL` predicate, returning 1 if x is NULL else 0. Distinct from the two-argument `IFNULL(x, y)`. |
 | `ABS`                                  | ✅     |         |
+| `ROUND` / `FLOOR` / `CEIL` / `CEILING` / `POW` / `POWER` / `SQRT` / `EXP` / `LN` | ✅ | Numeric functions backed by the engine's identically-named ones (`CEILING`→`ceil`, `POWER`→`pow`); `ROUND(x[, d])` takes the optional decimal-places argument, and NULL propagates. One display difference: the engine renders an integer-valued result as a float (`FLOOR(1.8)` → `1.0`, `POW(2,10)` → `1024.0`) where MySQL prints `1` / `1024`; the numeric value is the same (`FLOOR(1.8) = 1` holds on both). |
 | `LOWER` / `UPPER`                      | ✅     | ASCII case folding. |
 | `REPLACE`                              | ✅     | Replaces every occurrence, case-sensitively. |
 | `SUBSTR`                               | ✅     | 1-indexed, optional length, negative position from the end. Both the comma form `SUBSTR(str, pos[, len])` and the SQL-standard `SUBSTR(str FROM pos [FOR len])` are accepted. |

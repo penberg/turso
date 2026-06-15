@@ -1,0 +1,46 @@
+# Numeric functions: ROUND, FLOOR, CEIL(ING), POW(ER), SQRT, EXP, LN.
+#
+# These MySQL math functions share both name and behaviour with the engine, so
+# the front-end now accepts them (CEILING/POWER are renamed to the engine's
+# ceil/pow). NULL propagates, as in MySQL.
+#
+# Results are asserted via comparisons rather than the raw value: the engine
+# renders an integer-valued float as `N.0` (e.g. FLOOR(1.8) -> 1.0) where MySQL
+# prints `1`, but `FLOOR(1.8) = 1` is true on both. (See mysql/COMPAT.md.) So the
+# checks below pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Rounding family.
+query
+SELECT ROUND(1.55, 1) = 1.6, ROUND(2.5) = 3, ROUND(-1.5) = -2, FLOOR(1.8) = 1, CEIL(1.2) = 2, CEILING(1.01) = 2
+----
+1	1	1	1	1	1
+
+# Powers, roots, exp/log.
+query
+SELECT POW(2, 10) = 1024, POWER(3, 2) = 9, SQRT(16) = 4, EXP(0) = 1, LN(1) = 0
+----
+1	1	1	1	1
+
+# NULL propagates through each.
+query
+SELECT FLOOR(NULL) IS NULL, ROUND(NULL, 2) IS NULL, POW(NULL, 2) IS NULL, SQRT(NULL) IS NULL
+----
+1	1	1	1
+
+# Usable over a column and in WHERE.
+statement ok
+CREATE TABLE IF NOT EXISTS mathf (id INT PRIMARY KEY, v DECIMAL(6,2))
+
+statement ok
+INSERT INTO mathf (id, v) VALUES (1, 2.30), (2, 9.80), (3, 16.00)
+
+query
+SELECT id FROM mathf WHERE FLOOR(v) = 9
+----
+2
+
+query
+SELECT id FROM mathf WHERE SQRT(v) = 4 ORDER BY id
+----
+3

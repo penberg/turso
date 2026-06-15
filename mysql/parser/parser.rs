@@ -5738,6 +5738,12 @@ fn is_supported_function(upper_name: &str) -> bool {
         // `last_insert_rowid()` (renamed below), which matches because MySQL
         // `AUTO_INCREMENT` is lowered to the rowid-alias integer primary key.
         | "SIGN" | "LAST_INSERT_ID"
+        // Numeric functions that share both name and behaviour with the engine.
+        // `ROUND(x[, d])` rounds (to `d` decimals), `FLOOR`/`CEIL` round toward
+        // -inf/+inf, `POW(x, y)` raises to a power, and `SQRT`/`EXP`/`LN` are the
+        // square root, exponential, and natural log. `CEILING`/`POWER` are MySQL
+        // synonyms renamed to `ceil`/`pow` below.
+        | "ROUND" | "FLOOR" | "CEIL" | "CEILING" | "POW" | "POWER" | "SQRT" | "EXP" | "LN"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -5971,6 +5977,8 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
         "GREATEST" => "max",
         "LEAST" => "min",
+        "CEILING" => "ceil",
+        "POWER" => "pow",
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP" => "datetime",
@@ -9183,6 +9191,36 @@ mod tests {
     }
 
     #[test]
+    fn math_functions_parse_and_rename_synonyms() {
+        // Functions that keep their name (the engine resolves them
+        // case-insensitively).
+        for input in ["ROUND(x, 2)", "FLOOR(x)", "CEIL(x)", "POW(x, 2)", "SQRT(x)", "EXP(x)", "LN(x)"]
+        {
+            let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
+                panic!("expected `{input}` to parse as a function call");
+            };
+            assert!(
+                input
+                    .to_ascii_uppercase()
+                    .starts_with(&name.as_str().to_ascii_uppercase()),
+                "`{input}` should keep its name, got `{}`",
+                name.as_str()
+            );
+        }
+
+        // `CEILING`/`POWER` are MySQL synonyms renamed to the engine's `ceil`/`pow`.
+        let ast::Expr::FunctionCall { name, .. } = parse_expr("CEILING(x)").unwrap() else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "ceil");
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("POWER(x, 3)").unwrap() else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "pow");
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
     fn aggregate_distinct() {
         let expr = parse_expr("COUNT(DISTINCT v)").unwrap();
         let ast::Expr::FunctionCall {
@@ -9268,7 +9306,7 @@ mod tests {
     fn function_call_not_in_allow_list_is_unsupported() {
         for input in [
             "SLEEP(1)",
-            "ROUND(2.7)",
+            "TRUNCATE(2.7, 1)",
             "SOUNDEX('x')",
             "totally_made_up(1)",
         ] {
