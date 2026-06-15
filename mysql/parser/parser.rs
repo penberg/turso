@@ -130,16 +130,55 @@ impl Parser {
         // `CREATE` has already been consumed.
         let temporary = self.eat_keyword("TEMPORARY");
         if self.eat_keyword("TABLE") {
-            self.create_table(temporary)
-        } else {
-            let what = match self.peek() {
-                Some(Token::Word(w)) => w.to_ascii_uppercase(),
-                _ => "?".to_string(),
-            };
-            Err(ParseError::Unsupported(format!(
-                "CREATE {what} is not supported yet (only CREATE TABLE is implemented)"
-            )))
+            return self.create_table(temporary);
         }
+        if temporary {
+            return Err(ParseError::Unsupported(
+                "CREATE TEMPORARY only applies to tables".to_string(),
+            ));
+        }
+        // `CREATE [UNIQUE] INDEX idx ON tbl (cols)`.
+        let unique = self.eat_keyword("UNIQUE");
+        if self.eat_keyword("INDEX") {
+            return self.create_index(unique);
+        }
+        let what = match self.peek() {
+            Some(Token::Word(w)) => w.to_ascii_uppercase(),
+            _ => "?".to_string(),
+        };
+        Err(ParseError::Unsupported(format!(
+            "CREATE {what} is not supported yet (only CREATE TABLE / CREATE INDEX are implemented)"
+        )))
+    }
+
+    /// Parses `CREATE [UNIQUE] INDEX idx_name [USING ...] ON tbl_name (cols)`
+    /// (`CREATE [UNIQUE] INDEX` already consumed) into the engine's
+    /// `CREATE [UNIQUE] INDEX`, which it executes natively. Like the
+    /// `ALTER TABLE ... ADD KEY` lowering ([`Self::alter_add_index`]), column
+    /// prefix lengths (`col(191)`) are dropped and an optional `USING
+    /// BTREE/HASH` index type is ignored. An index name is required (MySQL has no
+    /// auto-named standalone `CREATE INDEX`).
+    fn create_index(&mut self, unique: bool) -> Result<ast::Stmt> {
+        let idx_name = self.qualified_name()?;
+        if self.eat_keyword("USING") {
+            let _ = self.name()?;
+        }
+        self.expect_keyword("ON")?;
+        let tbl_name = self.qualified_name()?;
+        if self.eat_keyword("USING") {
+            let _ = self.name()?;
+        }
+        let columns = self.sorted_column_list()?;
+        Ok(ast::Stmt::CreateIndex {
+            unique,
+            if_not_exists: false,
+            idx_name,
+            tbl_name: tbl_name.name,
+            using: None,
+            columns,
+            with_clause: Vec::new(),
+            where_clause: None,
+        })
     }
 
     fn create_table(&mut self, temporary: bool) -> Result<ast::Stmt> {
@@ -3560,6 +3599,33 @@ mod tests {
 
     fn parse(sql: &str) -> Result<ast::Stmt> {
         Parser::new(sql.as_bytes())?.parse_statement()
+    }
+
+    #[test]
+    fn create_index_lowers_to_create_index() {
+        // CREATE [UNIQUE] INDEX idx ON tbl (cols) builds the engine's CreateIndex;
+        // a prefix length is dropped and the USING clause ignored.
+        let cases = [
+            ("CREATE INDEX name_idx ON t (name)", false, "name_idx", 1),
+            ("CREATE UNIQUE INDEX u ON t (code(10))", true, "u", 1),
+            ("CREATE INDEX nc ON t USING BTREE (a, b)", false, "nc", 2),
+        ];
+        for (sql, want_unique, want_name, want_cols) in cases {
+            let ast::Stmt::CreateIndex {
+                unique,
+                idx_name,
+                tbl_name,
+                columns,
+                ..
+            } = parse(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to CREATE INDEX");
+            };
+            assert_eq!(unique, want_unique, "{sql}");
+            assert_eq!(idx_name.name.as_str(), want_name, "{sql}");
+            assert_eq!(tbl_name.as_str(), "t", "{sql}");
+            assert_eq!(columns.len(), want_cols, "{sql}");
+        }
     }
 
     #[test]

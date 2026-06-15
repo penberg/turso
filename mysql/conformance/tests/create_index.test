@@ -1,0 +1,59 @@
+# CREATE INDEX conformance.
+#
+# MySQL's CREATE [UNIQUE] INDEX idx ON tbl (cols) adds a secondary index, which
+# the engine creates natively. The front-end lowers it directly (like the
+# ALTER TABLE ... ADD KEY form): column prefix lengths (col(191)) are dropped --
+# the engine indexes the whole column -- and an optional USING BTREE/HASH index
+# type is ignored.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ci_demo (id INT PRIMARY KEY, name VARCHAR(20), code VARCHAR(20))
+
+statement ok
+INSERT INTO ci_demo (id, name, code) VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')
+
+# A non-unique index is transparent to queries.
+statement ok
+CREATE INDEX ci_name_idx ON ci_demo (name)
+
+query
+SELECT id FROM ci_demo WHERE name = 'b'
+----
+2
+
+# A unique index with a prefix length: the length is dropped, uniqueness enforced.
+statement ok
+CREATE UNIQUE INDEX ci_code_uniq ON ci_demo (code(10))
+
+statement error
+INSERT INTO ci_demo (id, name, code) VALUES (4, 'd', 'x')
+
+statement ok
+INSERT INTO ci_demo (id, name, code) VALUES (4, 'd', 'w')
+
+query
+SELECT id, code FROM ci_demo ORDER BY id
+----
+1	x
+2	y
+3	z
+4	w
+
+# A compound unique index enforces uniqueness over the column pair.
+statement ok
+CREATE UNIQUE INDEX ci_name_code ON ci_demo (name, code)
+
+statement error
+INSERT INTO ci_demo (id, name, code) VALUES (5, 'a', 'x')
+
+statement ok
+INSERT INTO ci_demo (id, name, code) VALUES (5, 'a', 'q')
+
+query
+SELECT id FROM ci_demo WHERE name = 'a' ORDER BY id
+----
+1
+5
