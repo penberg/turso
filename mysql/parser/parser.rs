@@ -2131,8 +2131,8 @@ impl Parser {
     /// engine's are signed, so a result with bit 63 set prints differently (e.g.
     /// MySQL's huge unsigned value vs a negative number). For the common case of
     /// small non-negative operands (flag masks) the results match. The unary `~`
-    /// (which always sets high bits), `^` (bitwise XOR), and the `<<`/`>>` shifts
-    /// are not modeled. (See `mysql/COMPAT.md`.)
+    /// (which always sets high bits) and `^` (bitwise XOR) are not modeled.
+    /// (See `mysql/COMPAT.md`.)
     fn bitor_expr(&mut self) -> Result<ast::Expr> {
         let mut lhs = self.bitand_expr()?;
         while matches!(self.peek(), Some(Token::Other('|'))) {
@@ -2144,13 +2144,33 @@ impl Parser {
     }
 
     /// Bitwise-AND tier: `&`, left-associative. Binds tighter than `|` and looser
-    /// than the arithmetic operators, as in MySQL.
+    /// than the shift operators, as in MySQL.
     fn bitand_expr(&mut self) -> Result<ast::Expr> {
-        let mut lhs = self.additive_expr()?;
+        let mut lhs = self.shift_expr()?;
         while matches!(self.peek(), Some(Token::Other('&'))) {
             self.advance();
-            let rhs = self.additive_expr()?;
+            let rhs = self.shift_expr()?;
             lhs = ast::Expr::binary(lhs, ast::Operator::BitwiseAnd, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// Shift tier: `<<` / `>>`, left-associative. Binds tighter than `&` and
+    /// looser than `+`/`-`, as in MySQL. Like the other bitwise operators these
+    /// act on unsigned 64-bit integers in MySQL but signed in the engine, so a
+    /// result with bit 63 set (e.g. `1 << 63`) or a right shift of a negative
+    /// value diverges; small non-negative shifts match. (See `mysql/COMPAT.md`.)
+    fn shift_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.additive_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::ShiftLeft) => ast::Operator::LeftShift,
+                Some(Token::ShiftRight) => ast::Operator::RightShift,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.additive_expr()?;
+            lhs = ast::Expr::binary(lhs, op, rhs);
         }
         Ok(lhs)
     }
@@ -6426,6 +6446,56 @@ mod tests {
 
         // `~` (unsigned in MySQL, signed here) is not modeled.
         assert!(parse_expr("~a").is_err());
+    }
+
+    #[test]
+    fn shift_operator_precedence() {
+        use ast::Operator::{Add, BitwiseAnd, LeftShift, RightShift};
+
+        assert_eq!(
+            parse_expr("a << b").unwrap(),
+            ast::Expr::binary(col("a"), LeftShift, col("b"))
+        );
+        assert_eq!(
+            parse_expr("a >> b").unwrap(),
+            ast::Expr::binary(col("a"), RightShift, col("b"))
+        );
+
+        // `+` binds tighter than `<<`: a + b << c == (a + b) << c.
+        assert_eq!(
+            parse_expr("a + b << c").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::binary(col("a"), Add, col("b")),
+                LeftShift,
+                col("c"),
+            )
+        );
+
+        // `<<` binds tighter than `&`: a << b & c == (a << b) & c.
+        assert_eq!(
+            parse_expr("a << b & c").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::binary(col("a"), LeftShift, col("b")),
+                BitwiseAnd,
+                col("c"),
+            )
+        );
+
+        // Left-associative: a >> b >> c == (a >> b) >> c.
+        assert_eq!(
+            parse_expr("a >> b >> c").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::binary(col("a"), RightShift, col("b")),
+                RightShift,
+                col("c"),
+            )
+        );
+
+        // The comparison operators are unaffected by the new `<<`/`>>` lexing.
+        assert_eq!(
+            parse_expr("a <> b").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
+        );
     }
 
     #[test]

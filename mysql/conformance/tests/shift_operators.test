@@ -1,0 +1,55 @@
+# Bitwise shift operator (<< and >>) conformance.
+#
+# MySQL's `<<` / `>>` are mapped to the engine's left/right shift. They bind
+# tighter than `&` and looser than `+`/`-`, and are left-associative, as in
+# MySQL. MySQL evaluates on unsigned 64-bit integers and the engine on signed, so
+# a result with bit 63 set (e.g. 1 << 63) or a right shift of a negative value
+# would diverge; for the small non-negative shifts used in practice the results
+# match.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Basic shifts.
+query
+SELECT 1 << 4, 255 >> 4, 1 << 10
+----
+16	15	1024
+
+# Left-associative: 100 >> 2 >> 1 = (100 >> 2) >> 1 = 25 >> 1 = 12.
+query
+SELECT 100 >> 2 >> 1
+----
+12
+
+# Shift binds tighter than `&`/`|`: 3 << 2 | 1 = (3 << 2) | 1 = 13.
+query
+SELECT 3 << 2 | 1, 16 >> 1 & 6
+----
+13	0
+
+# Shift binds looser than `+`: 1 + 1 << 2 = (1 + 1) << 2 = 8.
+query
+SELECT 1 + 1 << 2, (1 + 1) << 2
+----
+8	8
+
+# NULL propagates.
+query
+SELECT 5 << NULL, NULL >> 2
+----
+NULL	NULL
+
+# Usable over a column (doubling / halving via shifts).
+statement ok
+CREATE TABLE IF NOT EXISTS shift_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO shift_demo (id, n) VALUES (1, 1), (2, 4), (3, 32)
+
+query
+SELECT id, n << 1, n >> 1 FROM shift_demo ORDER BY id
+----
+1	2	0
+2	8	2
+3	64	16

@@ -60,10 +60,12 @@ impl<'a> Lexer<'a> {
             b'<' => match self.peek_at(1) {
                 Some(b'=') => self.double(Token::Le),
                 Some(b'>') => self.double(Token::Ne),
+                Some(b'<') => self.double(Token::ShiftLeft),
                 _ => self.single(Token::Lt),
             },
             b'>' => match self.peek_at(1) {
                 Some(b'=') => self.double(Token::Ge),
+                Some(b'>') => self.double(Token::ShiftRight),
                 _ => self.single(Token::Gt),
             },
             b'!' => match self.peek_at(1) {

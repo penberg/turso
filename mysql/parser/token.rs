@@ -37,6 +37,10 @@ pub enum Token {
     Gt,
     /// `>=`
     Ge,
+    /// `<<` — bitwise left shift.
+    ShiftLeft,
+    /// `>>` — bitwise right shift.
+    ShiftRight,
     /// `*`
     Star,
     /// `-`
@@ -70,6 +74,8 @@ impl Token {
             Token::Le => "`<=`".to_string(),
             Token::Gt => "`>`".to_string(),
             Token::Ge => "`>=`".to_string(),
+            Token::ShiftLeft => "`<<`".to_string(),
+            Token::ShiftRight => "`>>`".to_string(),
             Token::Star => "`*`".to_string(),
             Token::Minus => "`-`".to_string(),
             Token::Plus => "`+`".to_string(),
