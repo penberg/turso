@@ -1,0 +1,70 @@
+# The explicit DISTINCT quantifier on set operations.
+#
+# DISTINCT is the default for UNION / INTERSECT / EXCEPT, so `UNION DISTINCT` is
+# the same as `UNION` (both deduplicate). The front-end accepted `UNION` and
+# `UNION ALL` but rejected the explicit `UNION DISTINCT` with a syntax error; it
+# now consumes the DISTINCT quantifier (ignored, since it is the default).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ud_a (x INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS ud_b (x INT)
+
+statement ok
+INSERT INTO ud_a (x) VALUES (1), (2), (3), (3)
+
+statement ok
+INSERT INTO ud_b (x) VALUES (2), (3), (4)
+
+# UNION DISTINCT deduplicates (the doubled 3 and the shared 2/3 collapse).
+query
+SELECT x FROM ud_a UNION DISTINCT SELECT x FROM ud_b ORDER BY x
+----
+1
+2
+3
+4
+
+# It matches plain UNION, and differs from UNION ALL (which keeps duplicates).
+query
+SELECT x FROM ud_a UNION ALL SELECT x FROM ud_b ORDER BY x
+----
+1
+2
+2
+3
+3
+3
+4
+
+# INTERSECT DISTINCT and EXCEPT DISTINCT.
+query
+SELECT x FROM ud_a INTERSECT DISTINCT SELECT x FROM ud_b ORDER BY x
+----
+2
+3
+
+query
+SELECT x FROM ud_a EXCEPT DISTINCT SELECT x FROM ud_b ORDER BY x
+----
+1
+
+# Chained set operations with explicit DISTINCT.
+statement ok
+CREATE TABLE IF NOT EXISTS ud_c (x INT)
+
+statement ok
+INSERT INTO ud_c (x) VALUES (5)
+
+query
+SELECT x FROM ud_a UNION DISTINCT SELECT x FROM ud_b UNION DISTINCT SELECT x FROM ud_c ORDER BY x
+----
+1
+2
+3
+4
+5

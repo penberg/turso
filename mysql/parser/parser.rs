@@ -1567,18 +1567,23 @@ impl Parser {
     fn finish_compound_select(&mut self, first: ast::OneSelect) -> Result<ast::Select> {
         // Set-operation compounds. The operators map straight onto the engine's
         // identical semantics (`UNION` and `INTERSECT`/`EXCEPT` deduplicate;
-        // `UNION ALL` does not). Each branch may be parenthesized.
+        // `UNION ALL` does not). Each branch may be parenthesized. The explicit
+        // `DISTINCT` quantifier is the default for every set operation, so it is
+        // consumed and ignored (`UNION DISTINCT` == `UNION`).
         let mut compounds = Vec::new();
         loop {
             let operator = if self.eat_keyword("UNION") {
                 if self.eat_keyword("ALL") {
                     ast::CompoundOperator::UnionAll
                 } else {
+                    self.eat_keyword("DISTINCT");
                     ast::CompoundOperator::Union
                 }
             } else if self.eat_keyword("INTERSECT") {
+                self.eat_keyword("DISTINCT");
                 ast::CompoundOperator::Intersect
             } else if self.eat_keyword("EXCEPT") {
+                self.eat_keyword("DISTINCT");
                 ast::CompoundOperator::Except
             } else {
                 break;
@@ -7280,6 +7285,33 @@ mod tests {
             unreachable!()
         };
         assert_eq!(s.body.compounds.len(), 2);
+
+        // The explicit `DISTINCT` quantifier is the default, so `UNION DISTINCT`
+        // == `UNION` (and likewise for INTERSECT / EXCEPT).
+        for (sql, op) in [
+            (
+                "SELECT a FROM t UNION DISTINCT SELECT b FROM u",
+                ast::CompoundOperator::Union,
+            ),
+            (
+                "SELECT a FROM t INTERSECT DISTINCT SELECT b FROM u",
+                ast::CompoundOperator::Intersect,
+            ),
+            (
+                "SELECT a FROM t EXCEPT DISTINCT SELECT b FROM u",
+                ast::CompoundOperator::Except,
+            ),
+        ] {
+            let ast::Stmt::Select(s) = parse(sql).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(s.body.compounds.len(), 1, "{sql}");
+            assert_eq!(s.body.compounds[0].operator, op, "{sql}");
+        }
+        assert_eq!(
+            parse("SELECT a FROM t UNION DISTINCT SELECT b FROM u").unwrap(),
+            parse("SELECT a FROM t UNION SELECT b FROM u").unwrap()
+        );
     }
 
     #[test]
