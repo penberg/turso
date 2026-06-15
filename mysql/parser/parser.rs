@@ -1919,15 +1919,36 @@ impl Parser {
     fn comparison_expr(&mut self) -> Result<ast::Expr> {
         let lhs = self.additive_expr()?;
 
-        // `IS [NOT] NULL`
+        // `IS [NOT] {NULL | UNKNOWN | TRUE | FALSE}`. `UNKNOWN` is a synonym for
+        // `NULL`. The boolean tests never yield NULL in MySQL, so `IS TRUE`
+        // lowers to `coalesce(x <> 0, 0)` and `IS FALSE` to `coalesce(x = 0, 0)`
+        // (their `IS NOT` forms flip the comparison and default to 1).
         if self.eat_keyword("IS") {
             let not = self.eat_keyword("NOT");
-            self.expect_keyword("NULL")?;
-            return Ok(if not {
-                ast::Expr::not_null(lhs)
-            } else {
-                ast::Expr::is_null(lhs)
-            });
+            if self.eat_keyword("NULL") || self.eat_keyword("UNKNOWN") {
+                return Ok(if not {
+                    ast::Expr::not_null(lhs)
+                } else {
+                    ast::Expr::is_null(lhs)
+                });
+            }
+            if self.eat_keyword("TRUE") {
+                let (op, default) = if not {
+                    (ast::Operator::Equals, "1")
+                } else {
+                    (ast::Operator::NotEquals, "0")
+                };
+                return Ok(coalesce_truthiness(lhs, op, default));
+            }
+            if self.eat_keyword("FALSE") {
+                let (op, default) = if not {
+                    (ast::Operator::NotEquals, "1")
+                } else {
+                    (ast::Operator::Equals, "0")
+                };
+                return Ok(coalesce_truthiness(lhs, op, default));
+            }
+            return Err(self.unexpected("`NULL`, `UNKNOWN`, `TRUE`, or `FALSE`"));
         }
 
         // Infix `[NOT] IN / BETWEEN / LIKE`. At this point any prefix `NOT` has
@@ -3537,6 +3558,34 @@ fn numeric_expr(value: &str) -> Box<ast::Expr> {
 }
 
 /// Builds a single-argument engine function call, e.g. `julianday(arg)`.
+/// Builds `coalesce(expr <op> 0, default)`, the lowering for the MySQL boolean
+/// tests `IS [NOT] TRUE/FALSE`: the comparison yields 1/0 (or NULL when `expr`
+/// is NULL), and the `coalesce` default replaces that NULL so the result is
+/// always 0 or 1, never NULL.
+fn coalesce_truthiness(expr: ast::Expr, op: ast::Operator, default: &str) -> ast::Expr {
+    let cmp = ast::Expr::binary(
+        expr,
+        op,
+        ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+    );
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string("coalesce"),
+        distinctness: None,
+        args: vec![
+            Box::new(cmp),
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                default.to_string(),
+            ))),
+        ],
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
 /// Builds `CAST(a / b AS INTEGER)` — the integer quotient (truncated toward
 /// zero), used to lower the MySQL `DIV` operator and the quotient inside `MOD`.
 fn integer_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
@@ -5037,6 +5086,40 @@ mod tests {
             parse_expr("a IS NOT NULL").unwrap(),
             ast::Expr::not_null(col("a"))
         );
+    }
+
+    #[test]
+    fn expr_is_truthiness() {
+        // IS [NOT] UNKNOWN is exactly IS [NOT] NULL.
+        assert_eq!(
+            parse_expr("a IS UNKNOWN").unwrap(),
+            ast::Expr::is_null(col("a"))
+        );
+        assert_eq!(
+            parse_expr("a IS NOT UNKNOWN").unwrap(),
+            ast::Expr::not_null(col("a"))
+        );
+
+        // IS TRUE / IS FALSE lower to coalesce(a <op> 0, default).
+        for (sql, op, default) in [
+            ("a IS TRUE", ast::Operator::NotEquals, "0"),
+            ("a IS FALSE", ast::Operator::Equals, "0"),
+            ("a IS NOT TRUE", ast::Operator::Equals, "1"),
+            ("a IS NOT FALSE", ast::Operator::NotEquals, "1"),
+        ] {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to coalesce(...)");
+            };
+            assert_eq!(name.as_str(), "coalesce", "{sql}");
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Binary(_, o, _) if *o == op),
+                "{sql}"
+            );
+            assert!(
+                matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == default),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

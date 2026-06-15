@@ -1,0 +1,70 @@
+# IS [NOT] TRUE / FALSE / UNKNOWN conformance.
+#
+# MySQL's boolean tests treat any non-zero, non-NULL value as TRUE, zero as
+# FALSE, and NULL as UNKNOWN; they always return 1 or 0, never NULL. The
+# front-end lowers them:
+#   x IS UNKNOWN  -> x IS NULL        (and IS NOT UNKNOWN -> IS NOT NULL)
+#   x IS TRUE     -> coalesce(x <> 0, 0)
+#   x IS FALSE    -> coalesce(x = 0, 0)
+# with the IS NOT forms flipping the comparison and defaulting to 1.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+# IS TRUE: non-zero is true; zero and NULL are not.
+query
+SELECT 5 IS TRUE, 0 IS TRUE, NULL IS TRUE
+----
+1	0	0
+
+# IS FALSE: only zero is false.
+query
+SELECT 0 IS FALSE, 5 IS FALSE, NULL IS FALSE
+----
+1	0	0
+
+# IS UNKNOWN is IS NULL.
+query
+SELECT NULL IS UNKNOWN, 5 IS UNKNOWN
+----
+1	0
+
+# The IS NOT forms negate, and never yield NULL.
+query
+SELECT 5 IS NOT TRUE, 0 IS NOT TRUE, NULL IS NOT TRUE
+----
+0	1	1
+
+query
+SELECT 0 IS NOT FALSE, 5 IS NOT FALSE, NULL IS NOT FALSE
+----
+0	1	1
+
+query
+SELECT NULL IS NOT UNKNOWN, 5 IS NOT UNKNOWN
+----
+0	1
+
+# A comparison result is itself testable: (3 > 1) IS TRUE.
+query
+SELECT (3 > 1) IS TRUE, (3 < 1) IS TRUE
+----
+1	0
+
+# In a WHERE predicate over a column with a NULL.
+statement ok
+CREATE TABLE IF NOT EXISTS tr_demo (id INT PRIMARY KEY, flag INT)
+
+statement ok
+INSERT INTO tr_demo (id, flag) VALUES (1, 1), (2, 0), (3, NULL)
+
+query
+SELECT id FROM tr_demo WHERE flag IS TRUE ORDER BY id
+----
+1
+
+query
+SELECT id FROM tr_demo WHERE flag IS NOT TRUE ORDER BY id
+----
+2
+3
