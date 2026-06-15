@@ -1,0 +1,53 @@
+# DATE() / TIME() / TIMESTAMP() conformance.
+#
+# MySQL's single-argument DATE(x), TIME(x), and TIMESTAMP(x) return the date,
+# time, and full datetime of a value. They map onto the engine's date(), time(),
+# and datetime() functions (renamed by the front-end), which render the same
+# 'YYYY-MM-DD' / 'HH:MM:SS' / 'YYYY-MM-DD HH:MM:SS' forms. WordPress and plugins
+# use DATE() to filter by the date part (WHERE DATE(post_date) = ...). NULL
+# propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS dtf_demo (id INT PRIMARY KEY, dt DATETIME)
+
+statement ok
+INSERT INTO dtf_demo (id, dt) VALUES
+  (1, '2020-01-01 05:30:00'),
+  (2, '2020-06-15 23:59:59'),
+  (3, '2020-06-15 00:00:01')
+
+# DATE keeps the date part; TIME keeps the time part.
+query
+SELECT DATE('2020-03-15 10:30:45'), TIME('2020-03-15 10:30:45')
+----
+2020-03-15	10:30:45
+
+# TIMESTAMP of a bare date fills the time with midnight.
+query
+SELECT TIMESTAMP('2020-03-15')
+----
+2020-03-15 00:00:00
+
+# Column form, ORDER BY-deterministic.
+query
+SELECT id, DATE(dt), TIME(dt) FROM dtf_demo ORDER BY id
+----
+1	2020-01-01	05:30:00
+2	2020-06-15	23:59:59
+3	2020-06-15	00:00:01
+
+# NULL propagates.
+query
+SELECT DATE(NULL), TIME(NULL), TIMESTAMP(NULL)
+----
+NULL	NULL	NULL
+
+# Filtering by the date part collapses different times on the same day.
+query
+SELECT id FROM dtf_demo WHERE DATE(dt) = '2020-06-15' ORDER BY id
+----
+2
+3

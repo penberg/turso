@@ -3808,6 +3808,10 @@ fn is_supported_function(upper_name: &str) -> bool {
         // The scalar `GREATEST` / `LEAST` map to the engine's multi-argument
         // `max` / `min`, which — like MySQL — return NULL if any argument is NULL.
         | "GREATEST" | "LEAST"
+        // The single-argument date/time extractors `DATE`/`TIME`/`TIMESTAMP` map
+        // onto the engine's `date`/`time`/`datetime` (renamed below). They return
+        // the date, time, or full datetime of the value, like MySQL.
+        | "DATE" | "TIME" | "TIMESTAMP"
         // Aggregate functions.
         | "COUNT" | "SUM" | "MIN" | "MAX"
     )
@@ -3916,6 +3920,9 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
         "GREATEST" => "max",
         "LEAST" => "min",
+        "DATE" => "date",
+        "TIME" => "time",
+        "TIMESTAMP" => "datetime",
         _ => return None,
     })
 }
@@ -6044,6 +6051,9 @@ mod tests {
             ("CHARACTER_LENGTH('s')", "length"),
             ("GREATEST(1, 2, 3)", "max"),
             ("LEAST(1, 2, 3)", "min"),
+            ("DATE('2020-01-01 10:00')", "date"),
+            ("TIME('2020-01-01 10:00')", "time"),
+            ("TIMESTAMP('2020-01-01')", "datetime"),
         ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");
