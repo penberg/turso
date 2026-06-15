@@ -221,8 +221,8 @@ incomplete.
 | CREATE SPATIAL REFERENCE SYSTEM        | ❌     |         |
 | CREATE TABLE                           | ❌     | MySQL types, storage engines, and table options not translated. |
 | CREATE TEMPORARY TABLE                 | ✅     | Session-private and dropped at disconnect, like the engine's TEMP tables. |
-| CREATE TABLE ... LIKE                  | ❌     |         |
-| CREATE TABLE ... SELECT                | ❌     |         |
+| CREATE TABLE ... LIKE                  | ❌     | No engine equivalent (schema-only copy); rejected. |
+| CREATE TABLE [AS] SELECT               | ✅     | `CREATE TABLE name [AS] SELECT ...` (the `AS` is optional) builds the table from the query's result rows and columns, evaluated by the engine like SQLite; composes with `TEMPORARY` and `IF NOT EXISTS`. The form with an explicit leading column list before the select is not modeled. |
 | CREATE TABLESPACE                      | ❌     |         |
 | CREATE TRIGGER                         | ❌     |         |
 | CREATE VIEW                            | ❌     |         |

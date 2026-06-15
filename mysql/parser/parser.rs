@@ -201,10 +201,27 @@ impl Parser {
 
         let tbl_name = self.qualified_name()?;
 
-        // Only the explicit column-list form is supported (not LIKE / AS SELECT).
+        // `CREATE TABLE name [AS] SELECT ...` — create-table-as-select. MySQL
+        // makes the `AS` optional; the engine builds the table from the query's
+        // result columns. (The form with an explicit leading column list before
+        // the select is not modeled — the engine's body carries only the select.)
+        let as_kw = self.eat_keyword("AS");
+        if as_kw || self.is_keyword("SELECT") {
+            self.expect_keyword("SELECT")?;
+            let select = self.parse_select()?;
+            return Ok(ast::Stmt::CreateTable {
+                temporary,
+                if_not_exists,
+                tbl_name,
+                body: ast::CreateTableBody::AsSelect(select),
+            });
+        }
+
+        // Otherwise the explicit column-list form is required (not `LIKE`, which
+        // has no engine equivalent).
         if !self.is(&Token::LParen) {
             return Err(ParseError::Unsupported(
-                "CREATE TABLE without a column list (LIKE / AS SELECT)".to_string(),
+                "CREATE TABLE without a column list or AS SELECT (e.g. LIKE)".to_string(),
             ));
         }
         self.expect(&Token::LParen, "`(`")?;
@@ -5349,6 +5366,41 @@ mod tests {
         assert_eq!(columns[0].col_name.as_str(), "id");
         assert_eq!(columns[0].col_type.as_ref().unwrap().name, "INT");
         assert_eq!(columns[1].col_name.as_str(), "name");
+    }
+
+    #[test]
+    fn create_table_as_select() {
+        // CREATE TABLE name AS SELECT ... -> an AS-SELECT body.
+        for sql in [
+            "CREATE TABLE t AS SELECT id, n FROM src WHERE n > 0",
+            // The AS keyword is optional.
+            "CREATE TABLE t SELECT id FROM src",
+        ] {
+            let ast::Stmt::CreateTable { tbl_name, body, .. } = parse(sql).unwrap() else {
+                panic!("expected CreateTable for `{sql}`");
+            };
+            assert_eq!(tbl_name.name.as_str(), "t");
+            assert!(
+                matches!(body, ast::CreateTableBody::AsSelect(_)),
+                "expected an AS-SELECT body for `{sql}`"
+            );
+        }
+
+        // The TEMPORARY and IF NOT EXISTS modifiers compose with AS SELECT.
+        let ast::Stmt::CreateTable {
+            temporary, body, ..
+        } = parse("CREATE TEMPORARY TABLE IF NOT EXISTS t AS SELECT 1").unwrap()
+        else {
+            panic!("expected CreateTable");
+        };
+        assert!(temporary);
+        assert!(matches!(body, ast::CreateTableBody::AsSelect(_)));
+
+        // The LIKE form has no engine equivalent and is rejected.
+        assert!(matches!(
+            parse("CREATE TABLE t LIKE src").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]

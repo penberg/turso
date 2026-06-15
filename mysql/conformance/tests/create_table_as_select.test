@@ -1,0 +1,68 @@
+# CREATE TABLE ... [AS] SELECT (CTAS) conformance.
+#
+# MySQL's CREATE TABLE name [AS] SELECT ... builds a new table from a query's
+# result rows and columns (the AS is optional). The engine supports this
+# natively, so the front-end parses the optional AS plus the SELECT and emits an
+# AS-SELECT create-table body. The LIKE form (copy schema only) has no engine
+# equivalent and stays rejected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ctas_src (id INT PRIMARY KEY, n INT, label VARCHAR(10))
+
+statement ok
+INSERT INTO ctas_src (id, n, label) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+
+# Copy every row and column.
+statement ok
+CREATE TABLE ctas_all AS SELECT * FROM ctas_src
+
+query
+SELECT id, n, label FROM ctas_all ORDER BY id
+----
+1	10	a
+2	20	b
+3	30	c
+
+# A filtered, projected copy.
+statement ok
+CREATE TABLE ctas_filtered AS SELECT id, n FROM ctas_src WHERE n >= 20
+
+query
+SELECT id, n FROM ctas_filtered ORDER BY id
+----
+2	20
+3	30
+
+# Column aliases and computed expressions become the new table's columns.
+statement ok
+CREATE TABLE ctas_computed AS SELECT id AS k, n * 2 AS doubled FROM ctas_src WHERE id = 1
+
+query
+SELECT k, doubled FROM ctas_computed
+----
+1	20
+
+# The AS keyword is optional (CREATE TABLE name SELECT ...).
+statement ok
+CREATE TABLE ctas_noas SELECT id FROM ctas_src WHERE id = 3
+
+query
+SELECT id FROM ctas_noas
+----
+3
+
+# The copy is independent of the source: mutating it does not affect the source.
+statement ok
+INSERT INTO ctas_all (id, n, label) VALUES (4, 40, 'd')
+
+query
+SELECT COUNT(*) FROM ctas_src
+----
+3
+
+# The LIKE form (schema copy only) is not supported.
+statement error
+CREATE TABLE ctas_like LIKE ctas_src
