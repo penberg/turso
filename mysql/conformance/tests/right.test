@@ -1,0 +1,55 @@
+# RIGHT(str, len) conformance.
+#
+# MySQL's RIGHT(str, len) returns the rightmost `len` characters of `str`. The
+# front-end lowers it to the engine's substr(str, -len, len): a negative start
+# counts `len` characters from the end. A NULL string yields NULL, len <= 0
+# yields the empty string, and len past the end of the string yields the whole
+# string — all reproduced by substr(str, -len, len).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Every
+# row-returning query is ORDER BY-deterministic. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS right_demo (a INT PRIMARY KEY, b VARCHAR(32))
+
+statement ok
+INSERT INTO right_demo (a, b) VALUES (1, 'hello'), (2, 'wordpress'), (3, NULL)
+
+# The rightmost N characters of a literal.
+query
+SELECT RIGHT('hello world', 5)
+----
+world
+
+# Column form, ORDER BY-deterministic.
+query
+SELECT a, RIGHT(b, 4) FROM right_demo ORDER BY a
+----
+1	ello
+2	ress
+3	NULL
+
+# len past the end returns the whole string.
+query
+SELECT RIGHT('abc', 10)
+----
+abc
+
+# len of zero returns the empty string (wrapped in brackets so the empty result
+# is visible — a bare empty row is indistinguishable from "no rows" in the DSL).
+query
+SELECT CONCAT('[', RIGHT('abc', 0), ']')
+----
+[]
+
+# A NULL length yields NULL.
+query
+SELECT RIGHT('abc', NULL)
+----
+NULL
+
+# Usable in a WHERE predicate.
+query
+SELECT a FROM right_demo WHERE RIGHT(b, 4) = 'ress' ORDER BY a
+----
+2

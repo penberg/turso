@@ -2281,6 +2281,12 @@ impl Parser {
             return self.left_call();
         }
 
+        // `RIGHT(str, len)` (the rightmost `len` characters) lowers to the
+        // engine's `substr(str, -len, len)`.
+        if upper == "RIGHT" {
+            return self.right_call();
+        }
+
         // `GET_LOCK(name[, timeout])` / `RELEASE_LOCK(name)` are MySQL advisory
         // locks. This is a single-node engine with no cross-session lock table,
         // so they fold to a constant `1` ("acquired" / "released") — matching
@@ -2568,6 +2574,36 @@ impl Parser {
                 Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
                 Box::new(len_arg),
             ],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })
+    }
+
+    /// Parses a `RIGHT(str, len)` call (the name and `(` are already consumed)
+    /// and lowers it to the engine's `substr(str, -len, len)` — a negative start
+    /// counts `len` characters from the end. This reproduces MySQL's rightmost-
+    /// `len` semantics across the edge cases: `len` past the string length yields
+    /// the whole string (the start clamps to the front), `len` of zero yields the
+    /// empty string, and NULL propagates. Exactly two arguments are required.
+    fn right_call(&mut self) -> Result<ast::Expr> {
+        let str_arg = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let len_arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        // `-len`, built as `0 - len` to avoid a unary-minus node.
+        let neg_len = ast::Expr::binary(
+            ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+            ast::Operator::Subtract,
+            len_arg.clone(),
+        );
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("substr"),
+            distinctness: None,
+            args: vec![Box::new(str_arg), Box::new(neg_len), Box::new(len_arg)],
             order_by: Vec::new(),
             within_group: Vec::new(),
             filter_over: ast::FunctionTail {
@@ -4915,6 +4951,24 @@ mod tests {
             args[1].as_ref(),
             ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1"
         ));
+    }
+
+    #[test]
+    fn right_lowers_to_substr_from_end() {
+        // RIGHT(b, 4) becomes substr(b, 0 - 4, 4): a negative start counts from
+        // the end, and the third argument is the same length.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("RIGHT(b, 4)").unwrap() else {
+            panic!("expected RIGHT to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "substr");
+        assert_eq!(args.len(), 3);
+        assert!(
+            matches!(
+                args[1].as_ref(),
+                ast::Expr::Binary(_, ast::Operator::Subtract, _)
+            ),
+            "expected the start argument to be `0 - len`"
+        );
     }
 
     #[test]
