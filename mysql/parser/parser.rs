@@ -870,10 +870,11 @@ impl Parser {
             self.expect(&Token::RParen, "`)`")?;
         }
 
-        if self.is_keyword("SET") {
-            return Err(ParseError::Unsupported(
-                "INSERT ... SET is not supported yet".to_string(),
-            ));
+        // `INSERT [INTO] tbl SET col = expr, ...` is MySQL's assignment-list form,
+        // equivalent to `INSERT INTO tbl (col, ...) VALUES (expr, ...)`. It only
+        // applies without an explicit column list.
+        if columns.is_empty() && self.eat_keyword("SET") {
+            return self.insert_set(or_conflict, tbl_name);
         }
 
         // `INSERT [INTO] tbl [(cols)] SELECT ...`: the rows come from a query,
@@ -938,6 +939,55 @@ impl Parser {
                     with: None,
                     body: ast::SelectBody {
                         select: ast::OneSelect::Values(rows),
+                        compounds: Vec::new(),
+                    },
+                    order_by: Vec::new(),
+                    limit: None,
+                },
+                upsert,
+            ),
+            returning: Vec::new(),
+        })
+    }
+
+    /// Parses the `INSERT [INTO] tbl SET col = expr [, ...]` assignment-list form
+    /// (the `SET` keyword is already consumed) and builds the same statement as
+    /// the equivalent `INSERT INTO tbl (col, ...) VALUES (expr, ...)`. A trailing
+    /// `ON DUPLICATE KEY UPDATE` is honored for the non-`REPLACE` form, exactly as
+    /// for the VALUES form.
+    fn insert_set(
+        &mut self,
+        or_conflict: Option<ast::ResolveType>,
+        tbl_name: ast::QualifiedName,
+    ) -> Result<ast::Stmt> {
+        let mut columns = Vec::new();
+        let mut row = Vec::new();
+        loop {
+            columns.push(self.name()?);
+            self.expect(&Token::Eq, "`=`")?;
+            row.push(Box::new(self.expr()?));
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+
+        let upsert = if or_conflict.is_none() && self.eat_keyword("ON") {
+            Some(Box::new(self.on_duplicate_key_update()?))
+        } else {
+            None
+        };
+
+        Ok(ast::Stmt::Insert {
+            with: None,
+            or_conflict,
+            tbl_name,
+            columns,
+            body: ast::InsertBody::Select(
+                ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: ast::OneSelect::Values(vec![row]),
                         compounds: Vec::new(),
                     },
                     order_by: Vec::new(),
@@ -4101,15 +4151,45 @@ mod tests {
 
     #[test]
     fn insert_unsupported_variants() {
-        for sql in [
-            "INSERT INTO t SET a = 1",
-            "INSERT DELAYED INTO t VALUES (1)",
-        ] {
+        for sql in ["INSERT DELAYED INTO t VALUES (1)"] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn insert_set_lowers_to_columns_and_values() {
+        // INSERT ... SET col = expr, ... becomes the equivalent columns + VALUES.
+        let ast::Stmt::Insert {
+            tbl_name,
+            columns,
+            body,
+            ..
+        } = parse("INSERT INTO t SET a = 1, b = 'x'").unwrap()
+        else {
+            panic!("expected Insert");
+        };
+        assert_eq!(tbl_name.name.as_str(), "t");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].as_str(), "a");
+        assert_eq!(columns[1].as_str(), "b");
+        let ast::InsertBody::Select(select, _) = body else {
+            panic!("expected a VALUES body");
+        };
+        let ast::OneSelect::Values(rows) = select.body.select else {
+            panic!("expected Values");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+
+        // REPLACE ... SET carries the conflict modifier.
+        let ast::Stmt::Insert { or_conflict, .. } = parse("REPLACE INTO t SET a = 1").unwrap()
+        else {
+            panic!("expected Insert");
+        };
+        assert_eq!(or_conflict, Some(ast::ResolveType::Replace));
     }
 
     #[test]

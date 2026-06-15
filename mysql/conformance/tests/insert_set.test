@@ -1,0 +1,51 @@
+# INSERT ... SET conformance.
+#
+# MySQL's INSERT [INTO] tbl SET col = expr, ... is the assignment-list form of
+# INSERT, equivalent to INSERT INTO tbl (col, ...) VALUES (expr, ...). The
+# front-end lowers it to exactly that, so a column omitted from the SET list
+# takes its DEFAULT. The IGNORE / REPLACE conflict modifiers and a trailing
+# ON DUPLICATE KEY UPDATE carry through, like the VALUES form.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS iset_demo (id INT PRIMARY KEY, name VARCHAR(20), n INT DEFAULT 0)
+
+# A full assignment list inserts the row.
+statement ok
+INSERT INTO iset_demo SET id = 1, name = 'a', n = 10
+
+# An omitted column takes its DEFAULT (n -> 0 here).
+statement ok
+INSERT INTO iset_demo SET id = 2, name = 'b'
+
+query
+SELECT id, name, n FROM iset_demo ORDER BY id
+----
+1	a	10
+2	b	0
+
+# REPLACE ... SET overwrites a row that conflicts on the primary key.
+statement ok
+REPLACE INTO iset_demo SET id = 1, name = 'A', n = 99
+
+query
+SELECT id, name, n FROM iset_demo WHERE id = 1
+----
+1	A	99
+
+# A trailing ON DUPLICATE KEY UPDATE updates the conflicting row in place; the
+# columns not named in the UPDATE keep their existing values.
+statement ok
+INSERT INTO iset_demo SET id = 2, name = 'dup', n = 7 ON DUPLICATE KEY UPDATE n = 5
+
+query
+SELECT id, name, n FROM iset_demo ORDER BY id
+----
+1	A	99
+2	b	5
+
+# A bare duplicate-key INSERT ... SET (no IGNORE / ON DUPLICATE) still errors.
+statement error
+INSERT INTO iset_demo SET id = 1, name = 'x'
