@@ -1613,16 +1613,24 @@ impl Parser {
             ));
         }
         // `REGEXP` and its synonym `RLIKE` map onto the engine's `REGEXP`
-        // operator (the `regexp` function). The engine's regex is
-        // case-sensitive, unlike MySQL's default case-insensitive REGEXP — a
-        // documented divergence (see `mysql/COMPAT.md`).
+        // operator (the `regexp` function, backed by the Rust regex crate).
+        // MySQL's REGEXP is case-insensitive by default, while the engine's is
+        // case-sensitive, so prepend the regex crate's inline `(?i)` flag to the
+        // pattern — `pattern` becomes `'(?i)' || pattern`. `(?i)` at the start of
+        // a pattern applies case-insensitivity to the whole expression (including
+        // character classes), and a NULL pattern stays NULL through `||`.
         if self.eat_keyword("REGEXP") || self.eat_keyword("RLIKE") {
             let rhs = self.additive_expr()?;
+            let pattern = ast::Expr::binary(
+                ast::Expr::Literal(ast::Literal::String(requote("(?i)"))),
+                ast::Operator::Concat,
+                rhs,
+            );
             return Ok(ast::Expr::like(
                 lhs,
                 not,
                 ast::LikeOperator::Regexp,
-                rhs,
+                pattern,
                 None,
             ));
         }
@@ -4648,10 +4656,19 @@ mod tests {
             "name RLIKE '^a'",
             "name NOT REGEXP '^a'",
         ] {
-            let ast::Expr::Like { op, .. } = parse_expr(sql).unwrap() else {
+            let ast::Expr::Like { op, rhs, .. } = parse_expr(sql).unwrap() else {
                 panic!("expected `{sql}` to parse as a Like/Regexp expression");
             };
             assert_eq!(op, ast::LikeOperator::Regexp, "for `{sql}`");
+            // The pattern is prefixed with the regex crate's `(?i)` flag so the
+            // match is case-insensitive, like MySQL's default REGEXP.
+            let ast::Expr::Binary(flag, ast::Operator::Concat, _) = rhs.as_ref() else {
+                panic!("expected the pattern to be `'(?i)' || <pattern>` for `{sql}`");
+            };
+            assert!(
+                matches!(flag.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'(?i)'"),
+                "for `{sql}`"
+            );
         }
         let expr = parse_expr("name LIKE 'a%'").unwrap();
         let ast::Expr::Like {
