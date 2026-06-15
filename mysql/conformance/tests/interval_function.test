@@ -1,0 +1,47 @@
+# The INTERVAL() function (not the date-arithmetic INTERVAL keyword).
+#
+# INTERVAL(n, n1, n2, ..., nk) returns 0 if n < n1, 1 if n < n2, ..., k if
+# n >= nk -- i.e. how many of the ascending bounds n reaches or exceeds. The
+# front-end synthesizes it as (n>=n1)+(n>=n2)+...+(n>=nk), since a comparison
+# yields 1/0, with a NULL guard (MySQL returns -1 when n is NULL).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# n falls between bounds, below all, and at/above the top bound.
+query
+SELECT INTERVAL(5, 1, 3, 7), INTERVAL(0, 1, 3, 7), INTERVAL(8, 1, 3, 7)
+----
+2	0	3
+
+# A single bound is the degenerate case (0 or 1).
+query
+SELECT INTERVAL(5, 3), INTERVAL(2, 3)
+----
+1	0
+
+# A NULL first argument yields -1.
+query
+SELECT INTERVAL(NULL, 1, 3, 7)
+----
+-1
+
+# A longer ascending list.
+query
+SELECT INTERVAL(23, 1, 15, 17, 30, 44, 200)
+----
+3
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS iv (id INT PRIMARY KEY, score INT)
+
+statement ok
+INSERT INTO iv (id, score) VALUES (1, 0), (2, 50), (3, 95)
+
+query
+SELECT id, INTERVAL(score, 60, 90) FROM iv ORDER BY id
+----
+1	0
+2	0
+3	2

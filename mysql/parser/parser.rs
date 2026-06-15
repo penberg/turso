@@ -3223,6 +3223,12 @@ impl Parser {
             return self.oct_call();
         }
 
+        // `INTERVAL(n, n1, n2, ...)` returns how many of the (ascending) bounds
+        // `n` reaches or exceeds (see `interval_call`).
+        if upper == "INTERVAL" {
+            return self.interval_call();
+        }
+
         // `LOG(x)` is the natural log in MySQL (the engine's 1-arg `log` is
         // base-10), while `LOG(b, x)` is the base-`b` log on both (see `log_call`).
         if upper == "LOG" {
@@ -4156,6 +4162,40 @@ impl Parser {
                 "printf",
                 vec![ast::Expr::Literal(ast::Literal::String(requote("%o"))), n],
             ))),
+        })
+    }
+
+    /// Parses MySQL `INTERVAL(n, n1, n2, ..., nk)` (the name and `(` are already
+    /// consumed). It returns 0 if `n < n1`, 1 if `n < n2`, ..., `k` if `n >= nk`,
+    /// i.e. how many of the (ascending) bounds `n` reaches or exceeds. This is
+    /// the sum of the boolean comparisons `(n >= n1) + (n >= n2) + ... + (n >= nk)`,
+    /// since the engine yields 1/0 for a comparison. MySQL returns -1 when `n` is
+    /// NULL, so a NULL guard wraps the sum. At least one bound is required.
+    fn interval_call(&mut self) -> Result<ast::Expr> {
+        let n = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let mut bounds = vec![self.expr()?];
+        while self.eat(&Token::Comma) {
+            bounds.push(self.expr()?);
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        // (n >= n1) + (n >= n2) + ... + (n >= nk)
+        let mut sum: Option<ast::Expr> = None;
+        for bound in bounds {
+            let cmp = ast::Expr::binary(n.clone(), ast::Operator::GreaterEquals, bound);
+            sum = Some(match sum {
+                None => cmp,
+                Some(acc) => ast::Expr::binary(acc, ast::Operator::Add, cmp),
+            });
+        }
+        let sum = sum.expect("at least one bound");
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(n)),
+                numeric_expr("-1"),
+            )],
+            else_expr: Some(Box::new(sum)),
         })
     }
 
@@ -10258,6 +10298,34 @@ mod tests {
             args[0].as_ref(),
             ast::Expr::Literal(ast::Literal::String(s)) if s == "'%o'"
         ));
+    }
+
+    #[test]
+    fn interval_lowers_to_sum_of_comparisons() {
+        // INTERVAL(n, n1, n2) -> CASE WHEN n IS NULL THEN -1
+        //                        ELSE (n >= n1) + (n >= n2) END.
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("INTERVAL(n, 1, 3, 7)").unwrap()
+        else {
+            panic!("expected INTERVAL to lower to a CASE");
+        };
+        assert_eq!(when_then_pairs.len(), 1);
+        // The NULL guard returns -1.
+        assert!(matches!(
+            &*when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::Numeric(s)) if s == "-1"
+        ));
+        // The else branch sums three comparisons: ((c1 + c2) + c3).
+        let ast::Expr::Binary(_, ast::Operator::Add, _) = else_expr.unwrap().as_ref() else {
+            panic!("expected a sum of comparisons in the else branch");
+        };
+
+        // A single bound is allowed; a missing bound is rejected.
+        assert!(parse_expr("INTERVAL(5, 3)").is_ok());
+        assert!(parse_expr("INTERVAL(5)").is_err());
     }
 
     #[test]
