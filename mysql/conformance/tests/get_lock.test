@@ -1,0 +1,32 @@
+# GET_LOCK / RELEASE_LOCK conformance (single-node no-op model).
+#
+# MySQL's GET_LOCK(name, timeout) / RELEASE_LOCK(name) are cooperative advisory
+# locks. This is a single-node engine with no cross-session lock table, so the
+# front-end folds both to the constant 1 ("acquired" / "released"). For the
+# uncontended acquire-then-release flow WordPress uses, that is exactly MySQL's
+# result, so these queries match a real mysqld.
+#
+# NOT modeled (see mysql/COMPAT.md): contention (MySQL GET_LOCK can return 0 on
+# timeout) and releasing a lock this session never held (MySQL returns 0). Those
+# cases are avoided here, and a NULL/error case is not asserted.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# Acquiring an uncontended lock and releasing it both report success. Evaluated
+# left to right in one statement, so the release follows the acquire.
+query
+SELECT GET_LOCK('conf_lock', 0), RELEASE_LOCK('conf_lock')
+----
+1	1
+
+# A non-zero timeout argument is accepted and ignored.
+query
+SELECT GET_LOCK('conf_lock_2', 10)
+----
+1
+
+# Lock names are arbitrary strings; a second distinct lock also succeeds.
+query
+SELECT GET_LOCK('another', 0), RELEASE_LOCK('another')
+----
+1	1

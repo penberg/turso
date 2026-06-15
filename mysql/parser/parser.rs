@@ -2218,6 +2218,16 @@ impl Parser {
             return self.left_call();
         }
 
+        // `GET_LOCK(name[, timeout])` / `RELEASE_LOCK(name)` are MySQL advisory
+        // locks. This is a single-node engine with no cross-session lock table,
+        // so they fold to a constant `1` ("acquired" / "released") — matching
+        // MySQL for the uncontended acquire/release flow WordPress uses. The lock
+        // name and timeout are parsed and discarded. The contended/not-held cases
+        // (where MySQL returns 0 or NULL) are not modeled (see `mysql/COMPAT.md`).
+        if upper == "GET_LOCK" || upper == "RELEASE_LOCK" {
+            return self.advisory_lock_call();
+        }
+
         // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
         // `datetime(x, '+n unit')` / `datetime(x, '-n unit')` modifier.
         if upper == "DATE_ADD" {
@@ -2457,6 +2467,25 @@ impl Parser {
             ast::Operator::Divide,
             ast::Expr::Literal(ast::Literal::Numeric("1000000000.0".to_string())),
         ))
+    }
+
+    /// Parses a `GET_LOCK(name[, timeout])` / `RELEASE_LOCK(name)` advisory-lock
+    /// call (the name and `(` are already consumed), discards its arguments, and
+    /// folds it to the literal `1`. This single-node engine has no cross-session
+    /// lock table, so the no-op model always reports success; the contended and
+    /// not-held cases (where MySQL returns 0 or NULL) are not reproduced.
+    fn advisory_lock_call(&mut self) -> Result<ast::Expr> {
+        if !self.is(&Token::RParen) {
+            loop {
+                let _ = self.expr()?;
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::Literal(ast::Literal::Numeric("1".to_string())))
     }
 
     /// Parses a `LEFT(str, len)` call (the name and `(` are already consumed)
@@ -4772,6 +4801,17 @@ mod tests {
             parse_expr("RAND(5)").unwrap(),
             ast::Expr::Binary(_, ast::Operator::Divide, _)
         ));
+    }
+
+    #[test]
+    fn advisory_locks_fold_to_one() {
+        // GET_LOCK / RELEASE_LOCK fold to the literal 1 regardless of arguments.
+        for sql in ["GET_LOCK('x', 0)", "GET_LOCK('x', 10)", "RELEASE_LOCK('x')"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1"),
+                "expected `{sql}` to fold to 1"
+            );
+        }
     }
 
     #[test]
