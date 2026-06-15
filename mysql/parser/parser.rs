@@ -1411,9 +1411,11 @@ impl Parser {
                 Some(ast::JoinConstraint::Using(cols))
             } else if matches!(
                 operator,
-                ast::JoinOperator::TypedJoin(Some(t)) if t.contains(ast::JoinType::CROSS)
+                ast::JoinOperator::TypedJoin(Some(t))
+                    if t.contains(ast::JoinType::CROSS) || t.contains(ast::JoinType::NATURAL)
             ) {
-                // A `CROSS JOIN` is a Cartesian product and takes no condition.
+                // A `CROSS JOIN` (Cartesian product) and a `NATURAL JOIN` (joins
+                // on the common columns) both take no explicit condition.
                 None
             } else {
                 return Err(ParseError::Unsupported(
@@ -1509,17 +1511,34 @@ impl Parser {
                 ast::JoinType::INNER,
             ))));
         }
+        // `NATURAL [LEFT|RIGHT [OUTER]] JOIN` joins on the columns common to both
+        // tables, with no explicit condition; the engine evaluates it directly.
+        if self.eat_keyword("NATURAL") {
+            let side = if self.eat_keyword("LEFT") {
+                self.eat_keyword("OUTER");
+                ast::JoinType::LEFT | ast::JoinType::OUTER
+            } else if self.eat_keyword("RIGHT") {
+                self.eat_keyword("OUTER");
+                ast::JoinType::RIGHT | ast::JoinType::OUTER
+            } else {
+                ast::JoinType::INNER
+            };
+            self.expect_keyword("JOIN")?;
+            return Ok(Some(ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::NATURAL | side,
+            ))));
+        }
         if self.eat_keyword("JOIN") {
             return Ok(Some(ast::JoinOperator::TypedJoin(Some(
                 ast::JoinType::INNER,
             ))));
         }
-        for kw in ["FULL", "NATURAL"] {
-            if self.is_keyword(kw) {
-                return Err(ParseError::Unsupported(format!(
-                    "{kw} join is not supported yet"
-                )));
-            }
+        // MySQL has no `FULL [OUTER] JOIN`, so it is rejected (not accepted as a
+        // non-MySQL extension even though the engine could evaluate it).
+        if self.is_keyword("FULL") {
+            return Err(ParseError::Unsupported(
+                "FULL join is not supported yet".to_string(),
+            ));
         }
         Ok(None)
     }
@@ -4525,7 +4544,7 @@ mod tests {
         for sql in [
             "SELECT DISTINCTROW a FROM t",
             "SELECT * FROM a FULL JOIN b ON a.id = b.id",
-            "SELECT * FROM a NATURAL JOIN b",
+            "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
             "SELECT * FROM a JOIN b",
             "SELECT * FROM (SELECT 1)",
             "SELECT a FROM t GROUP BY 1",
@@ -4556,6 +4575,36 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].as_str(), "id");
         assert_eq!(cols[1].as_str(), "ref");
+    }
+
+    #[test]
+    fn natural_join_parses() {
+        // NATURAL [LEFT|RIGHT] JOIN carries the NATURAL flag and takes no
+        // constraint.
+        for (sql, side) in [
+            ("SELECT * FROM a NATURAL JOIN b", ast::JoinType::INNER),
+            ("SELECT * FROM a NATURAL LEFT JOIN b", ast::JoinType::LEFT),
+            (
+                "SELECT * FROM a NATURAL RIGHT OUTER JOIN b",
+                ast::JoinType::RIGHT,
+            ),
+        ] {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select {
+                from: Some(from), ..
+            } = &select.body.select
+            else {
+                panic!("expected a FROM clause for `{sql}`");
+            };
+            let ast::JoinOperator::TypedJoin(Some(t)) = from.joins[0].operator else {
+                panic!("expected a typed join for `{sql}`");
+            };
+            assert!(t.contains(ast::JoinType::NATURAL), "for `{sql}`");
+            assert!(t.contains(side), "for `{sql}`");
+            assert!(from.joins[0].constraint.is_none(), "for `{sql}`");
+        }
     }
 
     #[test]

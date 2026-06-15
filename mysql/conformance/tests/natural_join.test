@@ -1,0 +1,50 @@
+# NATURAL JOIN conformance.
+#
+# A NATURAL JOIN joins two tables on the columns they share by name, with no
+# explicit condition, coalescing each shared column into one output column. The
+# engine evaluates it the same as MySQL, so the front-end just parses
+# NATURAL [LEFT|RIGHT [OUTER]] JOIN. (FULL JOIN is not MySQL syntax and stays
+# rejected.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS nj_a (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS nj_b (id INT PRIMARY KEY, w INT)
+
+statement ok
+INSERT INTO nj_a (id, v) VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO nj_b (id, w) VALUES (1, 100), (3, 300)
+
+# NATURAL JOIN matches on the shared `id` column (merged into one).
+query
+SELECT id, v, w FROM nj_a NATURAL JOIN nj_b ORDER BY id
+----
+1	10	100
+3	30	300
+
+# NATURAL LEFT JOIN keeps every left row; unmatched right columns are NULL.
+query
+SELECT id, v, w FROM nj_a NATURAL LEFT JOIN nj_b ORDER BY id
+----
+1	10	100
+2	20	NULL
+3	30	300
+
+# NATURAL RIGHT JOIN keeps every right row.
+query
+SELECT id, v, w FROM nj_a NATURAL RIGHT JOIN nj_b ORDER BY id
+----
+1	10	100
+3	30	300
+
+# The merged column is selectable unqualified in a WHERE predicate.
+query
+SELECT id FROM nj_a NATURAL JOIN nj_b WHERE w > 100 ORDER BY id
+----
+3
