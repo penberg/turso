@@ -3196,6 +3196,12 @@ impl Parser {
             return self.strcmp_call();
         }
 
+        // `HEX(x)` is overloaded: the uppercase hex of a number, or the hex of a
+        // string's bytes (see `hex_call`).
+        if upper == "HEX" {
+            return self.hex_call();
+        }
+
         // `LOG(x)` is the natural log in MySQL (the engine's 1-arg `log` is
         // base-10), while `LOG(b, x)` is the base-`b` log on both (see `log_call`).
         if upper == "LOG" {
@@ -4100,6 +4106,41 @@ impl Parser {
                 (Box::new(greater), numeric_expr("1")),
             ],
             else_expr: Some(numeric_expr("0")),
+        })
+    }
+
+    /// Parses MySQL `HEX(x)` (the name and `(` are already consumed). `HEX` is
+    /// overloaded: for a number it is the uppercase hexadecimal of the value
+    /// (`HEX(255)` → `FF`), and for a string it is the hex of the string's bytes
+    /// (`HEX('A')` → `41`). The two cannot be told apart at parse time, so it
+    /// dispatches on the runtime type: `printf('%X', x)` for an integer/real,
+    /// else the engine's `hex(x)`, with a NULL guard (the engine's `hex(NULL)` is
+    /// the empty string, not NULL).
+    fn hex_call(&mut self) -> Result<ast::Expr> {
+        let x = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let string_lit =
+            |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+        let typeof_x = unary_fn("typeof", x.clone());
+        let is_numeric = ast::Expr::binary(
+            ast::Expr::binary(typeof_x.clone(), ast::Operator::Equals, string_lit("integer")),
+            ast::Operator::Or,
+            ast::Expr::binary(typeof_x, ast::Operator::Equals, string_lit("real")),
+        );
+        let numeric_hex = call_fn("printf", vec![string_lit("%X"), x.clone()]);
+        let bytes_hex = unary_fn("hex", x.clone());
+
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![
+                (
+                    Box::new(ast::Expr::is_null(x)),
+                    Box::new(ast::Expr::Literal(ast::Literal::Null)),
+                ),
+                (Box::new(is_numeric), Box::new(numeric_hex)),
+            ],
+            else_expr: Some(Box::new(bytes_hex)),
         })
     }
 
@@ -10052,6 +10093,38 @@ mod tests {
         };
         assert_eq!(name.as_str(), "atan2");
         assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn hex_dispatches_on_runtime_type() {
+        // HEX(x) -> CASE WHEN x IS NULL THEN NULL
+        //                WHEN typeof(x) IN (integer, real) THEN printf('%X', x)
+        //                ELSE hex(x) END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("HEX(x)").unwrap()
+        else {
+            panic!("expected HEX to lower to a CASE");
+        };
+        assert!(base.is_none());
+        assert_eq!(when_then_pairs.len(), 2);
+        // The NULL guard comes first.
+        assert!(matches!(
+            *when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        // The numeric branch is printf('%X', x); the else is hex(x).
+        let ast::Expr::FunctionCall { name, .. } = when_then_pairs[1].1.as_ref() else {
+            panic!("expected printf for the numeric branch");
+        };
+        assert_eq!(name.as_str(), "printf");
+        let else_expr = else_expr.unwrap();
+        let ast::Expr::FunctionCall { name, .. } = else_expr.as_ref() else {
+            panic!("expected hex for the else branch");
+        };
+        assert_eq!(name.as_str(), "hex");
     }
 
     #[test]

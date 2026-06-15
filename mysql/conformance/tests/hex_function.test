@@ -1,0 +1,42 @@
+# The HEX() function.
+#
+# MySQL's HEX is overloaded: for a number it returns the uppercase hexadecimal of
+# the value (HEX(255) -> 'FF'), and for a string it returns the hex of the
+# string's bytes (HEX('A') -> '41'). The two cannot be distinguished at parse
+# time, so the front-end dispatches on the runtime type -- printf('%X', x) for an
+# integer/real, otherwise the engine's hex(x) -- with a NULL guard.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Numbers: uppercase hexadecimal of the value.
+query
+SELECT HEX(255), HEX(0), HEX(16), HEX(4294967295)
+----
+FF	0	10	FFFFFFFF
+
+# Strings: hex of the bytes (a numeric *string* is still a string).
+query
+SELECT HEX('A'), HEX('abc'), HEX('xy'), HEX('255')
+----
+41	616263	7879	323535
+
+# NULL propagates (the column dispatch does not turn it into '').
+query
+SELECT HEX(NULL) IS NULL
+----
+1
+
+# HEX is the inverse-ish of the byte interpretation: over a column it follows the
+# stored type (numeric column vs text column).
+statement ok
+CREATE TABLE IF NOT EXISTS hx (id INT PRIMARY KEY, n INT, s VARCHAR(10))
+
+statement ok
+INSERT INTO hx (id, n, s) VALUES (1, 255, 'A'), (2, 16, 'xy')
+
+query
+SELECT id, HEX(n), HEX(s) FROM hx ORDER BY id
+----
+1	FF	41
+2	10	7879
