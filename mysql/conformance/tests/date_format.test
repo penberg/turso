@@ -5,10 +5,11 @@
 # %H, %i (minutes -> %M), %s (seconds -> %S), %j (day of year), %w (weekday
 # number), %U (Sunday-first week), %v (ISO week -> %V), %T (-> %H:%M:%S), %% --
 # and expands the name specifiers (%M month name, %b abbreviated month, %W
-# weekday name, %a abbreviated weekday) to CASE lookups, concatenating the
-# pieces. Literal characters pass through. The format must be a string literal;
-# specifiers without either form (e.g. %h 12-hour, %p AM/PM, %D day-with-suffix)
-# are rejected. See mysql/COMPAT.md.
+# weekday name, %a abbreviated weekday) to CASE lookups, and the no-leading-zero
+# numeric specifiers (%e day, %c month, %k hour) to integer casts, concatenating
+# the pieces. Literal characters pass through. The format must be a string
+# literal; specifiers without any of these forms (e.g. %h 12-hour, %p AM/PM,
+# %D day-with-suffix) are rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -109,3 +110,21 @@ query
 SELECT DATE_FORMAT(NULL, '%W %M')
 ----
 NULL
+
+# %e (day), %c (month), %k (hour) are the no-leading-zero numeric forms.
+query
+SELECT DATE_FORMAT('2020-03-05 09:07:42', '%e'), DATE_FORMAT('2020-03-05', '%c'), DATE_FORMAT('2020-03-05 09:07:42', '%k')
+----
+5	3	9
+
+# %d zero-pads but %e does not (contrast on the same day).
+query
+SELECT DATE_FORMAT('2020-03-05', '%d vs %e')
+----
+05 vs 5
+
+# Composed into a compact date/time.
+query
+SELECT DATE_FORMAT('2020-12-25 23:08:00', '%c/%e %k:%i')
+----
+12/25 23:08

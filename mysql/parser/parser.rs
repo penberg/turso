@@ -4941,15 +4941,19 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
 /// as `strftime(run, target)`. The name specifiers — `%M` (month name), `%b`
 /// (abbreviated month), `%W` (weekday name), `%a` (abbreviated weekday) — have no
 /// strftime form, so each becomes a `CASE`-over-`strftime` name lookup (see
-/// [`name_from_date`]). The pieces are concatenated with `||`. A NULL `target`
-/// makes every piece NULL, so the whole result is NULL, as in MySQL. Any other
-/// specifier (`%h`, `%p`, `%D`, the `%u`/`%V` week modes, …) is rejected rather
-/// than silently mistranslated.
+/// [`name_from_date`]). The no-leading-zero numeric specifiers `%e` (day), `%c`
+/// (month), and `%k` (hour) become the corresponding strftime code cast to an
+/// integer (which drops the zero padding). The pieces are concatenated with
+/// `||`. A NULL `target` makes every piece NULL, so the whole result is NULL, as
+/// in MySQL. Any other specifier (`%h`, `%p`, `%D`, the `%u`/`%V` week modes, …)
+/// is rejected rather than silently mistranslated.
 fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
-    // A piece is either a strftime format run or a name lookup over `target`.
+    // A piece is a strftime format run, a name lookup, or an integer extraction
+    // (a strftime code cast to an integer, which renders without leading zeros).
     enum Piece {
         Fmt(String),
         Name(&'static str, &'static [&'static str], i64),
+        Int(&'static str),
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut run = String::new();
@@ -5003,6 +5007,21 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
                 flush(&mut run, &mut pieces);
                 pieces.push(Piece::Name("%w", &WEEKDAY_NAMES_ABBR, 0));
             }
+            // No-leading-zero numeric specifiers: `%e` day (1-31), `%c` month
+            // (1-12), `%k` hour (0-23). strftime only zero-pads, so cast the
+            // padded value to an integer, which renders without the zero.
+            Some('e') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Int("%d"));
+            }
+            Some('c') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Int("%m"));
+            }
+            Some('k') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Int("%H"));
+            }
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
                     "DATE_FORMAT specifier %{other} is not supported yet"
@@ -5020,6 +5039,7 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
     let mut exprs = pieces.into_iter().map(|piece| match piece {
         Piece::Fmt(fmt) => strftime_text(&fmt, target.clone()),
         Piece::Name(fmt, names, start) => name_from_date(fmt, names, start, target.clone()),
+        Piece::Int(fmt) => cast_strftime_int(fmt, target.clone()),
     });
     // An empty format renders strftime('', target) — the empty string for a
     // valid target, NULL for a NULL one, matching MySQL.
@@ -6686,6 +6706,12 @@ mod tests {
         assert!(matches!(
             parse_expr("DATE_FORMAT(d, '%Y %M')").unwrap(),
             ast::Expr::Binary(_, ast::Operator::Concat, _)
+        ));
+        // The no-leading-zero numeric `%e`/`%c`/`%k` lower to an integer CAST of
+        // the strftime code; `%e` alone is therefore a bare CAST.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%e')").unwrap(),
+            ast::Expr::Cast { .. }
         ));
         // Specifiers with neither a strftime form nor a name lowering are still
         // rejected (12-hour `%h`, AM/PM `%p`, day-with-suffix `%D`).
