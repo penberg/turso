@@ -1,0 +1,40 @@
+# The DEFAULT keyword as a value in INSERT ... VALUES.
+#
+# MySQL allows `DEFAULT` in place of a value in INSERT ... VALUES, meaning "use
+# the column's declared default". The front-end previously parsed the keyword as
+# a column reference ("no such column: DEFAULT"); it now lowers it to the
+# engine's DEFAULT marker, which the engine honors in INSERT ... VALUES.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS insdef (id INT PRIMARY KEY, c INT DEFAULT 5, name VARCHAR(20) DEFAULT 'def')
+
+# DEFAULT for one column uses its declared default.
+statement ok
+INSERT INTO insdef (id, c) VALUES (1, DEFAULT)
+
+query
+SELECT id, c, name FROM insdef WHERE id = 1
+----
+1	5	def
+
+# DEFAULT for several columns at once.
+statement ok
+INSERT INTO insdef (id, c, name) VALUES (2, DEFAULT, DEFAULT)
+
+query
+SELECT id, c, name FROM insdef WHERE id = 2
+----
+2	5	def
+
+# DEFAULT mixed with explicit values, and across multiple rows.
+statement ok
+INSERT INTO insdef (id, c, name) VALUES (3, 99, DEFAULT), (4, DEFAULT, 'x')
+
+query
+SELECT id, c, name FROM insdef WHERE id IN (3, 4) ORDER BY id
+----
+3	99	def
+4	5	x

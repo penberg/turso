@@ -269,7 +269,7 @@ incomplete.
 | EXCEPT clause                          | ❌     |         |
 | HANDLER                                | ❌     |         |
 | IMPORT TABLE                           | ❌     |         |
-| INSERT ... VALUES (basic)              | ✅     | Multi-row `VALUES` supported. The empty form `INSERT INTO t () VALUES ()` (and the column-list-less `INSERT INTO t VALUES ()`) inserts one all-defaults row, lowered to the engine's `DEFAULT VALUES`. |
+| INSERT ... VALUES (basic)              | ✅     | Multi-row `VALUES` supported. The `DEFAULT` keyword may stand in for any value (`VALUES (1, DEFAULT)`), inserting that column's declared default. The empty form `INSERT INTO t () VALUES ()` (and the column-list-less `INSERT INTO t VALUES ()`) inserts one all-defaults row, lowered to the engine's `DEFAULT VALUES`. (`DEFAULT` is honored only in `INSERT ... VALUES`, not in `UPDATE ... SET`, and the `DEFAULT(col)` function form is unsupported.) |
 | INSERT ... SET                         | ✅     | The `INSERT [INTO] t SET col = expr, ...` assignment form, built as the equivalent `(cols) VALUES (exprs)`. |
 | INSERT ... SELECT                      | ✅     | `INSERT [INTO] t [(cols)] SELECT ...`; the query runs through the same SELECT subset, evaluated by the engine. |
 | INSERT ... ON DUPLICATE KEY UPDATE     | ✅     | Lowered to the engine's target-less upsert (`ON CONFLICT DO UPDATE SET ...`), which fires on any unique/primary-key conflict like MySQL. The `VALUES(col)` pseudo-function (the would-be-inserted value) is mapped to `excluded.col` anywhere in the assignment expression (e.g. `c = c + VALUES(c)`, `GREATEST(c, VALUES(c))`); a bare column on the right refers to the existing row. |

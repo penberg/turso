@@ -1217,7 +1217,7 @@ impl Parser {
             let mut row = Vec::new();
             if !self.is(&Token::RParen) {
                 loop {
-                    row.push(Box::new(self.expr()?));
+                    row.push(Box::new(self.value_or_default()?));
                     if self.eat(&Token::Comma) {
                         continue;
                     }
@@ -1358,6 +1358,19 @@ impl Parser {
             },
             next: None,
         })
+    }
+
+    /// Parses an `INSERT ... VALUES` element, recognizing the MySQL `DEFAULT`
+    /// keyword (insert the column's declared default) as the engine's
+    /// `Expr::Default`. Anything else is an ordinary expression. (The engine only
+    /// honors `DEFAULT` in `INSERT ... VALUES`, not in `UPDATE ... SET`, so this
+    /// is used there only.)
+    fn value_or_default(&mut self) -> Result<ast::Expr> {
+        if self.is_keyword("DEFAULT") && self.peek_nth(1) != Some(&Token::LParen) {
+            self.advance();
+            return Ok(ast::Expr::Default);
+        }
+        self.expr()
     }
 
     /// Parses the right-hand side of an `ON DUPLICATE KEY UPDATE` assignment as an
@@ -7288,6 +7301,30 @@ mod tests {
             unreachable!()
         };
         assert!(matches!(body, ast::InsertBody::Select(_, _)));
+    }
+
+    #[test]
+    fn insert_values_default_keyword_lowers_to_expr_default() {
+        // `INSERT ... VALUES (1, DEFAULT)` lowers the DEFAULT keyword to the
+        // engine's `Expr::Default` (use the column's declared default); other
+        // values stay ordinary expressions.
+        let ast::Stmt::Insert { body, .. } =
+            parse("INSERT INTO t (a, b) VALUES (1, DEFAULT)").unwrap()
+        else {
+            panic!("expected Insert");
+        };
+        let ast::InsertBody::Select(select, _) = body else {
+            panic!("expected a VALUES body");
+        };
+        let ast::OneSelect::Values(rows) = &select.body.select else {
+            panic!("expected a VALUES list");
+        };
+        assert!(matches!(rows[0][0].as_ref(), ast::Expr::Literal(_)));
+        assert!(matches!(rows[0][1].as_ref(), ast::Expr::Default));
+
+        // The `DEFAULT(col)` function form is not this keyword (and stays
+        // unsupported).
+        assert!(parse("INSERT INTO t (a) VALUES (DEFAULT(a))").is_err());
     }
 
     #[test]
