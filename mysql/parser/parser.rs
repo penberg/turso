@@ -3504,11 +3504,12 @@ impl Parser {
             }
             self.advance();
             self.expect(&Token::RParen, "`)`")?;
+            let over_clause = self.parse_over_clause()?;
             return Ok(ast::Expr::FunctionCallStar {
                 name,
                 filter_over: ast::FunctionTail {
                     filter_clause: None,
-                    over_clause: None,
+                    over_clause,
                 },
             });
         }
@@ -3525,6 +3526,15 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
 
+        // An aggregate may carry an `OVER (...)` window spec, turning it into a
+        // windowed aggregate (e.g. a running total); the engine evaluates these.
+        // Scalar functions take no window.
+        let over_clause = if is_aggregate_function(&upper) {
+            self.parse_over_clause()?
+        } else {
+            None
+        };
+
         // Some MySQL functions differ from the engine only in name; rename them.
         let name = match engine_function_name(&upper) {
             Some(engine) => ast::Name::from_string(engine),
@@ -3539,9 +3549,56 @@ impl Parser {
             within_group: Vec::new(),
             filter_over: ast::FunctionTail {
                 filter_clause: None,
-                over_clause: None,
+                over_clause,
             },
         })
+    }
+
+    /// Parses an optional `OVER ( [PARTITION BY ...] [ORDER BY ...] )` window
+    /// specification following an aggregate. The engine evaluates windowed
+    /// aggregates, so `SUM(x) OVER ()` (whole-partition total), `... OVER
+    /// (PARTITION BY g)`, and `... OVER (ORDER BY y)` (a running total under the
+    /// default frame, as in MySQL) all work. A named window (`OVER w`, which
+    /// needs a `WINDOW` clause) and an explicit frame (`ROWS`/`RANGE`/`GROUPS
+    /// ...`) are not modeled and are rejected.
+    fn parse_over_clause(&mut self) -> Result<Option<ast::Over>> {
+        if !self.eat_keyword("OVER") {
+            return Ok(None);
+        }
+        if !self.is(&Token::LParen) {
+            return Err(ParseError::Unsupported(
+                "OVER with a named window is not supported yet".to_string(),
+            ));
+        }
+        self.expect(&Token::LParen, "`(`")?;
+
+        let mut partition_by = Vec::new();
+        if self.eat_keyword("PARTITION") {
+            self.expect_keyword("BY")?;
+            loop {
+                partition_by.push(Box::new(self.expr()?));
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+
+        let order_by = self.order_by()?;
+
+        if self.is_keyword("ROWS") || self.is_keyword("RANGE") || self.is_keyword("GROUPS") {
+            return Err(ParseError::Unsupported(
+                "an explicit window frame (ROWS/RANGE) is not supported yet".to_string(),
+            ));
+        }
+        self.expect(&Token::RParen, "`)`")?;
+
+        Ok(Some(ast::Over::Window(ast::Window {
+            base: None,
+            partition_by,
+            order_by,
+            frame_clause: None,
+        })))
     }
 
     /// Parses the arguments of a `CONCAT(a, b, ...)` call (the name and `(` are
@@ -7312,6 +7369,48 @@ mod tests {
             parse("SELECT a FROM t UNION DISTINCT SELECT b FROM u").unwrap(),
             parse("SELECT a FROM t UNION SELECT b FROM u").unwrap()
         );
+    }
+
+    #[test]
+    fn aggregate_over_window_clause() {
+        // An aggregate with `OVER (...)` carries a window spec. `OVER ()`.
+        let ast::Expr::FunctionCall { filter_over, .. } =
+            parse_expr("SUM(amt) OVER ()").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        let Some(ast::Over::Window(w)) = filter_over.over_clause else {
+            panic!("expected an OVER window clause");
+        };
+        assert!(w.partition_by.is_empty() && w.order_by.is_empty());
+
+        // PARTITION BY and ORDER BY are captured.
+        let ast::Expr::FunctionCall { filter_over, .. } =
+            parse_expr("SUM(amt) OVER (PARTITION BY g, h ORDER BY id DESC)").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        let Some(ast::Over::Window(w)) = filter_over.over_clause else {
+            panic!("expected an OVER window clause");
+        };
+        assert_eq!(w.partition_by.len(), 2);
+        assert_eq!(w.order_by.len(), 1);
+
+        // `COUNT(*) OVER ()` carries the window on the star form too.
+        let ast::Expr::FunctionCallStar { filter_over, .. } =
+            parse_expr("COUNT(*) OVER (PARTITION BY g)").unwrap()
+        else {
+            panic!("expected a star function call");
+        };
+        assert!(matches!(filter_over.over_clause, Some(ast::Over::Window(_))));
+
+        // An explicit frame and a named window are rejected.
+        assert!(parse_expr("SUM(amt) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)").is_err());
+        assert!(parse_expr("SUM(amt) OVER w").is_err());
+
+        // A scalar function does not take a window (the OVER is left unparsed).
+        let mut p = Parser::new(b"ABS(x) OVER ()").unwrap();
+        assert!(!(p.expr().is_ok() && p.peek().is_none()));
     }
 
     #[test]

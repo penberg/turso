@@ -1,0 +1,54 @@
+# Windowed aggregate functions: agg(...) OVER ( [PARTITION BY] [ORDER BY] ).
+#
+# The front-end now parses the OVER clause on an aggregate, and the engine
+# evaluates windowed aggregates, so SUM/COUNT/MIN/MAX/AVG OVER (...) work: a bare
+# OVER () aggregates the whole result, PARTITION BY aggregates per group, and
+# ORDER BY produces a running aggregate under the default frame (as in MySQL).
+# A named window (OVER w) and an explicit frame (ROWS/RANGE) are not supported,
+# and the dedicated window functions (RANK, ROW_NUMBER, ...) are not available in
+# the engine.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS win (id INT PRIMARY KEY, g INT, amt INT)
+
+statement ok
+INSERT INTO win (id, g, amt) VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40)
+
+# OVER () aggregates the whole result on every row.
+query
+SELECT id, SUM(amt) OVER () AS total, COUNT(*) OVER () AS n FROM win ORDER BY id
+----
+1	100	4
+2	100	4
+3	100	4
+4	100	4
+
+# PARTITION BY aggregates within each group.
+query
+SELECT id, SUM(amt) OVER (PARTITION BY g) AS grp_total, MAX(amt) OVER (PARTITION BY g) AS grp_max FROM win ORDER BY id
+----
+1	30	20
+2	30	20
+3	70	40
+4	70	40
+
+# ORDER BY gives a running aggregate (default frame).
+query
+SELECT id, SUM(amt) OVER (ORDER BY id) AS running, COUNT(*) OVER (ORDER BY id) AS seen FROM win ORDER BY id
+----
+1	10	1
+2	30	2
+3	60	3
+4	100	4
+
+# PARTITION BY combined with ORDER BY: a running total restarted per group.
+query
+SELECT id, SUM(amt) OVER (PARTITION BY g ORDER BY id) AS grp_running FROM win ORDER BY id
+----
+1	10
+2	30
+3	30
+4	70
