@@ -1,9 +1,10 @@
-# Date-part extractors: YEAR / MONTH / DAY / HOUR / MINUTE / SECOND.
+# Date-part extractors: YEAR / MONTH / DAY / DAYOFYEAR / HOUR / MINUTE / SECOND.
 #
 # These MySQL functions return the integer component of a date/datetime. The
 # front-end lowers each to cast(strftime(fmt, x) as integer), which matches
 # MySQL's numeric result for the 'YYYY-MM-DD HH:MM:SS' format WordPress stores
-# (post_date, transient timeouts, cron schedules). WP_Date_Query relies on these.
+# (post_date, transient timeouts, cron schedules). WP_Date_Query relies on these
+# (its `dayofyear` filter uses DAYOFYEAR).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -25,6 +26,20 @@ query
 SELECT HOUR(d), MINUTE(d), SECOND(d) FROM date_demo WHERE a = 1
 ----
 9	7	42
+
+# DAYOFYEAR is the 1-based day of the year (1..366); 2020 is a leap year, so
+# 2020-03-15 is day 75 and 1999-12-31 is day 365.
+query
+SELECT DAYOFYEAR(d) FROM date_demo ORDER BY a
+----
+75
+365
+
+# DAYOFYEAR of the last day of a leap year is 366.
+query
+SELECT DAYOFYEAR('2020-12-31')
+----
+366
 
 # Works on a bare date literal too.
 query
