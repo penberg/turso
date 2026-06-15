@@ -1,0 +1,63 @@
+# DIV / MOD operator conformance.
+#
+# MySQL's `a DIV b` is integer division (quotient truncated toward zero) and
+# `a MOD b` is the remainder (taking the sign of `a`). The front-end lowers
+# them to integer arithmetic that matches MySQL for both integer and float
+# operands:
+#   a DIV b -> CAST(a / b AS INTEGER)
+#   a MOD b -> a - b * CAST(a / b AS INTEGER)
+# (The symbolic `/` and `%` are still not parsed, since their MySQL semantics
+# diverge from the engine's.) NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# Integer division truncates toward zero, for every sign combination.
+query
+SELECT 7 DIV 2, 8 DIV 2, -7 DIV 2, 7 DIV -2, -8 DIV -2
+----
+3	4	-3	-3	4
+
+# DIV truncates a fractional quotient toward zero.
+query
+SELECT 7 DIV 2 = 3, 99 DIV 10
+----
+1	9
+
+# MOD is the remainder, with the sign of the dividend.
+query
+SELECT 7 MOD 3, -7 MOD 3, 7 MOD -3, 10 MOD 5
+----
+1	-1	1	0
+
+# MOD is exact for float operands (the engine's % would truncate to integers).
+query
+SELECT 7.5 MOD 2
+----
+1.5
+
+# DIV and MOD share the multiplicative precedence and are left-associative:
+# 17 DIV 5 = 3, then 3 MOD 2 = 1.
+query
+SELECT 17 DIV 5 MOD 2
+----
+1
+
+# NULL propagates.
+query
+SELECT NULL DIV 2, 5 MOD NULL
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS dm_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO dm_demo (id, n) VALUES (1, 10), (2, 15), (3, 23)
+
+query
+SELECT id, n DIV 10, n MOD 10 FROM dm_demo ORDER BY id
+----
+1	1	0
+2	1	5
+3	2	3

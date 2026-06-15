@@ -2066,15 +2066,33 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// Multiplicative tier: `*` only. `/` and `%` are intentionally not parsed —
-    /// their MySQL semantics differ from SQLite (float division, float modulo),
-    /// so they produce a clean parse error rather than a wrong answer.
+    /// Multiplicative tier: `*` and the MySQL keyword operators `DIV` (integer
+    /// division) and `MOD` (modulo). The symbolic `/` and `%` are intentionally
+    /// not parsed — their MySQL semantics differ from SQLite (float division,
+    /// float modulo) — but `DIV`/`MOD` have a well-defined integer mapping:
+    ///   - `a DIV b` → `CAST(a / b AS INTEGER)`: the quotient truncated toward
+    ///     zero, regardless of whether the engine divides as integer or float.
+    ///   - `a MOD b` → `a - b * CAST(a / b AS INTEGER)`: the remainder, which
+    ///     takes the sign of `a` and is exact for float operands too (where the
+    ///     engine's `%` would wrongly truncate to integers).
     fn multiplicative_expr(&mut self) -> Result<ast::Expr> {
         let mut lhs = self.collate_expr()?;
-        while self.is(&Token::Star) {
-            self.advance();
-            let rhs = self.collate_expr()?;
-            lhs = ast::Expr::binary(lhs, ast::Operator::Multiply, rhs);
+        loop {
+            if self.is(&Token::Star) {
+                self.advance();
+                let rhs = self.collate_expr()?;
+                lhs = ast::Expr::binary(lhs, ast::Operator::Multiply, rhs);
+            } else if self.eat_keyword("DIV") {
+                let rhs = self.collate_expr()?;
+                lhs = integer_division(lhs, rhs);
+            } else if self.eat_keyword("MOD") {
+                let rhs = self.collate_expr()?;
+                let quotient = integer_division(lhs.clone(), rhs.clone());
+                let product = ast::Expr::binary(rhs, ast::Operator::Multiply, quotient);
+                lhs = ast::Expr::binary(lhs, ast::Operator::Subtract, product);
+            } else {
+                break;
+            }
         }
         Ok(lhs)
     }
@@ -3519,6 +3537,19 @@ fn numeric_expr(value: &str) -> Box<ast::Expr> {
 }
 
 /// Builds a single-argument engine function call, e.g. `julianday(arg)`.
+/// Builds `CAST(a / b AS INTEGER)` — the integer quotient (truncated toward
+/// zero), used to lower the MySQL `DIV` operator and the quotient inside `MOD`.
+fn integer_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(ast::Expr::binary(a, ast::Operator::Divide, b)),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
 fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
     ast::Expr::FunctionCall {
         name: ast::Name::from_string(name),
@@ -5568,6 +5599,36 @@ mod tests {
             panic!("expected CONVERT(expr, type) to parse as a Cast");
         };
         assert_eq!(type_name.unwrap().name, "INTEGER");
+    }
+
+    #[test]
+    fn div_and_mod_operators_lower_to_integer_arithmetic() {
+        // a DIV b -> CAST(a / b AS INTEGER).
+        let ast::Expr::Cast { expr, type_name } = parse_expr("a DIV b").unwrap() else {
+            panic!("expected DIV to lower to a CAST");
+        };
+        assert_eq!(type_name.unwrap().name, "INTEGER");
+        assert!(matches!(
+            expr.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::Divide, _)
+        ));
+
+        // a MOD b -> a - b * CAST(a / b AS INTEGER).
+        let ast::Expr::Binary(lhs, ast::Operator::Subtract, rhs) = parse_expr("a MOD b").unwrap()
+        else {
+            panic!("expected MOD to lower to a subtraction");
+        };
+        assert_eq!(*lhs, col("a"));
+        let ast::Expr::Binary(_, ast::Operator::Multiply, q) = rhs.as_ref() else {
+            panic!("expected `b * quotient`");
+        };
+        assert!(matches!(q.as_ref(), ast::Expr::Cast { .. }));
+
+        // Left-associative and same precedence as `*`.
+        assert!(matches!(
+            parse_expr("17 DIV 5 MOD 2").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Subtract, _)
+        ));
     }
 
     #[test]
