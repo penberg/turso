@@ -1,0 +1,58 @@
+# DROP INDEX conformance.
+#
+# MySQL drops a secondary index with `DROP INDEX idx ON tbl` or
+# `ALTER TABLE tbl DROP {INDEX|KEY} idx`. Both lower to the engine's
+# `DROP INDEX idx` (index names live in a per-database namespace here, so the
+# table qualifier is implied/ignored). After a UNIQUE index is dropped its
+# constraint is no longer enforced.
+#
+# Scope: DROP PRIMARY KEY / FOREIGN KEY are rejected by the front-end and
+# covered by a parser unit test, not here, because a real mysqld accepts them.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS didx_demo (id INT PRIMARY KEY, code VARCHAR(20), tag VARCHAR(20))
+
+statement ok
+ALTER TABLE didx_demo ADD UNIQUE KEY code_u (code)
+
+statement ok
+ALTER TABLE didx_demo ADD UNIQUE KEY tag_u (tag)
+
+statement ok
+INSERT INTO didx_demo (id, code, tag) VALUES (1, 'x', 'p'), (2, 'y', 'q')
+
+# Both unique indexes are enforced.
+statement error
+INSERT INTO didx_demo (id, code, tag) VALUES (3, 'x', 'r')
+
+statement error
+INSERT INTO didx_demo (id, code, tag) VALUES (4, 's', 'p')
+
+# Standalone DROP INDEX ... ON ... removes the code uniqueness.
+statement ok
+DROP INDEX code_u ON didx_demo
+
+statement ok
+INSERT INTO didx_demo (id, code, tag) VALUES (3, 'x', 'r')
+
+# The tag index is still enforced.
+statement error
+INSERT INTO didx_demo (id, code, tag) VALUES (5, 'z', 'p')
+
+# ALTER TABLE ... DROP INDEX removes the tag uniqueness.
+statement ok
+ALTER TABLE didx_demo DROP INDEX tag_u
+
+statement ok
+INSERT INTO didx_demo (id, code, tag) VALUES (5, 'z', 'p')
+
+query
+SELECT id, code, tag FROM didx_demo ORDER BY id
+----
+1	x	p
+2	y	q
+3	x	r
+5	z	p

@@ -324,7 +324,19 @@ impl Parser {
     /// foreign key (`DROP {INDEX|KEY|PRIMARY KEY|FOREIGN KEY|CONSTRAINT|CHECK}`)
     /// has no single-statement engine equivalent and is rejected.
     fn alter_drop(&mut self, name: ast::QualifiedName) -> Result<ast::Stmt> {
-        for kw in ["INDEX", "KEY", "PRIMARY", "FOREIGN", "CONSTRAINT", "CHECK"] {
+        // `DROP {INDEX|KEY} idx_name` drops a secondary index, mirroring the
+        // `ADD KEY` -> `CREATE INDEX` lowering; it becomes the engine's
+        // `DROP INDEX idx_name` (index names are per-database here, so the table
+        // is implied). `DROP PRIMARY KEY` / `DROP FOREIGN KEY` have no in-place
+        // engine form.
+        if self.eat_keyword("INDEX") || self.eat_keyword("KEY") {
+            let idx_name = self.qualified_name()?;
+            return Ok(ast::Stmt::DropIndex {
+                if_exists: false,
+                idx_name,
+            });
+        }
+        for kw in ["PRIMARY", "FOREIGN", "CONSTRAINT", "CHECK"] {
             if self.is_keyword(kw) {
                 return Err(ParseError::Unsupported(format!(
                     "ALTER TABLE ... DROP {kw} is not supported yet"
@@ -792,15 +804,39 @@ impl Parser {
             Err(ParseError::Unsupported(
                 "DROP TEMPORARY only applies to tables".to_string(),
             ))
+        } else if self.eat_keyword("INDEX") {
+            self.drop_index()
         } else {
             let what = match self.peek() {
                 Some(Token::Word(w)) => w.to_ascii_uppercase(),
                 _ => "?".to_string(),
             };
             Err(ParseError::Unsupported(format!(
-                "DROP {what} is not supported yet (only DROP TABLE is implemented)"
+                "DROP {what} is not supported yet (only DROP TABLE / DROP INDEX are implemented)"
             )))
         }
+    }
+
+    /// Parses `DROP INDEX [IF EXISTS] idx_name [ON tbl_name]` (`DROP INDEX` is
+    /// already consumed) and lowers it to the engine's `DROP INDEX idx_name`.
+    /// MySQL spells it `DROP INDEX idx ON tbl`; the engine's index namespace is
+    /// per-database (see [`Self::alter_add_index`]), so the `ON tbl` qualifier is
+    /// parsed and ignored.
+    fn drop_index(&mut self) -> Result<ast::Stmt> {
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let idx_name = self.qualified_name()?;
+        if self.eat_keyword("ON") {
+            let _ = self.qualified_name()?;
+        }
+        Ok(ast::Stmt::DropIndex {
+            if_exists,
+            idx_name,
+        })
     }
 
     /// Parses the `DROP [TEMPORARY] TABLE [IF EXISTS] tbl_name` form. With
@@ -4572,7 +4608,6 @@ mod tests {
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
             "ALTER TABLE t ADD a INT, ADD b INT",
             "ALTER TABLE t DROP PRIMARY KEY",
-            "ALTER TABLE t DROP INDEX idx",
             "ALTER TABLE t DROP FOREIGN KEY fk",
             "ALTER TABLE t CHANGE COLUMN a b INT",
             "ALTER TABLE t MODIFY COLUMN a BIGINT",
@@ -4582,6 +4617,22 @@ mod tests {
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn drop_index_lowers_to_engine_drop_index() {
+        // Standalone `DROP INDEX idx ON t` and `ALTER TABLE t DROP {INDEX|KEY}
+        // idx` both become the engine's DROP INDEX by name (the table is implied).
+        for sql in [
+            "DROP INDEX idx ON t",
+            "ALTER TABLE t DROP INDEX idx",
+            "ALTER TABLE t DROP KEY idx",
+        ] {
+            let ast::Stmt::DropIndex { idx_name, .. } = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to DROP INDEX");
+            };
+            assert_eq!(idx_name.name.as_str(), "idx", "{sql}");
         }
     }
 
@@ -5568,7 +5619,6 @@ mod tests {
             "DROP TABLE t RESTRICT",
             "DROP TABLE t CASCADE",
             "DROP DATABASE d",
-            "DROP INDEX i ON t",
             "DROP TEMPORARY TABLE mydb.t", // schema-qualified temp drop
         ] {
             assert!(
