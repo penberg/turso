@@ -2219,9 +2219,7 @@ impl Parser {
                 lhs = integer_division(lhs, rhs);
             } else if self.eat_keyword("MOD") {
                 let rhs = self.collate_expr()?;
-                let quotient = integer_division(lhs.clone(), rhs.clone());
-                let product = ast::Expr::binary(rhs, ast::Operator::Multiply, quotient);
-                lhs = ast::Expr::binary(lhs, ast::Operator::Subtract, product);
+                lhs = modulo(lhs, rhs);
             } else {
                 break;
             }
@@ -2555,6 +2553,13 @@ impl Parser {
         // lowers to a `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0 END`.
         if upper == "FIELD" {
             return self.field_call();
+        }
+
+        // `MOD(a, b)` is the function spelling of the `a MOD b` operator; MySQL
+        // defines them identically, so lower it the same way (exact for floats,
+        // unlike the engine's `%`).
+        if upper == "MOD" {
+            return self.mod_call();
         }
 
         // `INSTR(str, substr)` and `LOCATE(substr, str)` (note the swapped
@@ -3396,6 +3401,18 @@ impl Parser {
         })
     }
 
+    /// Lowers `MOD(a, b)` (the name and `(` are already consumed) to the same
+    /// `a - b * CAST(a / b AS INTEGER)` remainder as the `a MOD b` operator,
+    /// which takes the sign of `a` and is exact for float operands. NULL
+    /// propagates. Exactly two arguments are required.
+    fn mod_call(&mut self) -> Result<ast::Expr> {
+        let a = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let b = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(modulo(a, b))
+    }
+
     /// Lowers `LAST_DAY(d)` (the name and `(` are already consumed) to
     /// `date(d, 'start of month', '+1 month', '-1 day')`, which the engine's
     /// date modifiers evaluate to the last day of `d`'s month — matching MySQL,
@@ -3741,6 +3758,16 @@ fn integer_division(a: ast::Expr, b: ast::Expr) -> ast::Expr {
             array_dimensions: 0,
         }),
     }
+}
+
+/// Builds `a - b * CAST(a / b AS INTEGER)` — the MySQL remainder, which takes
+/// the sign of `a` and is exact for float operands too (where the engine's `%`
+/// would wrongly truncate to integers). Shared by the `a MOD b` operator and
+/// the `MOD(a, b)` function form, which MySQL defines identically.
+fn modulo(a: ast::Expr, b: ast::Expr) -> ast::Expr {
+    let quotient = integer_division(a.clone(), b.clone());
+    let product = ast::Expr::binary(b, ast::Operator::Multiply, quotient);
+    ast::Expr::binary(a, ast::Operator::Subtract, product)
 }
 
 fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
@@ -6035,6 +6062,13 @@ mod tests {
             parse_expr("17 DIV 5 MOD 2").unwrap(),
             ast::Expr::Binary(_, ast::Operator::Subtract, _)
         ));
+
+        // The MOD(a, b) function form lowers identically to the `a MOD b`
+        // operator (MySQL defines them the same).
+        assert_eq!(
+            parse_expr("MOD(a, b)").unwrap(),
+            parse_expr("a MOD b").unwrap()
+        );
     }
 
     #[test]

@@ -1,0 +1,49 @@
+# MOD(a, b) function conformance.
+#
+# MySQL's MOD(a, b) is the function spelling of the `a MOD b` operator and is
+# defined identically: the remainder taking the sign of `a`, exact for float
+# operands. The front-end lowers both to `a - b * CAST(a / b AS INTEGER)`, which
+# matches MySQL (the engine's `%` would truncate floats to integers). NULL
+# propagates, and MOD by zero is NULL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The remainder takes the sign of the dividend, like the operator form.
+query
+SELECT MOD(7, 3), MOD(-7, 3), MOD(7, -3), MOD(10, 5)
+----
+1	-1	1	0
+
+# Exact for float operands.
+query
+SELECT MOD(7.5, 2)
+----
+1.5
+
+# The function and operator forms agree.
+query
+SELECT MOD(17, 5) = 17 MOD 5
+----
+1
+
+# NULL propagates from either argument; MOD by zero is NULL.
+query
+SELECT MOD(NULL, 2), MOD(5, NULL), MOD(5, 0)
+----
+NULL	NULL	NULL
+
+# Usable over a column (alternating-row style: MOD(id, 2)).
+statement ok
+CREATE TABLE IF NOT EXISTS modf_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO modf_demo (id, n) VALUES (1, 10), (2, 15), (3, 23), (4, 8)
+
+query
+SELECT id, MOD(id, 2), MOD(n, 10) FROM modf_demo ORDER BY id
+----
+1	1	0
+2	0	5
+3	1	3
+4	0	8

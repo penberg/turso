@@ -319,7 +319,8 @@ diverge are deliberately excluded.
 | `CAST(expr AS type)`                   | 🚧     | Real cast syntax (not a function). Targets map onto engine affinity: `CHAR`→text, `SIGNED`/`UNSIGNED`→integer, `DECIMAL`→numeric, `DOUBLE`/`FLOAT`/`REAL`→real, `BINARY`→blob. Length/precision (`CHAR(n)`, `DECIMAL(m,d)`) parses but is **not enforced**, integer rounding of fractional values differs from MySQL (truncates vs rounds), and `UNSIGNED` is not distinguished from `SIGNED`. Date/time and `JSON` targets are rejected. |
 | `CONVERT(expr USING charset)` / `CONVERT(expr, type)` | 🚧 | `USING charset` is charset coercion: the engine is single-charset (UTF-8), so the charset is dropped and the value passes through unchanged. `CONVERT(expr, type)` is identical to `CAST(expr AS type)` (same mapping and divergences). |
 | `/` (division)                         | ❌     | **Excluded** — MySQL float division (`5/2=2.5`) vs SQLite integer division (`5/2=2`). |
-| `%` / `MOD`                            | ❌     | **Excluded** — float modulo differs. |
+| `%` (modulo operator)                  | ❌     | **Excluded** — the symbolic `%` is not parsed (the engine's `%` truncates float operands to integers). |
+| `a MOD b` / `MOD(a, b)` / `a DIV b`    | ✅     | The `MOD`/`DIV` keyword operators and the `MOD(a, b)` function are lowered to integer arithmetic (`a - b * CAST(a / b AS INTEGER)` and `CAST(a / b AS INTEGER)`), which matches MySQL for both integer and float operands. |
 | `\|\|`                                 | ❌     | **Excluded** — MySQL `\|\|` is logical OR; SQLite `\|\|` is string concat. |
 | `[NOT] IN (SELECT ...)`                | ✅     | Uncorrelated subquery in `IN`/`NOT IN`; evaluates identically. |
 | `[NOT] EXISTS (SELECT ...)`            | ✅     | Correlated subqueries supported; identical semantics. |
