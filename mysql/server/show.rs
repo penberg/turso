@@ -42,8 +42,9 @@ pub enum ShowOutcome {
 }
 
 /// Tries to handle `sql` as `SHOW [FULL] {COLUMNS|FIELDS} {FROM|IN} tbl`,
-/// `{DESCRIBE|DESC} tbl` (a synonym for the non-FULL form), or
-/// `SHOW [FULL] TABLES [LIKE 'pat']`.
+/// `{DESCRIBE|DESC} tbl` (a synonym for the non-FULL form),
+/// `SHOW [FULL] TABLES [LIKE 'pat']`, or
+/// `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} tbl`.
 ///
 /// Returns `None` if `sql` is none of these, so every other `SHOW` form falls
 /// through to the parser (which rejects it as unsupported).
@@ -53,6 +54,9 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     }
     if let Some(parsed) = parse_show_tables(sql) {
         return Some(build_tables(conn, &parsed).map(ShowOutcome::Columns));
+    }
+    if let Some(parsed) = parse_show_index(sql) {
+        return Some(build_index(conn, &parsed));
     }
     None
 }
@@ -334,6 +338,210 @@ fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResu
         .collect();
 
     Ok(ColumnsResult { columns, rows })
+}
+
+/// The parsed form of a `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} tbl` statement.
+struct ShowIndex {
+    table: String,
+}
+
+/// Parses `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} tbl [{FROM|IN} db]`. Returns
+/// `None` for any other statement, including the `... WHERE`/`LIKE` filter form
+/// (not handled), so those fall through to the parser.
+fn parse_show_index(sql: &str) -> Option<ShowIndex> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let mut k = 0;
+    let kw = |t: &str, kw: &str| t.eq_ignore_ascii_case(kw);
+
+    if !toks.get(k).is_some_and(|t| kw(t, "SHOW")) {
+        return None;
+    }
+    k += 1;
+    if !toks
+        .get(k)
+        .is_some_and(|t| kw(t, "INDEX") || kw(t, "INDEXES") || kw(t, "KEYS"))
+    {
+        return None;
+    }
+    k += 1;
+    if !toks.get(k).is_some_and(|t| kw(t, "FROM") || kw(t, "IN")) {
+        return None;
+    }
+    k += 1;
+
+    let mut table = toks.get(k)?.clone();
+    k += 1;
+    // `db.tbl`: the real table name follows the dot.
+    if toks.get(k).is_some_and(|t| t == ".") {
+        k += 1;
+        table = toks.get(k)?.clone();
+        k += 1;
+    }
+    // Optional `{FROM|IN} db` qualifier; consumed and ignored.
+    if toks.get(k).is_some_and(|t| kw(t, "FROM") || kw(t, "IN")) {
+        k += 1;
+        toks.get(k)?;
+        k += 1;
+    }
+    // A trailing `WHERE`/`LIKE` is not handled here.
+    if k != toks.len() {
+        return None;
+    }
+    Some(ShowIndex { table })
+}
+
+/// The 15 columns of MySQL 8's `SHOW INDEX` result set, in order.
+const INDEX_COLUMNS: [&str; 15] = [
+    "Table",
+    "Non_unique",
+    "Key_name",
+    "Seq_in_index",
+    "Column_name",
+    "Collation",
+    "Cardinality",
+    "Sub_part",
+    "Packed",
+    "Null",
+    "Index_type",
+    "Comment",
+    "Index_comment",
+    "Visible",
+    "Expression",
+];
+
+/// Builds one `SHOW INDEX` row for the `seq`-th (1-based) column of an index.
+fn index_row(
+    table: &str,
+    non_unique: &str,
+    key_name: &str,
+    seq: usize,
+    column: &str,
+    null: &str,
+) -> Vec<Option<String>> {
+    vec![
+        Some(table.to_string()),
+        Some(non_unique.to_string()),
+        Some(key_name.to_string()),
+        Some(seq.to_string()),
+        Some(column.to_string()),
+        Some("A".to_string()), // Collation (ascending)
+        None,                  // Cardinality (the engine has no index statistics)
+        None,                  // Sub_part (no prefix length tracked)
+        None,                  // Packed
+        Some(null.to_string()),
+        Some("BTREE".to_string()), // Index_type
+        Some(String::new()),       // Comment
+        Some(String::new()),       // Index_comment
+        Some("YES".to_string()),   // Visible
+        None,                      // Expression
+    ]
+}
+
+/// Reads the table's indexes via `PRAGMA index_list` / `index_info` and reshapes
+/// them into the MySQL `SHOW INDEX` result set. The engine keeps no index
+/// statistics, so `Cardinality` is reported as NULL (likewise `Sub_part`,
+/// `Packed`, `Expression`); `Collation` is `A`, `Index_type` is `BTREE`, and
+/// `Visible` is `YES`. A primary key is reported under MySQL's `PRIMARY` name,
+/// including the rowid-alias integer primary key the engine keeps out of
+/// `index_list`. `dbDelta()` reads this output to learn which indexes exist.
+fn build_index(conn: &Arc<Connection>, show: &ShowIndex) -> Result<ShowOutcome, LimboError> {
+    let tbl = show.table.replace('\'', "''");
+
+    // `table_info` detects a missing table and gives nullability and the PK columns.
+    let table_info = format!("PRAGMA table_info('{tbl}')");
+    let Some(mut stmt) = conn.query(&table_info)? else {
+        return Ok(ShowOutcome::NoSuchTable(show.table.clone()));
+    };
+    let mut nullable: HashMap<String, bool> = HashMap::new();
+    let mut pk_cols: Vec<(i64, String)> = Vec::new();
+    let mut any = false;
+    stmt.run_with_row_callback(|row| {
+        any = true;
+        let name = value_to_string(row.get_value(1)).unwrap_or_default();
+        let notnull = value_to_string(row.get_value(3)).as_deref() != Some("0");
+        let pk = value_to_string(row.get_value(5))
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if pk > 0 {
+            pk_cols.push((pk, name.clone()));
+        }
+        nullable.insert(name, !notnull);
+        Ok(())
+    })?;
+    if !any {
+        return Ok(ShowOutcome::NoSuchTable(show.table.clone()));
+    }
+    pk_cols.sort_by_key(|(ord, _)| *ord);
+
+    let null_flag = |col: &str| {
+        if *nullable.get(col).unwrap_or(&true) {
+            "YES"
+        } else {
+            ""
+        }
+    };
+
+    // `index_list`: seq, name, unique, origin, partial.
+    let mut idxs: Vec<(String, bool, String)> = Vec::new();
+    let index_list = format!("PRAGMA index_list('{tbl}')");
+    if let Some(mut stmt) = conn.query(&index_list)? {
+        stmt.run_with_row_callback(|row| {
+            let name = value_to_string(row.get_value(1)).unwrap_or_default();
+            let unique = value_to_string(row.get_value(2)).as_deref() == Some("1");
+            let origin = value_to_string(row.get_value(3)).unwrap_or_default();
+            idxs.push((name, unique, origin));
+            Ok(())
+        })?;
+    }
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut have_pk_index = false;
+    for (name, unique, origin) in &idxs {
+        let is_pk = origin.eq_ignore_ascii_case("pk");
+        let key_name = if is_pk {
+            have_pk_index = true;
+            "PRIMARY".to_string()
+        } else {
+            name.clone()
+        };
+        let non_unique = if *unique { "0" } else { "1" };
+        // `index_info`: seqno, cid, name (the indexed column).
+        let mut cols: Vec<String> = Vec::new();
+        let idx = name.replace('\'', "''");
+        let index_info = format!("PRAGMA index_info('{idx}')");
+        if let Some(mut stmt) = conn.query(&index_info)? {
+            stmt.run_with_row_callback(|row| {
+                cols.push(value_to_string(row.get_value(2)).unwrap_or_default());
+                Ok(())
+            })?;
+        }
+        for (i, col) in cols.iter().enumerate() {
+            // A primary key's columns are never nullable in MySQL.
+            let null = if is_pk { "" } else { null_flag(col) };
+            rows.push(index_row(
+                &show.table,
+                non_unique,
+                &key_name,
+                i + 1,
+                col,
+                null,
+            ));
+        }
+    }
+
+    // A single-column INTEGER PRIMARY KEY is a rowid alias and never appears in
+    // `index_list`, so synthesize its `PRIMARY` rows from `table_info`.
+    if !have_pk_index {
+        for (i, (_, col)) in pk_cols.iter().enumerate() {
+            rows.push(index_row(&show.table, "0", "PRIMARY", i + 1, col, ""));
+        }
+    }
+
+    Ok(ShowOutcome::Columns(ColumnsResult {
+        columns: INDEX_COLUMNS.to_vec(),
+        rows,
+    }))
 }
 
 /// One column as read from `PRAGMA table_info`.

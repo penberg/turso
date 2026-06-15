@@ -251,6 +251,7 @@ impl Parser {
     ///   - `DROP [COLUMN] col` → `ALTER TABLE ... DROP COLUMN`,
     ///   - `RENAME [TO|AS] new` → `ALTER TABLE ... RENAME TO`, and
     ///   - `RENAME COLUMN old TO new` → `ALTER TABLE ... RENAME COLUMN`.
+    ///
     /// Everything else — `ADD PRIMARY KEY`/`FOREIGN KEY`/`FULLTEXT`/`CONSTRAINT`,
     /// `DROP {INDEX|PRIMARY KEY|FOREIGN KEY}`, the type-changing `CHANGE`/`MODIFY`
     /// operations, `RENAME INDEX`, and the comma-separated multi-operation form —
@@ -343,7 +344,7 @@ impl Parser {
                 Some(ast::Expr::Id(n)) => n.as_str(),
                 _ => "idx",
             };
-            ast::Name::from_string(&format!("{}_{}", tbl.name.as_str(), first))
+            ast::Name::from_string(format!("{}_{}", tbl.name.as_str(), first))
         });
 
         Ok(ast::Stmt::CreateIndex {
@@ -2956,6 +2957,7 @@ impl Parser {
     ///   - mode 0 → `%U` (Sunday-first, 0–53, week 1 = first week with a Sunday),
     ///   - mode 3 → `%V` (ISO 8601, Monday-first, 1–53),
     ///   - mode 5 → `%W` (Monday-first, 0–53, week 1 = first week with a Monday).
+    ///
     /// The other modes (1/2/4/6/7) have no exact strftime equivalent and are
     /// rejected. The `mode` must be an integer literal.
     fn week_call(&mut self) -> Result<ast::Expr> {
@@ -3277,6 +3279,8 @@ impl Parser {
     /// which renders the epoch as a `'YYYY-MM-DD HH:MM:SS'` UTC datetime. The
     /// two-argument formatting form is not supported. The name and `(` are
     /// already consumed.
+    // Named after the MySQL `FROM_UNIXTIME` function, not a conversion constructor.
+    #[allow(clippy::wrong_self_convention)]
     fn from_unixtime_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
