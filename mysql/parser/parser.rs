@@ -115,6 +115,22 @@ impl Parser {
             return Ok(stmts);
         }
 
+        // `DO expr [, expr]...` evaluates its expressions purely for their side
+        // effects and returns no result set (it is a faster `SELECT` with the
+        // rows discarded). MySQL's usual `DO` targets -- locking functions
+        // (`GET_LOCK`), `SLEEP`, user-variable assignments -- have no engine
+        // equivalent, so there is nothing to run: parse the expressions to
+        // validate the syntax, then emit no statements. The server replies OK
+        // with no result set, matching MySQL's contract.
+        if self.is_keyword("DO") {
+            self.advance(); // DO
+            self.expr()?;
+            while self.eat(&Token::Comma) {
+                self.expr()?;
+            }
+            return Ok(Vec::new());
+        }
+
         Ok(vec![self.statement()?])
     }
 
@@ -10867,6 +10883,22 @@ mod tests {
 
         // RESTRICT/CASCADE on a multi-table drop is still rejected.
         assert!(parse_all("DROP TABLE a, b RESTRICT").is_err());
+    }
+
+    #[test]
+    fn do_statement_emits_no_statements() {
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+
+        // `DO expr` parses its expression(s) for validation and yields nothing,
+        // so the server replies OK with no result set.
+        assert_eq!(parse_all("DO 1 + 1").unwrap().len(), 0);
+        assert_eq!(parse_all("DO 1, 2, 3").unwrap().len(), 0);
+        assert_eq!(parse_all("DO ABS(-5), POW(2, 3)").unwrap().len(), 0);
+        assert_eq!(parse_all("DO (SELECT 1)").unwrap().len(), 0);
+
+        // A malformed expression is still rejected.
+        assert!(parse_all("DO ,").is_err());
+        assert!(parse_all("DO 1 +").is_err());
     }
 
     #[test]

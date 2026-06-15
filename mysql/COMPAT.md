@@ -244,6 +244,7 @@ incomplete.
 | DROP VIEW                              | ❌     |         |
 | RENAME TABLE                           | ❌     |         |
 | TRUNCATE TABLE                         | 🚧     | Translated to an unfiltered `DELETE FROM tbl` (same empty-table result). `TRUNCATE`'s implicit commit, `AUTO_INCREMENT` reset, and zero affected-row count are not reproduced. |
+| DO *expr* [, *expr*]...                | 🚧     | Accepted and replied to with OK and no result set, matching MySQL. The expressions are parsed for validation but **not evaluated** -- MySQL's usual `DO` targets (locking functions, `SLEEP`, user-variable assignments) have no engine equivalent, so there is nothing to run. Not observable through the OK response. |
 
 #### CREATE TABLE column attributes
 

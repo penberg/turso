@@ -1,0 +1,40 @@
+# The DO statement.
+#
+# DO expr [, expr]... evaluates its expressions purely for side effects and
+# returns no result set (it is a faster SELECT with the rows discarded). The
+# front-end accepts it and replies OK; the engine has no DO and no equivalent
+# for MySQL's usual DO targets (locking functions, SLEEP, user variables), so
+# the expressions are parsed for validation but not evaluated -- not observable
+# through the OK response.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# A single arithmetic expression.
+statement ok
+DO 1 + 1
+
+# Multiple expressions.
+statement ok
+DO 1, 2, 3
+
+# Function-call expressions.
+statement ok
+DO ABS(-5), POW(2, 3)
+
+# A subquery over an existing table (real mysqld evaluates and discards it).
+statement ok
+CREATE TABLE IF NOT EXISTS dostmt (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO dostmt (id, n) VALUES (1, 10), (2, 20)
+
+statement ok
+DO (SELECT COUNT(*) FROM dostmt)
+
+# DO does not alter data: the rows are unchanged afterwards.
+query
+SELECT id, n FROM dostmt ORDER BY id
+----
+1	10
+2	20
