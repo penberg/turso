@@ -2459,6 +2459,19 @@ impl Parser {
             return self.extract_call();
         }
 
+        // `QUARTER(d)` (1–4) is `(MONTH(d) + 2) / 3` with integer division.
+        if upper == "QUARTER" {
+            return self.quarter_call();
+        }
+
+        // `WEEKOFYEAR(d)` is the ISO-8601 week (a synonym for `WEEK(d, 3)`),
+        // which the engine computes as `strftime('%V', d)`.
+        if upper == "WEEKOFYEAR" {
+            let arg = self.expr()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(cast_strftime_int("%V", arg));
+        }
+
         // Current date/time functions (`NOW()`, `CURDATE()`, ...) lower to the
         // engine's `datetime('now')` / `date('now')` / `time('now')`.
         if let Some(engine_fn) = current_time_function(&upper) {
@@ -2900,6 +2913,25 @@ impl Parser {
             }
         };
         Ok(cast_strftime_int(fmt, arg))
+    }
+
+    /// Lowers `QUARTER(d)` (the name and `(` are already consumed) to
+    /// `(CAST(strftime('%m', d) AS INTEGER) + 2) / 3`. Integer division maps each
+    /// month to its 1–4 quarter (months 1–3 → 1, 4–6 → 2, …); NULL propagates.
+    /// Exactly one argument is required.
+    fn quarter_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let month_plus_two = ast::Expr::binary(
+            cast_strftime_int("%m", arg),
+            ast::Operator::Add,
+            ast::Expr::Literal(ast::Literal::Numeric("2".to_string())),
+        );
+        Ok(ast::Expr::binary(
+            month_plus_two,
+            ast::Operator::Divide,
+            ast::Expr::Literal(ast::Literal::Numeric("3".to_string())),
+        ))
     }
 
     /// Parses a `DAYOFWEEK(d)` / `WEEKDAY(d)` call (the name and `(` are already
@@ -5185,6 +5217,33 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn quarter_and_weekofyear_lower_to_strftime() {
+        // QUARTER(d) -> (CAST(strftime('%m', d) AS INTEGER) + 2) / 3.
+        let ast::Expr::Binary(num, ast::Operator::Divide, three) =
+            parse_expr("QUARTER(d)").unwrap()
+        else {
+            panic!("expected QUARTER to lower to a division");
+        };
+        assert!(matches!(three.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "3"));
+        let ast::Expr::Binary(_, ast::Operator::Add, two) = num.as_ref() else {
+            panic!("expected `month + 2` on the left of the division");
+        };
+        assert!(matches!(two.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "2"));
+
+        // WEEKOFYEAR(d) -> CAST(strftime('%V', d) AS INTEGER).
+        let ast::Expr::Cast { expr, .. } = parse_expr("WEEKOFYEAR(d)").unwrap() else {
+            panic!("expected WEEKOFYEAR to lower to a CAST");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+            panic!("expected strftime inside the cast");
+        };
+        assert_eq!(name.as_str(), "strftime");
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%V'")
+        );
     }
 
     #[test]
