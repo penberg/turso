@@ -1,0 +1,48 @@
+# The JSON extract operators -> and ->>.
+#
+# MySQL's `doc -> path` extracts the JSON value at `path` (keeping its JSON
+# quoting, so a string comes back as `"x"`), and `doc ->> path` extracts and
+# unquotes it (a string comes back as `x`). The front-end previously rejected
+# them with a syntax error; they now map straight onto the engine's identical
+# `->` / `->>` operators. They bind tightly (so `doc ->> '$.a' = 'x'` groups as
+# `(doc ->> '$.a') = 'x'`) and chain.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS jdoc (id INT PRIMARY KEY, j TEXT)
+
+statement ok
+INSERT INTO jdoc (id, j) VALUES (1, '{"a":"x","b":5,"c":[10,20,30]}'), (2, '{"a":"y","b":9}')
+
+# -> keeps JSON quoting; ->> unquotes; numbers come back as numbers.
+query
+SELECT id, j -> '$.a', j ->> '$.a', j -> '$.b' FROM jdoc ORDER BY id
+----
+1	"x"	x	5
+2	"y"	y	9
+
+# ->> binds tighter than =, so this filters on the unquoted scalar.
+query
+SELECT id FROM jdoc WHERE j ->> '$.a' = 'x'
+----
+1
+
+# Array element access via a path, and arithmetic on an extracted number.
+query
+SELECT j ->> '$.c[1]', (j -> '$.b') + 1 FROM jdoc WHERE id = 1
+----
+20	6
+
+# A missing path yields NULL.
+query
+SELECT j ->> '$.nope' IS NULL FROM jdoc WHERE id = 1
+----
+1
+
+# The `-` operator is unaffected by the new `->` / `->>` lexing.
+query
+SELECT 5 - 3, 10 - -2
+----
+2	12

@@ -2862,11 +2862,27 @@ impl Parser {
             self.advance();
             return self.collate_expr();
         }
-        let expr = self.primary_expr()?;
-        while self.eat_keyword("COLLATE") {
-            // The collation name is an identifier (e.g. `utf8mb4_general_ci`);
-            // consume and drop it.
-            self.name()?;
+        let mut expr = self.primary_expr()?;
+        loop {
+            // `doc -> path` / `doc ->> path` — MySQL's JSON extract operators,
+            // mapping straight onto the engine's `->` (returns the JSON value,
+            // keeping its quoting) and `->>` (returns the unquoted scalar). They
+            // bind tightly here (like `COLLATE`), so `doc ->> '$.a' = 'x'` is
+            // `(doc ->> '$.a') = 'x'`, and they chain left-to-right. The path
+            // operand is a primary expression (a quoted path literal).
+            if self.eat(&Token::Arrow) {
+                let path = self.primary_expr()?;
+                expr = ast::Expr::binary(expr, ast::Operator::ArrowRight, path);
+            } else if self.eat(&Token::ArrowDouble) {
+                let path = self.primary_expr()?;
+                expr = ast::Expr::binary(expr, ast::Operator::ArrowRightShift, path);
+            } else if self.eat_keyword("COLLATE") {
+                // The collation name is an identifier (e.g. `utf8mb4_general_ci`);
+                // consume and drop it.
+                self.name()?;
+            } else {
+                break;
+            }
         }
         Ok(expr)
     }
@@ -9524,6 +9540,47 @@ mod tests {
             parse_expr("a <> b").unwrap(),
             ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
         );
+    }
+
+    #[test]
+    fn json_arrow_operators_parse() {
+        // `j -> '$.a'` and `j ->> '$.a'` map to the engine's ArrowRight /
+        // ArrowRightShift operators.
+        assert_eq!(
+            parse_expr("j -> '$.a'").unwrap(),
+            ast::Expr::binary(
+                col("j"),
+                ast::Operator::ArrowRight,
+                ast::Expr::Literal(ast::Literal::String("'$.a'".to_string())),
+            )
+        );
+        let ast::Expr::Binary(_, ast::Operator::ArrowRightShift, _) =
+            parse_expr("j ->> '$.a'").unwrap()
+        else {
+            panic!("expected `->>` to lower to ArrowRightShift");
+        };
+
+        // They bind tighter than `=`: `j ->> '$.a' = 'x'` is `(j ->> '$.a') = 'x'`.
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, _) =
+            parse_expr("j ->> '$.a' = 'x'").unwrap()
+        else {
+            panic!("expected the top operator to be `=`");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::ArrowRightShift, _)
+        ));
+
+        // They chain left-to-right.
+        let ast::Expr::Binary(lhs, ast::Operator::ArrowRight, _) =
+            parse_expr("j -> '$.a' -> '$.b'").unwrap()
+        else {
+            panic!("expected a chained `->`");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::ArrowRight, _)
+        ));
     }
 
     #[test]

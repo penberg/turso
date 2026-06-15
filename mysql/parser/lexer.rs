@@ -77,7 +77,13 @@ impl<'a> Lexer<'a> {
             // `&&` is logical AND; a single `&` is the bitwise operator, which
             // lexes as `Other('&')` like the other bitwise characters.
             b'&' if self.peek_at(1) == Some(b'&') => self.double(Token::AmpAmp),
-            b'-' => self.single(Token::Minus),
+            // `->>` (JSON extract-and-unquote) before `->` (JSON extract) before
+            // a bare `-`. (A `--` line comment was already skipped as trivia.)
+            b'-' => match self.peek_at(1) {
+                Some(b'>') if self.peek_at(2) == Some(b'>') => self.triple(Token::ArrowDouble),
+                Some(b'>') => self.double(Token::Arrow),
+                _ => self.single(Token::Minus),
+            },
             b'+' => self.single(Token::Plus),
             b'?' => self.single(Token::Param),
             b'`' => self.read_delimited(b'`', "identifier")?,
@@ -328,6 +334,22 @@ mod tests {
             .into_iter()
             .map(|(t, _)| t)
             .collect()
+    }
+
+    #[test]
+    fn json_arrow_operators_lex() {
+        // `->>` and `->` are distinct tokens; a bare `-` and `- -` are unaffected.
+        assert_eq!(tokens("a ->> b"), vec![word("a"), Token::ArrowDouble, word("b")]);
+        assert_eq!(tokens("a -> b"), vec![word("a"), Token::Arrow, word("b")]);
+        assert_eq!(tokens("a - b"), vec![word("a"), Token::Minus, word("b")]);
+        assert_eq!(
+            tokens("5 - -2"),
+            vec![Token::Num("5".into()), Token::Minus, Token::Minus, Token::Num("2".into())]
+        );
+    }
+
+    fn word(w: &str) -> Token {
+        Token::Word(w.to_string())
     }
 
     #[test]

@@ -45,6 +45,10 @@ pub enum Token {
     Spaceship,
     /// `&&` — the logical-AND operator (a synonym for `AND`).
     AmpAmp,
+    /// `->` — the JSON extract operator (`col -> path`).
+    Arrow,
+    /// `->>` — the JSON extract-and-unquote operator (`col ->> path`).
+    ArrowDouble,
     /// `*`
     Star,
     /// `-`
@@ -81,6 +85,8 @@ impl Token {
             Token::ShiftLeft => "`<<`".to_string(),
             Token::ShiftRight => "`>>`".to_string(),
             Token::Spaceship => "`<=>`".to_string(),
+            Token::Arrow => "`->`".to_string(),
+            Token::ArrowDouble => "`->>`".to_string(),
             Token::AmpAmp => "`&&`".to_string(),
             Token::Star => "`*`".to_string(),
             Token::Minus => "`-`".to_string(),
