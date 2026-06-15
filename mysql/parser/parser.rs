@@ -2695,6 +2695,15 @@ impl Parser {
             return self.week_call();
         }
 
+        // `DAYNAME(d)` / `MONTHNAME(d)` map the weekday / month to its English
+        // name via a CASE over `strftime`.
+        if upper == "DAYNAME" {
+            return self.dayname_call();
+        }
+        if upper == "MONTHNAME" {
+            return self.monthname_call();
+        }
+
         // `FIELD(x, a, b, ...)` (the 1-based index of `x` in the list, else 0)
         // lowers to a `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0 END`.
         if upper == "FIELD" {
@@ -3510,6 +3519,49 @@ impl Parser {
             ast::Operator::Divide,
             ast::Expr::Literal(ast::Literal::Numeric("3".to_string())),
         ))
+    }
+
+    /// Parses a `DAYNAME(d)` call (the name and `(` are already consumed) and
+    /// lowers it to the English weekday name via [`name_from_date`] over
+    /// `strftime('%w', d)` (0=Sunday..6=Saturday). NULL propagates. Exactly one
+    /// argument is required.
+    fn dayname_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        const DAYS: [&str; 7] = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ];
+        Ok(name_from_date("%w", &DAYS, 0, arg))
+    }
+
+    /// Parses a `MONTHNAME(d)` call (the name and `(` are already consumed) and
+    /// lowers it to the English month name via [`name_from_date`] over
+    /// `strftime('%m', d)` (01..12). NULL propagates. Exactly one argument is
+    /// required.
+    fn monthname_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        const MONTHS: [&str; 12] = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        Ok(name_from_date("%m", &MONTHS, 1, arg))
     }
 
     /// Parses a `DAYOFWEEK(d)` / `WEEKDAY(d)` call (the name and `(` are already
@@ -4514,6 +4566,30 @@ fn unary_fn(name: &str, arg: ast::Expr) -> ast::Expr {
             filter_clause: None,
             over_clause: None,
         },
+    }
+}
+
+/// Builds `CASE CAST(strftime(fmt, arg) AS INTEGER) WHEN start THEN names[0] ...
+/// END` — a date component (a weekday or month number) mapped to its English
+/// name. The `CASE` has no `ELSE`, so a NULL date (which makes the integer NULL,
+/// matching no `WHEN`) yields NULL, as MySQL does. Used by `DAYNAME`/`MONTHNAME`.
+fn name_from_date(fmt: &str, names: &[&str], start: i64, arg: ast::Expr) -> ast::Expr {
+    let number = cast_strftime_int(fmt, arg);
+    let when_then_pairs = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let key = ast::Expr::Literal(ast::Literal::Numeric((start + i as i64).to_string()));
+            (
+                Box::new(key),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote(name)))),
+            )
+        })
+        .collect();
+    ast::Expr::Case {
+        base: Some(Box::new(number)),
+        when_then_pairs,
+        else_expr: None,
     }
 }
 
@@ -6382,6 +6458,37 @@ mod tests {
         // A non-literal interval value, or a non-numeric string, is rejected.
         assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
         assert!(parse_expr("DATE_ADD(d, INTERVAL 'abc' DAY)").is_err());
+    }
+
+    #[test]
+    fn dayname_monthname_lower_to_case_over_strftime() {
+        // DAYNAME -> CASE over strftime('%w') with 7 names; MONTHNAME 12 over '%m'.
+        for (sql, want_branches, first_name) in [
+            ("DAYNAME(d)", 7, "'Sunday'"),
+            ("MONTHNAME(d)", 12, "'January'"),
+        ] {
+            let ast::Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } = parse_expr(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            // The base is CAST(strftime(...) AS INTEGER).
+            assert!(
+                matches!(base.as_deref(), Some(ast::Expr::Cast { .. })),
+                "{sql}"
+            );
+            assert_eq!(when_then_pairs.len(), want_branches, "{sql}");
+            // No ELSE, so a NULL date yields NULL.
+            assert!(else_expr.is_none(), "{sql}");
+            // The first branch maps to the first name.
+            assert!(
+                matches!(when_then_pairs[0].1.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == first_name),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,47 @@
+# DAYNAME(d) / MONTHNAME(d) conformance.
+#
+# DAYNAME returns the English weekday name and MONTHNAME the English month name.
+# The front-end maps the weekday number strftime('%w', d) (0=Sunday..6=Saturday)
+# and the month number strftime('%m', d) (1..12) to their names with a CASE (no
+# ELSE, so a NULL date yields NULL). These fill the gap left by DATE_FORMAT's
+# unsupported %W / %M specifiers.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Weekday names across a week (2020-06-14 is a Sunday).
+query
+SELECT DAYNAME('2020-06-14'), DAYNAME('2020-06-15'), DAYNAME('2020-06-20')
+----
+Sunday	Monday	Saturday
+
+# Month names at the year's ends and middle.
+query
+SELECT MONTHNAME('2020-01-01'), MONTHNAME('2020-06-15'), MONTHNAME('2020-12-31')
+----
+January	June	December
+
+# A DATETIME value uses its date part.
+query
+SELECT DAYNAME('2020-03-15 10:30:00'), MONTHNAME('2020-03-15 10:30:00')
+----
+Sunday	March
+
+# NULL propagates.
+query
+SELECT DAYNAME(NULL), MONTHNAME(NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS dn_demo (id INT PRIMARY KEY, d DATE)
+
+statement ok
+INSERT INTO dn_demo (id, d) VALUES (1, '2020-02-29'), (2, '2021-07-04')
+
+query
+SELECT id, DAYNAME(d), MONTHNAME(d) FROM dn_demo ORDER BY id
+----
+1	Saturday	February
+2	Sunday	July
