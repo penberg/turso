@@ -1394,10 +1394,21 @@ impl Parser {
             let table = Box::new(self.table_ref()?);
             let constraint = if self.eat_keyword("ON") {
                 Some(ast::JoinConstraint::On(Box::new(self.expr()?)))
-            } else if self.is_keyword("USING") {
-                return Err(ParseError::Unsupported(
-                    "JOIN ... USING is not supported yet".to_string(),
-                ));
+            } else if self.eat_keyword("USING") {
+                // `USING (col, ...)`: an equi-join on the named columns shared by
+                // both tables, which the engine evaluates the same as MySQL
+                // (coalescing each join column into one output column).
+                self.expect(&Token::LParen, "`(`")?;
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.name()?);
+                    if self.eat(&Token::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(&Token::RParen, "`)`")?;
+                Some(ast::JoinConstraint::Using(cols))
             } else {
                 return Err(ParseError::Unsupported(
                     "JOIN without an ON condition is not supported yet".to_string(),
@@ -4495,7 +4506,6 @@ mod tests {
             "SELECT DISTINCTROW a FROM t",
             "SELECT * FROM a CROSS JOIN b",
             "SELECT * FROM a FULL JOIN b ON a.id = b.id",
-            "SELECT * FROM a JOIN b USING (id)",
             "SELECT * FROM a JOIN b",
             "SELECT * FROM (SELECT 1)",
             "SELECT a FROM t GROUP BY 1",
@@ -4505,6 +4515,27 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn join_using_parses() {
+        // JOIN ... USING (cols) builds the engine's USING constraint.
+        let ast::Stmt::Select(select) = parse("SELECT * FROM a JOIN b USING (id, ref)").unwrap()
+        else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            panic!("expected a FROM clause");
+        };
+        let Some(ast::JoinConstraint::Using(cols)) = &from.joins[0].constraint else {
+            panic!("expected a USING constraint");
+        };
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].as_str(), "id");
+        assert_eq!(cols[1].as_str(), "ref");
     }
 
     #[test]

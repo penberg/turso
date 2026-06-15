@@ -1,0 +1,55 @@
+# JOIN ... USING (cols) conformance.
+#
+# `USING (col, ...)` is an equi-join on the columns shared by both tables; it
+# also coalesces each join column into a single output column (so the column
+# name is unambiguous afterwards). The engine evaluates it the same as MySQL, so
+# the front-end just parses the column list into the engine's USING constraint.
+# It composes with the join types (INNER / LEFT / RIGHT).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names and ORDER BY-deterministic queries.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ju_a (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS ju_b (id INT PRIMARY KEY, w INT)
+
+statement ok
+INSERT INTO ju_a (id, v) VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO ju_b (id, w) VALUES (1, 100), (3, 300)
+
+# Inner join on the shared `id`; the merged `id` is selectable unqualified.
+query
+SELECT id, v, w FROM ju_a JOIN ju_b USING (id) ORDER BY id
+----
+1	10	100
+3	30	300
+
+# USING composes with LEFT JOIN: unmatched right columns are NULL.
+query
+SELECT id, v, w FROM ju_a LEFT JOIN ju_b USING (id) ORDER BY id
+----
+1	10	100
+2	20	NULL
+3	30	300
+
+# A multi-column USING joins on every named column.
+statement ok
+CREATE TABLE IF NOT EXISTS ju_c (x INT, y INT, z INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS ju_d (x INT, y INT, q INT)
+
+statement ok
+INSERT INTO ju_c (x, y, z) VALUES (1, 1, 7), (1, 2, 8)
+
+statement ok
+INSERT INTO ju_d (x, y, q) VALUES (1, 1, 70)
+
+query
+SELECT x, y, z, q FROM ju_c JOIN ju_d USING (x, y) ORDER BY x, y
+----
+1	1	7	70
