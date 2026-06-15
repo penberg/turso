@@ -3055,6 +3055,12 @@ impl Parser {
             return self.log_call();
         }
 
+        // `ATAN(x)` is the arctangent; MySQL also accepts `ATAN(y, x)` as a synonym
+        // for `ATAN2(y, x)`, which the engine spells `atan2` (see `atan_call`).
+        if upper == "ATAN" {
+            return self.atan_call();
+        }
+
         // `CHAR(n, ...)` builds a string from character codes, mapping to the
         // engine's `char()` (see `char_call`).
         if upper == "CHAR" {
@@ -3875,6 +3881,22 @@ impl Parser {
         } else {
             self.expect(&Token::RParen, "`)`")?;
             Ok(unary_fn("ln", first))
+        }
+    }
+
+    /// Parses MySQL `ATAN(x)` or `ATAN(y, x)` (the name and `(` are already
+    /// consumed). The one-argument form is the arctangent — the engine's `atan`.
+    /// The two-argument `ATAN(y, x)` is a MySQL synonym for `ATAN2(y, x)`, which
+    /// the engine spells `atan2`.
+    fn atan_call(&mut self) -> Result<ast::Expr> {
+        let first = self.expr()?;
+        if self.eat(&Token::Comma) {
+            let x = self.expr()?;
+            self.expect(&Token::RParen, "`)`")?;
+            Ok(call_fn("atan2", vec![first, x]))
+        } else {
+            self.expect(&Token::RParen, "`)`")?;
+            Ok(unary_fn("atan", first))
         }
     }
 
@@ -5821,6 +5843,12 @@ fn is_supported_function(upper_name: &str) -> bool {
         // form is the natural log in MySQL but base-10 in the engine, is handled
         // separately by `log_call`.)
         | "PI" | "LOG2" | "LOG10"
+        // Trigonometric functions, in radians, identical to the engine's:
+        // `SIN`/`COS`/`TAN` and their inverses `ASIN`/`ACOS`, plus `ATAN2(y, x)`
+        // and the angle conversions `DEGREES`/`RADIANS`. (`ATAN`, which also has a
+        // two-argument `ATAN(y, x)` = `ATAN2` form in MySQL, is handled by
+        // `atan_call`.)
+        | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN2" | "DEGREES" | "RADIANS"
         // Aggregate functions. `AVG` (the mean, ignoring NULLs — and `AVG(DISTINCT
         // x)`) maps to the engine's `avg`, which behaves identically.
         | "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
@@ -9339,6 +9367,32 @@ mod tests {
                 "expected `{input}` to parse as a function call"
             );
         }
+    }
+
+    #[test]
+    fn trig_functions_parse_and_atan_handles_two_args() {
+        // The trig functions keep their name (the engine resolves them).
+        for input in [
+            "SIN(x)", "COS(x)", "TAN(x)", "ASIN(x)", "ACOS(x)", "ATAN2(y, x)", "DEGREES(x)",
+            "RADIANS(x)",
+        ] {
+            assert!(
+                matches!(parse_expr(input).unwrap(), ast::Expr::FunctionCall { .. }),
+                "expected `{input}` to parse as a function call"
+            );
+        }
+
+        // ATAN(x) -> atan(x); ATAN(y, x) -> atan2(y, x) (MySQL's two-arg synonym).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("ATAN(x)").unwrap() else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "atan");
+        assert_eq!(args.len(), 1);
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("ATAN(y, x)").unwrap() else {
+            panic!("expected a function call");
+        };
+        assert_eq!(name.as_str(), "atan2");
+        assert_eq!(args.len(), 2);
     }
 
     #[test]

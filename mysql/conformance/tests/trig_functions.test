@@ -1,0 +1,41 @@
+# Trigonometric functions: SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, DEGREES,
+# RADIANS.
+#
+# These operate in radians and map straight onto the engine's same-named
+# functions. ATAN also has MySQL's two-argument form ATAN(y, x), a synonym for
+# ATAN2(y, x), which the front-end lowers to the engine's atan2. DEGREES/RADIANS
+# convert between degrees and radians.
+#
+# Results are compared after ROUND() since they are floating point; the rounded
+# values agree on both turso-mysql-server and a real mysqld. This test needs no
+# tables.
+
+# Basic sine/cosine/tangent at 0.
+query
+SELECT ROUND(SIN(0), 6) = 0, ROUND(COS(0), 6) = 1, ROUND(TAN(0), 6) = 0
+----
+1	1	1
+
+# Inverses, against the known angles pi/2 and pi/4.
+query
+SELECT ROUND(ASIN(1), 6) = ROUND(PI() / 2, 6), ROUND(ACOS(1), 6) = 0, ROUND(ATAN(1), 6) = ROUND(PI() / 4, 6)
+----
+1	1	1
+
+# The two-argument ATAN(y, x) is a synonym for ATAN2(y, x).
+query
+SELECT ROUND(ATAN(1, 1), 6) = ROUND(PI() / 4, 6), ROUND(ATAN(1, 1), 6) = ROUND(ATAN2(1, 1), 6)
+----
+1	1
+
+# Degree/radian conversion.
+query
+SELECT ROUND(DEGREES(PI()), 6) = 180, ROUND(RADIANS(180), 6) = ROUND(PI(), 6)
+----
+1	1
+
+# NULL propagates through each.
+query
+SELECT SIN(NULL) IS NULL, ATAN(NULL) IS NULL, ATAN2(NULL, 1) IS NULL, DEGREES(NULL) IS NULL
+----
+1	1	1	1
