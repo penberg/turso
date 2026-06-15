@@ -2867,6 +2867,25 @@ impl Parser {
                         self.advance();
                         self.convert_expr()
                     }
+                    // The SQL-standard niladic date/time keywords are valid
+                    // *without* parentheses: `CURRENT_TIMESTAMP`, `CURRENT_DATE`,
+                    // `CURRENT_TIME`, `LOCALTIME`, `LOCALTIMESTAMP`, and the
+                    // `UTC_*` forms. (Their parenthesized forms, and `NOW()` /
+                    // `CURDATE()` etc. which require parentheses, go through
+                    // `function_call`.) Lower the bare form to the same engine
+                    // call so it is not mistaken for a column reference.
+                    kw @ ("CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME"
+                    | "LOCALTIMESTAMP" | "UTC_TIMESTAMP" | "UTC_DATE" | "UTC_TIME")
+                        if self.peek_nth(1) != Some(&Token::LParen) =>
+                    {
+                        let engine_fn =
+                            current_time_function(kw).expect("niladic date/time keyword");
+                        self.advance();
+                        Ok(call_fn(
+                            engine_fn,
+                            vec![ast::Expr::Literal(ast::Literal::String(requote("now")))],
+                        ))
+                    }
                     // A bare identifier followed by `(` is a function call;
                     // otherwise it is a column reference.
                     _ if self.peek_nth(1) == Some(&Token::LParen) => self.function_call(),
@@ -3043,7 +3062,10 @@ impl Parser {
         if upper == "VALUES" && self.in_upsert_assignment {
             let col = self.name()?;
             self.expect(&Token::RParen, "`)`")?;
-            return Ok(ast::Expr::Qualified(ast::Name::from_string("excluded"), col));
+            return Ok(ast::Expr::Qualified(
+                ast::Name::from_string("excluded"),
+                col,
+            ));
         }
 
         // `CONCAT(a, b, ...)` lowers to the engine's `||` concatenation, which —
@@ -6267,7 +6289,10 @@ mod tests {
             panic!("expected columns");
         };
         let default_of = |name: &str| -> Option<ast::Expr> {
-            let col = columns.iter().find(|c| c.col_name.as_str() == name).unwrap();
+            let col = columns
+                .iter()
+                .find(|c| c.col_name.as_str() == name)
+                .unwrap();
             col.constraints.iter().find_map(|c| match &c.constraint {
                 ast::ColumnConstraint::Default(e) => Some((**e).clone()),
                 _ => None,
@@ -6285,7 +6310,11 @@ mod tests {
         // The AUTO_INCREMENT PRIMARY KEY column, a nullable column, and a
         // DATETIME column (no clean engine default) get no synthesized default.
         for name in ["id", "n", "dt"] {
-            assert_eq!(default_of(name), None, "column `{name}` should have no default");
+            assert_eq!(
+                default_of(name),
+                None,
+                "column `{name}` should have no default"
+            );
         }
         // An explicit DEFAULT is preserved unchanged.
         assert_eq!(
@@ -6994,7 +7023,9 @@ mod tests {
         }
 
         // Hints attach to joined tables too.
-        assert!(parse("SELECT * FROM a USE INDEX (x) JOIN b FORCE INDEX (y) ON a.id = b.id").is_ok());
+        assert!(
+            parse("SELECT * FROM a USE INDEX (x) JOIN b FORCE INDEX (y) ON a.id = b.id").is_ok()
+        );
     }
 
     #[test]
@@ -7024,7 +7055,10 @@ mod tests {
         }
 
         // An OUTER (LEFT/RIGHT) join still requires a condition.
-        for sql in ["SELECT * FROM a LEFT JOIN b", "SELECT * FROM a RIGHT JOIN b"] {
+        for sql in [
+            "SELECT * FROM a LEFT JOIN b",
+            "SELECT * FROM a RIGHT JOIN b",
+        ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to require a condition"
@@ -7418,8 +7452,8 @@ mod tests {
     fn insert_on_duplicate_values_inside_expression_lowers_to_excluded() {
         // `VALUES(col)` is recognized anywhere in the assignment expression (not
         // only as a whole RHS) and lowers to `excluded.col`.
-        let stmt =
-            parse("INSERT INTO t (n) VALUES (1) ON DUPLICATE KEY UPDATE n = n + VALUES(n)").unwrap();
+        let stmt = parse("INSERT INTO t (n) VALUES (1) ON DUPLICATE KEY UPDATE n = n + VALUES(n)")
+            .unwrap();
         let ast::Stmt::Insert {
             body: ast::InsertBody::Select(_, Some(upsert)),
             ..
@@ -7995,6 +8029,38 @@ mod tests {
                 "expected a 'now' argument for `{sql}`"
             );
         }
+    }
+
+    #[test]
+    fn bare_current_datetime_keywords_lower_to_now() {
+        // The SQL-standard niladic keywords work without parentheses and lower to
+        // the same `<fn>('now')` engine call as their parenthesized forms.
+        let cases = [
+            ("CURRENT_TIMESTAMP", "datetime"),
+            ("LOCALTIME", "datetime"),
+            ("LOCALTIMESTAMP", "datetime"),
+            ("UTC_TIMESTAMP", "datetime"),
+            ("CURRENT_DATE", "date"),
+            ("UTC_DATE", "date"),
+            ("CURRENT_TIME", "time"),
+            ("UTC_TIME", "time"),
+        ];
+        for (sql, engine_fn) in cases {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected bare `{sql}` to lower to a function call");
+            };
+            assert_eq!(name.as_str(), engine_fn, "for `{sql}`");
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'now'"),
+                "expected a 'now' argument for bare `{sql}`"
+            );
+        }
+
+        // The bare form and the parenthesized form lower identically.
+        assert_eq!(
+            parse_expr("CURRENT_TIMESTAMP").unwrap(),
+            parse_expr("CURRENT_TIMESTAMP()").unwrap()
+        );
     }
 
     #[test]
@@ -9219,7 +9285,8 @@ mod tests {
         );
 
         // `a / b` is MySQL float division: `CAST(a AS REAL) / b`.
-        let ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) = parse_expr("a / b").unwrap() else {
+        let ast::Expr::Binary(lhs, ast::Operator::Divide, rhs) = parse_expr("a / b").unwrap()
+        else {
             panic!("expected `/` to lower to a division");
         };
         let ast::Expr::Cast { type_name, .. } = lhs.as_ref() else {
@@ -9459,8 +9526,15 @@ mod tests {
     fn math_functions_parse_and_rename_synonyms() {
         // Functions that keep their name (the engine resolves them
         // case-insensitively).
-        for input in ["ROUND(x, 2)", "FLOOR(x)", "CEIL(x)", "POW(x, 2)", "SQRT(x)", "EXP(x)", "LN(x)"]
-        {
+        for input in [
+            "ROUND(x, 2)",
+            "FLOOR(x)",
+            "CEIL(x)",
+            "POW(x, 2)",
+            "SQRT(x)",
+            "EXP(x)",
+            "LN(x)",
+        ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");
             };
@@ -9515,7 +9589,13 @@ mod tests {
     fn trig_functions_parse_and_atan_handles_two_args() {
         // The trig functions keep their name (the engine resolves them).
         for input in [
-            "SIN(x)", "COS(x)", "TAN(x)", "ASIN(x)", "ACOS(x)", "ATAN2(y, x)", "DEGREES(x)",
+            "SIN(x)",
+            "COS(x)",
+            "TAN(x)",
+            "ASIN(x)",
+            "ACOS(x)",
+            "ATAN2(y, x)",
+            "DEGREES(x)",
             "RADIANS(x)",
         ] {
             assert!(

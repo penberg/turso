@@ -1,0 +1,45 @@
+# Parenthesis-less SQL-standard date/time keywords.
+#
+# CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIME, LOCALTIMESTAMP, and
+# the UTC_* forms are valid in MySQL *without* parentheses (the parenthesized
+# forms, and NOW()/CURDATE()/CURTIME() which require parentheses, are also
+# accepted). The front-end previously treated the bare keyword as a column
+# reference ("no such column: CURRENT_TIMESTAMP"); it now lowers it to the same
+# engine call as the parenthesized form.
+#
+# The values are "now", so the test asserts relationships that hold regardless of
+# the instant (date equality, lengths) -- these agree on both turso-mysql-server
+# and a real mysqld. (As with NOW(), the engine has no session time zone, so the
+# value is UTC; see mysql/COMPAT.md.) Uses its own table name.
+
+# The bare CURRENT_DATE equals CURDATE(), and a bare timestamp's date is today.
+query
+SELECT CURRENT_DATE = CURDATE(), DATE(CURRENT_TIMESTAMP) = CURRENT_DATE, DATE(LOCALTIMESTAMP) = CURDATE()
+----
+1	1	1
+
+# LOCALTIME and the UTC_* bare forms resolve too.
+query
+SELECT DATE(LOCALTIME) = CURDATE(), DATE(UTC_TIMESTAMP) = UTC_DATE(), UTC_DATE = UTC_DATE()
+----
+1	1	1
+
+# The rendered forms have MySQL's shapes: 'YYYY-MM-DD HH:MM:SS' (19),
+# 'HH:MM:SS' (8), 'YYYY-MM-DD' (10).
+query
+SELECT LENGTH(CURRENT_TIMESTAMP) = 19, LENGTH(CURRENT_TIME) = 8, LENGTH(CURRENT_DATE) = 10
+----
+1	1	1
+
+# Usable as a bare keyword in a WHERE comparison (the common form, e.g.
+# expiring transients).
+statement ok
+CREATE TABLE IF NOT EXISTS cdt (id INT PRIMARY KEY, expires DATETIME)
+
+statement ok
+INSERT INTO cdt (id, expires) VALUES (1, '2000-01-01 00:00:00'), (2, '2099-12-31 23:59:59')
+
+query
+SELECT id FROM cdt WHERE expires < CURRENT_TIMESTAMP ORDER BY id
+----
+1
