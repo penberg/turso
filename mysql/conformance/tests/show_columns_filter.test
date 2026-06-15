@@ -1,0 +1,45 @@
+# SHOW COLUMNS ... LIKE / WHERE filtering.
+#
+# MySQL allows `SHOW COLUMNS FROM tbl LIKE 'pat'` (the pattern matches the
+# column name) and `SHOW COLUMNS FROM tbl WHERE <expr>`. WordPress checks
+# whether a column exists with `SHOW COLUMNS FROM $table LIKE '$column'` (e.g.
+# in its schema-upgrade routines). The front-end now recognizes a `LIKE 'pat'`
+# (on Field) and a single `WHERE col {= | LIKE} value` predicate over one known
+# output column, and filters the built rows.
+#
+# Like the base SHOW COLUMNS output (see show_columns.test), these rows are the
+# engine's representation; Type carries the recovered declared length. Rows are
+# tab-separated; the trailing empty Extra column produces a trailing tab.
+
+statement ok
+CREATE TABLE IF NOT EXISTS scf (id INT PRIMARY KEY, name VARCHAR(60), nickname VARCHAR(60), body TEXT)
+
+# LIKE with an exact column name keeps just that column.
+query
+SHOW COLUMNS FROM scf LIKE 'name'
+----
+name	varchar(60)	YES		NULL	
+
+# LIKE with a wildcard keeps the matching columns (schema order).
+query
+SHOW COLUMNS FROM scf LIKE 'n%'
+----
+name	varchar(60)	YES		NULL	
+nickname	varchar(60)	YES		NULL	
+
+# The match is case-insensitive, as in MySQL.
+query
+SHOW COLUMNS FROM scf LIKE 'BODY'
+----
+body	text	YES		NULL	
+
+# WHERE on a named output column.
+query
+SHOW COLUMNS FROM scf WHERE Field = 'id'
+----
+id	int	YES	PRI	NULL	
+
+# A pattern matching no column yields an empty result.
+query
+SHOW COLUMNS FROM scf LIKE 'no_such_col'
+----

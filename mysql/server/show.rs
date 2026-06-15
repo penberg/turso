@@ -99,7 +99,34 @@ fn parse_show_warnings(sql: &str) -> Option<ColumnsResult> {
 struct ShowColumns {
     full: bool,
     table: String,
+    filter: Option<ColumnFilter>,
 }
+
+/// A single-predicate filter on the `SHOW COLUMNS` output, from a trailing
+/// `LIKE 'pat'` (matched against `Field`) or `WHERE col {= | LIKE} value`.
+struct ColumnFilter {
+    /// The output column matched against (one of [`COLUMNS_FULL`] /
+    /// [`COLUMNS_BASE`]); `Field` for the `LIKE 'pat'` form.
+    column: String,
+    like: bool,
+    value: String,
+}
+
+/// The columns of `SHOW FULL COLUMNS`, in order.
+const COLUMNS_FULL: [&str; 9] = [
+    "Field",
+    "Type",
+    "Collation",
+    "Null",
+    "Key",
+    "Default",
+    "Extra",
+    "Privileges",
+    "Comment",
+];
+
+/// The columns of the non-FULL `SHOW COLUMNS`, in order.
+const COLUMNS_BASE: [&str; 6] = ["Field", "Type", "Null", "Key", "Default", "Extra"];
 
 /// Reads the table's columns via `PRAGMA table_info` and reshapes them into the
 /// MySQL `SHOW [FULL] COLUMNS` result set.
@@ -146,26 +173,31 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
         }
     }
 
-    let columns = if show.full {
-        vec![
-            "Field",
-            "Type",
-            "Collation",
-            "Null",
-            "Key",
-            "Default",
-            "Extra",
-            "Privileges",
-            "Comment",
-        ]
+    let columns: Vec<&'static str> = if show.full {
+        COLUMNS_FULL.to_vec()
     } else {
-        vec!["Field", "Type", "Null", "Key", "Default", "Extra"]
+        COLUMNS_BASE.to_vec()
     };
 
-    let rows = info
+    let mut rows = info
         .into_iter()
         .map(|c| c.into_row(show.full))
         .collect::<Vec<_>>();
+
+    // Apply an optional `LIKE 'pat'` (on `Field`) or `WHERE col {= | LIKE} value`
+    // filter to the built rows.
+    if let Some(f) = &show.filter {
+        let col_idx = columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(&f.column))
+            .expect("column validated at parse time");
+        rows.retain(|row| match row[col_idx].as_deref() {
+            // A NULL output column matches neither `=` nor `LIKE`, as in MySQL.
+            None => false,
+            Some(v) if f.like => like_match(&f.value, v),
+            Some(v) => v == f.value,
+        });
+    }
 
     Ok(ShowOutcome::Columns(ColumnsResult { columns, rows }))
 }
@@ -757,11 +789,53 @@ fn parse_show_columns(sql: &str) -> Option<ShowColumns> {
         k += 1;
     }
 
-    // Any trailing tokens (e.g. LIKE/WHERE) are not handled here.
+    // Optional `LIKE 'pat'` (matched against `Field`, the column name — the form
+    // WordPress uses to check whether a column exists) or `WHERE col {= | LIKE}
+    // value` over a single known output column.
+    let filter = if toks.get(k).is_some_and(|t| kw(t, "LIKE")) {
+        k += 1;
+        let pat = unquote_token(toks.get(k)?)?;
+        k += 1;
+        Some(ColumnFilter {
+            column: "Field".to_string(),
+            like: true,
+            value: pat,
+        })
+    } else if toks.get(k).is_some_and(|t| kw(t, "WHERE")) {
+        k += 1;
+        let column = toks.get(k)?.clone();
+        let known = if full { &COLUMNS_FULL[..] } else { &COLUMNS_BASE[..] };
+        if !known.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+            return None;
+        }
+        k += 1;
+        let like = match toks.get(k)?.as_str() {
+            "=" => false,
+            t if kw(t, "LIKE") => true,
+            _ => return None,
+        };
+        k += 1;
+        let raw = toks.get(k)?;
+        let value = unquote_token(raw).unwrap_or_else(|| raw.clone());
+        k += 1;
+        Some(ColumnFilter {
+            column,
+            like,
+            value,
+        })
+    } else {
+        None
+    };
+
+    // Any further tokens (a compound `WHERE ... AND ...`, etc.) are unsupported.
     if k != toks.len() {
         return None;
     }
-    Some(ShowColumns { full, table })
+    Some(ShowColumns {
+        full,
+        table,
+        filter,
+    })
 }
 
 /// Parses `{DESCRIBE | DESC} tbl` (optionally `db.tbl`), MySQL's synonym for
@@ -797,7 +871,11 @@ fn parse_describe(sql: &str) -> Option<ShowColumns> {
     if k != toks.len() {
         return None;
     }
-    Some(ShowColumns { full: false, table })
+    Some(ShowColumns {
+        full: false,
+        table,
+        filter: None,
+    })
 }
 
 /// Parses `SHOW [FULL] TABLES [{FROM|IN} db] [LIKE 'pat']`. Returns `None` for
@@ -1296,8 +1374,44 @@ mod tests {
         assert!(parse_show_columns("SHOW TABLES").is_none());
         assert!(parse_show_columns("SHOW VARIABLES LIKE 'x'").is_none());
         assert!(parse_show_columns("SELECT 1").is_none());
-        // LIKE/WHERE filters are not handled yet and fall through to the parser.
-        assert!(parse_show_columns("SHOW COLUMNS FROM t LIKE 'a%'").is_none());
+        // A compound WHERE or an unknown column still falls through to the parser.
+        assert!(parse_show_columns("SHOW COLUMNS FROM t WHERE Bogus = 'x'").is_none());
+        assert!(
+            parse_show_columns("SHOW COLUMNS FROM t WHERE Field = 'a' AND Null = 'NO'").is_none()
+        );
+    }
+
+    #[test]
+    fn parses_show_columns_with_filter() {
+        // `LIKE 'pat'` filters on the Field (column name).
+        let p = parse_show_columns("SHOW COLUMNS FROM t LIKE 'a%'").unwrap();
+        let f = p.filter.expect("a filter");
+        assert_eq!(f.column, "Field");
+        assert!(f.like);
+        assert_eq!(f.value, "a%");
+
+        // `WHERE col = 'value'` filters on a named output column.
+        let f = parse_show_columns("SHOW COLUMNS FROM t WHERE Field='id'")
+            .unwrap()
+            .filter
+            .expect("a filter");
+        assert_eq!(f.column, "Field");
+        assert!(!f.like);
+        assert_eq!(f.value, "id");
+
+        // `Collation`/`Privileges`/`Comment` are only valid columns in the FULL
+        // form, so a WHERE on them parses only there.
+        assert!(parse_show_columns("SHOW FULL COLUMNS FROM t WHERE Collation='x'")
+            .unwrap()
+            .filter
+            .is_some());
+        assert!(parse_show_columns("SHOW COLUMNS FROM t WHERE Collation='x'").is_none());
+
+        // The bare form has no filter.
+        assert!(parse_show_columns("SHOW COLUMNS FROM t")
+            .unwrap()
+            .filter
+            .is_none());
     }
 
     #[test]
