@@ -2747,6 +2747,17 @@ impl Parser {
             let inner = self.collate_expr()?;
             return Ok(ast::Expr::unary(ast::UnaryOperator::Not, inner));
         }
+        // `~expr` — bitwise NOT (unary), high precedence like the other unary
+        // prefixes. It maps to the engine's `~`, whose result is bit-for-bit
+        // identical to MySQL's; the engine prints it as a signed integer where
+        // MySQL prints the unsigned 64-bit value (the same divergence as the
+        // other bitwise operators — see `mysql/COMPAT.md`), but masked/combined
+        // results agree.
+        if matches!(self.peek(), Some(Token::Other('~'))) {
+            self.advance();
+            let inner = self.collate_expr()?;
+            return Ok(ast::Expr::unary(ast::UnaryOperator::BitwiseNot, inner));
+        }
         // `BINARY expr` — drop the operator; the engine compares binary already.
         if self.is_keyword("BINARY") {
             self.advance();
@@ -8809,8 +8820,14 @@ mod tests {
             )
         );
 
-        // `~` (unsigned in MySQL, signed here) is not modeled.
-        assert!(parse_expr("~a").is_err());
+        // `~` is supported (see `bitwise_not_is_a_tight_unary_prefix`); `^` (XOR)
+        // is still not modeled — the engine has no `^` operator — so `a ^ b` does
+        // not fully parse.
+        let mut p = Parser::new(b"a ^ b").unwrap();
+        assert!(
+            !(p.expr().is_ok() && p.peek().is_none()),
+            "expected `a ^ b` to be rejected"
+        );
     }
 
     #[test]
@@ -8860,6 +8877,35 @@ mod tests {
         assert_eq!(
             parse_expr("a <> b").unwrap(),
             ast::Expr::binary(col("a"), ast::Operator::NotEquals, col("b"))
+        );
+    }
+
+    #[test]
+    fn bitwise_not_is_a_tight_unary_prefix() {
+        // `~a` is unary bitwise NOT.
+        assert_eq!(
+            parse_expr("~a").unwrap(),
+            ast::Expr::unary(ast::UnaryOperator::BitwiseNot, col("a"))
+        );
+
+        // It binds tighter than `&`: `~a & b` == `(~a) & b`.
+        assert_eq!(
+            parse_expr("~a & b").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::unary(ast::UnaryOperator::BitwiseNot, col("a")),
+                ast::Operator::BitwiseAnd,
+                col("b"),
+            )
+        );
+
+        // And tighter than `*`: `~a * b` == `(~a) * b`.
+        assert_eq!(
+            parse_expr("~a * b").unwrap(),
+            ast::Expr::binary(
+                ast::Expr::unary(ast::UnaryOperator::BitwiseNot, col("a")),
+                ast::Operator::Multiply,
+                col("b"),
+            )
         );
     }
 

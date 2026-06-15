@@ -1,0 +1,35 @@
+# The unary bitwise NOT operator `~`.
+#
+# `~x` flips every bit, completing the bitwise operator set (`&`, `|`, `<<`, `>>`
+# were already supported). It maps to the engine's `~`, which is bit-for-bit
+# identical to MySQL; `~` binds tightly, like the other unary prefixes.
+#
+# As with the other bitwise operators, MySQL evaluates on unsigned 64-bit while
+# the engine uses signed, so a bare `~x` prints differently (`~5` is the engine's
+# -6 vs MySQL's 18446744073709551610 -- the same bits). This test therefore
+# asserts masked / combined results, which are equal on both targets. Passes
+# against both turso-mysql-server and a real mysqld. This test needs no tables.
+
+# Double NOT returns the original value.
+query
+SELECT ~~5 = 5, ~~0 = 0, ~~255 = 255
+----
+1	1	1
+
+# `& ~mask` clears bits; the low bits of `~x` mask to the complement.
+query
+SELECT 5 & ~1 = 4, 12 & ~3 = 12, 5 & ~6 = 1, (~5) & 7 = 2, ~0 & 255 = 255
+----
+1	1	1	1	1
+
+# `~` binds tighter than `&` (so `~3 & 1` is `(~3) & 1`, clearing bit 0).
+query
+SELECT ~3 & 1 = 0, ~4 & 7 = 3
+----
+1	1
+
+# NULL propagates.
+query
+SELECT ~NULL IS NULL
+----
+1
