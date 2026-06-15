@@ -2260,6 +2260,30 @@ impl Parser {
         self.expect(&Token::LParen, "`(`")?;
         let expr = self.expr()?;
         self.expect_keyword("AS")?;
+
+        // `DATE`/`DATETIME`/`TIME` have no SQLite type affinity, so a plain
+        // `CAST` would not parse or reformat the value. Lower them to the
+        // engine's `date()`/`datetime()`/`time()` functions, which render the
+        // 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' / 'HH:MM:SS' forms MySQL returns.
+        let date_func = match self.peek() {
+            Some(Token::Word(w)) => match w.to_ascii_uppercase().as_str() {
+                "DATE" => Some("date"),
+                "DATETIME" => Some("datetime"),
+                "TIME" => Some("time"),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(func) = date_func {
+            self.advance();
+            // An optional fractional-seconds precision (`DATETIME(6)`) is dropped.
+            if self.is(&Token::LParen) {
+                let _ = self.type_size()?;
+            }
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(unary_fn(func, expr));
+        }
+
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(ast::Expr::Cast {
@@ -5176,13 +5200,25 @@ mod tests {
             assert_eq!(ty.name, expected, "for `{sql}`");
             assert!(ty.size.is_none(), "length must be dropped for `{sql}`");
         }
-        // Targets that diverge from the engine are rejected.
-        for sql in ["CAST(a AS DATE)", "CAST(a AS DATETIME)", "CAST(a AS JSON)"] {
-            assert!(
-                matches!(parse_expr(sql).unwrap_err(), ParseError::Unsupported(_)),
-                "expected `{sql}` to be unsupported"
-            );
+        // DATE/DATETIME/TIME have no affinity, so they lower to the engine's
+        // date()/datetime()/time() functions instead of a Cast.
+        for (sql, func) in [
+            ("CAST(a AS DATE)", "date"),
+            ("CAST(a AS DATETIME)", "datetime"),
+            ("CAST(a AS DATETIME(6))", "datetime"),
+            ("CAST(a AS TIME)", "time"),
+        ] {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a function call");
+            };
+            assert_eq!(name.as_str(), func, "for `{sql}`");
+            assert_eq!(args.len(), 1, "for `{sql}`");
         }
+        // Other targets that diverge from the engine are still rejected.
+        assert!(matches!(
+            parse_expr("CAST(a AS JSON)").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]

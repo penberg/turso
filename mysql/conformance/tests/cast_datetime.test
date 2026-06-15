@@ -1,0 +1,52 @@
+# CAST(expr AS DATE / DATETIME / TIME) conformance.
+#
+# Unlike the affinity-based CAST targets (see cast.test), MySQL's DATE/DATETIME/
+# TIME casts parse and reformat the value. SQLite has no such type affinity, so
+# the front-end lowers them to the engine's date()/datetime()/time() functions:
+#   CAST(x AS DATE)     -> date(x)      -> 'YYYY-MM-DD'
+#   CAST(x AS DATETIME) -> datetime(x)  -> 'YYYY-MM-DD HH:MM:SS'
+#   CAST(x AS TIME)     -> time(x)      -> 'HH:MM:SS'
+# An optional fractional-seconds precision (DATETIME(6)) is accepted and dropped.
+# WordPress uses these in meta date queries (ORDER BY CAST(meta_value AS DATE)).
+# NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+# DATE keeps the date part; TIME keeps the time part.
+query
+SELECT CAST('2020-03-15 09:07:42' AS DATE), CAST('2020-03-15 09:07:42' AS TIME)
+----
+2020-03-15	09:07:42
+
+# DATETIME on a bare date fills the time with midnight.
+query
+SELECT CAST('2020-03-15' AS DATETIME)
+----
+2020-03-15 00:00:00
+
+# A fractional-seconds precision is accepted and ignored.
+query
+SELECT CAST('2020-03-15 09:07:42' AS DATETIME(6))
+----
+2020-03-15 09:07:42
+
+# NULL propagates.
+query
+SELECT CAST(NULL AS DATE), CAST(NULL AS TIME)
+----
+NULL	NULL
+
+# Usable as an ORDER BY key on meta-style string values.
+statement ok
+CREATE TABLE IF NOT EXISTS cd_demo (id INT PRIMARY KEY, v VARCHAR(20))
+
+statement ok
+INSERT INTO cd_demo (id, v) VALUES (1, '2021-05-10'), (2, '2019-12-31'), (3, '2020-08-01')
+
+query
+SELECT id FROM cd_demo ORDER BY CAST(v AS DATE)
+----
+2
+3
+1

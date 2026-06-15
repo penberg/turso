@@ -5,7 +5,9 @@
 # UNSIGNED (integer), DECIMAL (numeric), DOUBLE / FLOAT / REAL (real), BINARY
 # (blob). A length/precision (CHAR(n), DECIMAL(m,d)) is accepted but not
 # enforced, and rounding of fractional values when casting to an integer differs
-# from MySQL — see mysql/COMPAT.md.
+# from MySQL — see mysql/COMPAT.md. The DATE / DATETIME / TIME targets are
+# handled separately (lowered to date()/datetime()/time()) — see
+# cast_datetime.test.
 #
 # These cases use integer/string inputs where both targets agree, so they pass
 # against both turso-mysql-server and a real mysqld.
