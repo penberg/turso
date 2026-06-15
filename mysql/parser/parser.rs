@@ -4960,6 +4960,15 @@ fn translate_date_format(mysql_fmt: &str) -> Result<String> {
             // they pass straight through.
             Some('j') => out.push_str("%j"),
             Some('w') => out.push_str("%w"),
+            // Week numbers: MySQL `%U` (Sunday-first, mode 0) is strftime `%U`,
+            // and MySQL `%v` (Monday-first ISO, mode 3) is strftime `%V` — the
+            // same mode-to-format mapping the `WEEK()` function uses (and which
+            // its conformance test verifies). MySQL `%u`/`%V` (modes 1/2) have no
+            // matching strftime format and stay rejected.
+            Some('U') => out.push_str("%U"),
+            Some('v') => out.push_str("%V"),
+            // `%T` is the 24-hour `HH:MM:SS` time, i.e. `%H:%i:%s`.
+            Some('T') => out.push_str("%H:%M:%S"),
             Some('%') => out.push_str("%%"),
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
@@ -6591,13 +6600,15 @@ mod tests {
             matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%Y-%m-%d %H:%M:%S'"),
             "format was not translated correctly"
         );
-        // `%j` (day of year) and `%w` (weekday number) pass straight through.
-        let ast::Expr::FunctionCall { args, .. } = parse_expr("DATE_FORMAT(d, '%j-%w')").unwrap()
+        // `%j`/`%w` pass through; `%U`/`%v` map to strftime `%U`/`%V`; `%T`
+        // expands to `%H:%M:%S`.
+        let ast::Expr::FunctionCall { args, .. } =
+            parse_expr("DATE_FORMAT(d, '%j-%w %U %v %T')").unwrap()
         else {
             unreachable!()
         };
         assert!(
-            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%j-%w'")
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%j-%w %U %V %H:%M:%S'")
         );
         // A specifier without a strftime equivalent is rejected (`%W` is the
         // weekday *name* in MySQL but the *week number* in strftime, so it is not

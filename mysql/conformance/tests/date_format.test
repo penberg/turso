@@ -3,10 +3,11 @@
 # MySQL's DATE_FORMAT formats a datetime with format specifiers. The front-end
 # lowers it to the engine's strftime(), translating the MySQL specifiers that
 # have a direct strftime equivalent: %Y %m %d %H, %i (minutes -> %M),
-# %s (seconds -> %S), %j (day of year), %w (weekday number), and %%. Literal
-# characters pass through. The format must be a string literal; specifiers
-# without a strftime equivalent (e.g. %M month name, %p, %W weekday name, %h)
-# are rejected. See mysql/COMPAT.md.
+# %s (seconds -> %S), %j (day of year), %w (weekday number), %U (Sunday-first
+# week), %v (ISO week -> %V), %T (-> %H:%M:%S), and %%. Literal characters pass
+# through. The format must be a string literal; specifiers without a strftime
+# equivalent (e.g. %M month name, %p, %W weekday name, %h) are rejected. See
+# mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -62,3 +63,23 @@ query
 SELECT DATE_FORMAT(d, 'day %j (wday %w) of %Y') FROM df_demo
 ----
 day 075 (wday 0) of 2020
+
+# %T is the 24-hour HH:MM:SS time.
+query
+SELECT DATE_FORMAT(d, '%T') FROM df_demo
+----
+09:07:42
+
+# %U is the Sunday-first week number (mode 0): 2020-01-05 is the first Sunday so
+# week 01, the day before is week 00.
+query
+SELECT DATE_FORMAT('2020-01-05', '%U'), DATE_FORMAT('2020-01-04', '%U')
+----
+01	00
+
+# %v is the Monday-first ISO week number (mode 3): 2020-01-06 starts ISO week 02,
+# and 2021-01-01 belongs to ISO week 53 of the prior year.
+query
+SELECT DATE_FORMAT('2020-01-06', '%v'), DATE_FORMAT('2021-01-01', '%v')
+----
+02	53
