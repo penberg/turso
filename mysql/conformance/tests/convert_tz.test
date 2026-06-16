@@ -1,0 +1,57 @@
+# CONVERT_TZ(dt, from_tz, to_tz) — shift a datetime between time zones.
+#
+# MySQL's CONVERT_TZ moves a datetime from one zone to another. The front-end
+# supports the numeric-offset form (`+HH:MM` / `-HH:MM`): each offset is read as a
+# signed minute count and dt is shifted by their difference, lowered to
+# datetime(dt, '<diff> minutes'). A DATE argument is treated as midnight (the
+# result is a DATETIME, as in MySQL), and a NULL or non-numeric offset yields NULL.
+#
+# The named-zone form ('US/Eastern', 'UTC', ...) is not exercised: it needs the
+# server's time-zone tables, which this engine has none of, so it returns NULL
+# here — matching a real mysqld with no time-zone tables loaded, but differing from
+# one that has them (see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# Forward by 5h30m, and back by 5h.
+query
+SELECT CONVERT_TZ('2020-06-15 12:00:00', '+00:00', '+05:30'), CONVERT_TZ('2020-06-15 12:00:00', '+05:00', '+00:00')
+----
+2020-06-15 17:30:00	2020-06-15 07:00:00
+
+# A negative target offset, and a shift that rolls past midnight into the next day.
+query
+SELECT CONVERT_TZ('2020-06-15 12:00:00', '+02:00', '-05:00'), CONVERT_TZ('2020-06-15 23:30:00', '+00:00', '+01:00')
+----
+2020-06-15 05:00:00	2020-06-16 00:30:00
+
+# A shift across a 17-hour span (negative to positive offset) rolls to the next day.
+query
+SELECT CONVERT_TZ('2020-06-15 12:00:00', '-08:00', '+09:00')
+----
+2020-06-16 05:00:00
+
+# A DATE argument is taken as midnight and returns a DATETIME.
+query
+SELECT CONVERT_TZ('2020-06-15', '+00:00', '+05:30')
+----
+2020-06-15 05:30:00
+
+# A NULL datetime or offset propagates to NULL.
+query
+SELECT CONVERT_TZ(NULL, '+00:00', '+01:00'), CONVERT_TZ('2020-06-15 12:00:00', '+00:00', NULL)
+----
+NULL	NULL
+
+statement ok
+CREATE TABLE convtz_t (id INT PRIMARY KEY, gmt DATETIME)
+
+statement ok
+INSERT INTO convtz_t VALUES (1, '2020-12-31 22:00:00'), (2, '2020-06-15 03:00:00')
+
+# Applied to a column: convert stored GMT to a +05:30 local time.
+query
+SELECT id, CONVERT_TZ(gmt, '+00:00', '+05:30') FROM convtz_t ORDER BY id
+----
+1	2021-01-01 03:30:00
+2	2020-06-15 08:30:00

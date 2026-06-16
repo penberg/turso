@@ -4470,6 +4470,12 @@ impl Parser {
             return self.last_day_call();
         }
 
+        // `CONVERT_TZ(dt, from_tz, to_tz)` shifts a datetime between numeric
+        // UTC offsets (see `convert_tz_call`).
+        if upper == "CONVERT_TZ" {
+            return self.convert_tz_call();
+        }
+
         // `MAKEDATE(year, dayofyear)` builds a date from a year and a 1-based day
         // of year.
         if upper == "MAKEDATE" {
@@ -7025,6 +7031,96 @@ impl Parser {
                 filter_clause: None,
                 over_clause: None,
             },
+        })
+    }
+
+    /// Parses `CONVERT_TZ(dt, from_tz, to_tz)` (the name and `(` already consumed)
+    /// and lowers it to a shift of `dt` between two **numeric UTC offsets**. Each
+    /// `±HH:MM` offset is read as a signed minute count, and `dt` is shifted by
+    /// their difference via `datetime(dt, '<diff> minutes')` — so `CONVERT_TZ(dt,
+    /// '+00:00', '+05:30')` moves the time forward 5½ hours, as in MySQL. A DATE
+    /// argument is treated as midnight (the result is a DATETIME, like MySQL).
+    ///
+    /// A guard returns NULL unless both offsets have the `±HH:MM` shape, so a NULL
+    /// or unparseable offset yields NULL (and a NULL `dt` propagates through
+    /// `datetime`). This matches a real mysqld with **no time-zone tables loaded**,
+    /// the common deployment. The named-zone form (`'US/Eastern'`, `'UTC'`), which
+    /// needs those tables, is the one divergence: it returns NULL here rather than
+    /// a converted value (see `mysql/COMPAT.md`).
+    fn convert_tz_call(&mut self) -> Result<ast::Expr> {
+        let dt = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let from_tz = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let to_tz = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let str_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+        let cast_int = |e: ast::Expr| ast::Expr::Cast {
+            expr: Box::new(e),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        };
+        // The signed minute count of an `±HH:MM` offset:
+        // (-1 if it starts with '-', else 1) * (HH * 60 + MM).
+        let offset_minutes = |o: &ast::Expr| {
+            let sign = ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(ast::Expr::binary(
+                        substr_fn(o.clone(), *numeric_expr("1"), *numeric_expr("1")),
+                        ast::Operator::Equals,
+                        str_lit("-"),
+                    )),
+                    Box::new(*numeric_expr("-1")),
+                )],
+                else_expr: Some(numeric_expr("1")),
+            };
+            let hours = cast_int(substr_fn(o.clone(), *numeric_expr("2"), *numeric_expr("2")));
+            let minutes = cast_int(substr_fn(o.clone(), *numeric_expr("5"), *numeric_expr("2")));
+            let magnitude = ast::Expr::binary(
+                ast::Expr::binary(hours, ast::Operator::Multiply, *numeric_expr("60")),
+                ast::Operator::Add,
+                minutes,
+            );
+            ast::Expr::binary(sign, ast::Operator::Multiply, magnitude)
+        };
+        // Whether an offset has the `±HH:MM` shape (a sign then a `:` separator).
+        let is_offset = |o: &ast::Expr| {
+            let first = substr_fn(o.clone(), *numeric_expr("1"), *numeric_expr("1"));
+            let signed = ast::Expr::binary(
+                ast::Expr::binary(first.clone(), ast::Operator::Equals, str_lit("+")),
+                ast::Operator::Or,
+                ast::Expr::binary(first, ast::Operator::Equals, str_lit("-")),
+            );
+            let colon = ast::Expr::binary(
+                substr_fn(o.clone(), *numeric_expr("4"), *numeric_expr("1")),
+                ast::Operator::Equals,
+                str_lit(":"),
+            );
+            ast::Expr::binary(signed, ast::Operator::And, colon)
+        };
+
+        // diff = to_minutes - from_minutes, applied as `datetime(dt, '+diff minutes')`.
+        let diff = ast::Expr::binary(
+            offset_minutes(&to_tz),
+            ast::Operator::Subtract,
+            offset_minutes(&from_tz),
+        );
+        let modifier = call_fn("printf", vec![str_lit("%+d minutes"), diff]);
+        let shifted = call_fn("datetime", vec![dt, modifier]);
+
+        // NULL unless both offsets are numeric (a NULL `dt` propagates through
+        // `datetime`); the named-zone form falls here, as on a tz-table-less server.
+        let both_numeric =
+            ast::Expr::binary(is_offset(&from_tz), ast::Operator::And, is_offset(&to_tz));
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(Box::new(both_numeric), Box::new(shifted))],
+            else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::Null))),
         })
     }
 
@@ -14342,6 +14438,36 @@ mod tests {
 
         // The swap flag must be an integer literal.
         assert!(parse_expr("UUID_TO_BIN(u, n)").is_err());
+    }
+
+    #[test]
+    fn convert_tz_lowers_to_guarded_datetime_shift() {
+        // CONVERT_TZ(dt, f, t) -> CASE WHEN <both numeric offsets> THEN
+        //                              datetime(dt, printf('%+d minutes', ...))
+        //                         ELSE NULL END.
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("CONVERT_TZ(dt, f, t)").unwrap()
+        else {
+            panic!("expected CONVERT_TZ to lower to a guarded CASE");
+        };
+        // The guard returns NULL for a non-numeric (or NULL) offset.
+        assert_eq!(
+            **else_expr.as_ref().unwrap(),
+            ast::Expr::Literal(ast::Literal::Null)
+        );
+        // The THEN branch is a datetime() shift.
+        let ast::Expr::FunctionCall { name, args, .. } = when_then_pairs[0].1.as_ref() else {
+            panic!("expected the THEN to be a datetime() call");
+        };
+        assert_eq!(name.as_str(), "datetime");
+        // datetime(dt, printf('%+d minutes', diff)).
+        let ast::Expr::FunctionCall { name: inner, .. } = args[1].as_ref() else {
+            panic!("expected a printf() modifier");
+        };
+        assert_eq!(inner.as_str(), "printf");
     }
 
     #[test]
