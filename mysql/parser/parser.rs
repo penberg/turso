@@ -2400,6 +2400,16 @@ impl Parser {
             ));
         }
 
+        // The `information_schema` object-enumeration views the engine never
+        // populates (`VIEWS`, `ROUTINES`, `TRIGGERS`, `EVENTS`) are emulated as
+        // always-empty result sets, so a dump/backup tool that enumerates them
+        // gets nothing rather than an error (see `information_schema_empty_view_select`).
+        if let Some(select) = information_schema_empty_view_select(&tbl_name)? {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(select, alias));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -10417,6 +10427,55 @@ fn information_schema_schemata_select(current_db: Option<&str>) -> Result<ast::S
     match Parser::new(sql.as_bytes())?.parse_statement()? {
         ast::Stmt::Select(select) => Ok(select),
         _ => unreachable!("the information_schema.SCHEMATA emulation parses as a SELECT"),
+    }
+}
+
+/// Emulates the `information_schema` object-enumeration views the engine never
+/// populates — it cannot define stored `VIEWS`, `ROUTINES` (procedures /
+/// functions), `TRIGGERS`, or `EVENTS` — as always-empty result sets carrying
+/// the columns mysqldump and backup/migration tools select. The view is built as
+/// a constant-column `SELECT ... FROM sqlite_schema WHERE type = <never matched>`
+/// so it has the right shape but no rows, exactly as a MySQL server with none of
+/// these objects returns (so `WHERE <schema> = DATABASE()` filters yield
+/// nothing). Returns `None` if `name` is not one of these views.
+fn information_schema_empty_view_select(
+    name: &ast::QualifiedName,
+) -> Result<Option<ast::Select>> {
+    if !name
+        .db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+    {
+        return Ok(None);
+    }
+    let view = name.name.as_str();
+    let columns = if view.eq_ignore_ascii_case("VIEWS") {
+        "'def' AS TABLE_CATALOG, 'def' AS TABLE_SCHEMA, '' AS TABLE_NAME, \
+         '' AS VIEW_DEFINITION, 'NONE' AS CHECK_OPTION, 'NO' AS IS_UPDATABLE, \
+         '' AS DEFINER, 'DEFINER' AS SECURITY_TYPE, \
+         'utf8mb4' AS CHARACTER_SET_CLIENT, 'utf8mb4_general_ci' AS COLLATION_CONNECTION"
+    } else if view.eq_ignore_ascii_case("ROUTINES") {
+        "'' AS SPECIFIC_NAME, 'def' AS ROUTINE_CATALOG, 'def' AS ROUTINE_SCHEMA, \
+         '' AS ROUTINE_NAME, '' AS ROUTINE_TYPE, '' AS DATA_TYPE, \
+         'SQL' AS ROUTINE_BODY, '' AS ROUTINE_DEFINITION, 'DEFINER' AS SECURITY_TYPE, \
+         '' AS SQL_MODE, '' AS DEFINER"
+    } else if view.eq_ignore_ascii_case("TRIGGERS") {
+        "'def' AS TRIGGER_CATALOG, 'def' AS TRIGGER_SCHEMA, '' AS TRIGGER_NAME, \
+         '' AS EVENT_MANIPULATION, 'def' AS EVENT_OBJECT_CATALOG, \
+         'def' AS EVENT_OBJECT_SCHEMA, '' AS EVENT_OBJECT_TABLE, \
+         '' AS ACTION_STATEMENT, '' AS ACTION_TIMING, '' AS DEFINER"
+    } else if view.eq_ignore_ascii_case("EVENTS") {
+        "'def' AS EVENT_CATALOG, 'def' AS EVENT_SCHEMA, '' AS EVENT_NAME, \
+         '' AS DEFINER, 'SQL' AS EVENT_BODY, '' AS EVENT_DEFINITION, \
+         '' AS EVENT_TYPE, 'DISABLED' AS STATUS"
+    } else {
+        return Ok(None);
+    };
+    // `type` never equals this sentinel, so the row set is empty.
+    let sql = format!("SELECT {columns} FROM sqlite_schema WHERE type = '__never__'");
+    match Parser::new(sql.as_bytes())?.parse_statement()? {
+        ast::Stmt::Select(select) => Ok(Some(select)),
+        _ => unreachable!("the empty information_schema view emulation parses as a SELECT"),
     }
 }
 

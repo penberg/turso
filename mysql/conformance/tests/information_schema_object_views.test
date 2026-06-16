@@ -1,0 +1,58 @@
+# Empty information_schema object-enumeration views.
+#
+# information_schema.VIEWS / ROUTINES / TRIGGERS / EVENTS list a database's
+# views, stored procedures/functions, triggers, and scheduled events. The engine
+# cannot define any of these through the front-end, so for any database they are
+# empty -- exactly what a MySQL server returns when none are defined. The views
+# did not exist in the front-end, so a reference errored ("no such database:
+# information_schema").
+#
+# mysqldump (with its default --routines / --triggers / --events) and backup /
+# migration plugins enumerate these per database during an export; they now get
+# an empty result instead of an error.
+#
+# Queries filter by the current schema (`WHERE <schema> = DATABASE()`), as those
+# tools do, so a real server's other-schema objects (e.g. the built-in `sys`
+# triggers) do not affect the comparison. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+# No user views in this database.
+query
+SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE()
+----
+
+query
+SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE()
+----
+0
+
+# No stored procedures or functions.
+query
+SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE()
+----
+
+query
+SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'FUNCTION'
+----
+0
+
+# No triggers in this database (a real server's built-in sys-schema triggers are
+# excluded by the schema filter).
+query
+SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()
+----
+0
+
+query
+SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()
+----
+
+# No scheduled events.
+query
+SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()
+----
+
+query
+SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()
+----
+0
