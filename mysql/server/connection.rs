@@ -136,6 +136,9 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
     // The unlimited row count remembered from the last `SQL_CALC_FOUND_ROWS`
     // query, answered by a subsequent `SELECT FOUND_ROWS()`.
     let mut found_rows: u64 = 0;
+    // The affected-row count of the last statement, answered by `SELECT
+    // ROW_COUNT()`. MySQL's initial value (no statement yet) is -1.
+    let mut last_row_count: i64 = -1;
     // The session SQL mode set via `SET sql_mode = '...'`, returned by
     // `SELECT @@SESSION.sql_mode`. Empty until the client sets it.
     let mut sql_mode = String::new();
@@ -170,6 +173,7 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
                     &sql,
                     seq,
                     &mut found_rows,
+                    &mut last_row_count,
                     &mut sql_mode,
                     current_db.as_deref(),
                 );
@@ -246,10 +250,32 @@ fn run_query(
     sql: &str,
     first_seq: u8,
     found_rows: &mut u64,
+    last_row_count: &mut i64,
     sql_mode: &mut String,
     current_db: Option<&str>,
 ) -> Vec<u8> {
     debug!(%sql, "COM_QUERY");
+
+    // `SELECT ROW_COUNT()` reports the affected-row count of the previous
+    // statement. It is answered here (the engine has no such function) from the
+    // value the statement below remembers. This query is itself a result-set
+    // statement, so it leaves `ROW_COUNT()` at -1 for the next call, as in MySQL.
+    if is_row_count_query(sql) {
+        let value = *last_row_count;
+        *last_row_count = -1;
+        return encode_session_response(
+            first_seq,
+            SessionResponse::Row {
+                columns: vec!["ROW_COUNT()".to_string()],
+                values: vec![Some(value.to_string())],
+            },
+        );
+    }
+
+    // Every other query updates what `ROW_COUNT()` will report. Default to -1 (the
+    // value after a result-set query); the row-modifying path below sets the
+    // affected count, and the no-row statements set 0.
+    *last_row_count = -1;
 
     // `SELECT FOUND_ROWS()` reports the count remembered from the last
     // `SQL_CALC_FOUND_ROWS` query (see below). It is answered here because the
@@ -272,6 +298,8 @@ fn run_query(
     // returned verbatim.
     if let Some(value) = parse_set_sql_mode(sql) {
         *sql_mode = value;
+        // A `SET` reports a `ROW_COUNT()` of 0, like any non-row statement.
+        *last_row_count = 0;
         let mut out = Vec::new();
         encode_frame(&mut out, first_seq, &OkPacket::default().encode());
         return out;
@@ -320,6 +348,9 @@ fn run_query(
                 return error_response(first_seq, &e);
             }
         }
+        // Multiple statements only come from a multi-table `DROP TABLE` (DDL), so
+        // `ROW_COUNT()` is 0.
+        *last_row_count = 0;
         let mut out = Vec::new();
         encode_frame(&mut out, first_seq, &OkPacket::default().encode());
         return out;
@@ -340,7 +371,7 @@ fn run_query(
         }
     }
 
-    execute_stmt(conn, stmt, first_seq)
+    execute_stmt(conn, stmt, first_seq, last_row_count)
 }
 
 /// Extracts the value from a `SET [SESSION|GLOBAL] sql_mode = '...'` statement
@@ -397,6 +428,17 @@ fn is_found_rows_query(sql: &str) -> bool {
     let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     normalized.eq_ignore_ascii_case("SELECT FOUND_ROWS()")
         || normalized.eq_ignore_ascii_case("SELECT FOUND_ROWS ()")
+}
+
+/// Whether `sql` is a standalone `SELECT ROW_COUNT()` query, ignoring case,
+/// surrounding whitespace, and a trailing semicolon. Only the bare form is
+/// special-cased (as with `FOUND_ROWS()`); the engine has no `ROW_COUNT`
+/// function, so an inline use (`SELECT ROW_COUNT() + 1`) is still rejected.
+fn is_row_count_query(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.eq_ignore_ascii_case("SELECT ROW_COUNT()")
+        || normalized.eq_ignore_ascii_case("SELECT ROW_COUNT ()")
 }
 
 /// Whether `sql` is a `SELECT` whose first item is the `SQL_CALC_FOUND_ROWS`
@@ -535,7 +577,21 @@ fn parse_error_response(first_seq: u8, error: &ParseError) -> Vec<u8> {
 /// no round trip through SQL text. The response is built entirely in memory so
 /// that, if execution fails partway through, we can discard a partial result
 /// set and reply with a clean ERR packet instead of a truncated stream.
-fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u8> {
+fn execute_stmt(
+    conn: &Arc<Connection>,
+    stmt: ast::Stmt,
+    first_seq: u8,
+    last_row_count: &mut i64,
+) -> Vec<u8> {
+    // `ROW_COUNT()` reports the affected rows of a row-modifying statement
+    // (`INSERT`/`UPDATE`/`DELETE`, and `REPLACE` / `INSERT ... ON DUPLICATE KEY`,
+    // both of which lower to `INSERT`). Any other statement — DDL, transaction
+    // control, a result-set query — reports 0 or -1, handled below.
+    let is_dml = matches!(
+        stmt,
+        ast::Stmt::Insert { .. } | ast::Stmt::Update { .. } | ast::Stmt::Delete { .. }
+    );
+
     // MySQL treats `COMMIT` / `ROLLBACK` with no transaction in progress as a
     // silent no-op, whereas the engine errors ("no transaction is active").
     // Clients — notably the WordPress test harness, which brackets every test
@@ -546,6 +602,8 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u
     if matches!(stmt, ast::Stmt::Commit { .. } | ast::Stmt::Rollback { .. })
         && conn.get_auto_commit()
     {
+        // Transaction control reports `ROW_COUNT()` of 0.
+        *last_row_count = 0;
         let mut out = Vec::new();
         encode_frame(&mut out, first_seq, &OkPacket::default().encode());
         return out;
@@ -575,7 +633,11 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u
 
     let mut statement = match conn.prepare_stmt(stmt) {
         Ok(statement) => statement,
-        Err(e) => return error_response(first_seq, &e),
+        Err(e) => {
+            // A failed statement leaves `ROW_COUNT()` at -1, as in MySQL.
+            *last_row_count = -1;
+            return error_response(first_seq, &e);
+        }
     };
 
     let num_columns = statement.num_columns();
@@ -584,16 +646,25 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u
         let mut out = Vec::new();
         match statement.run_with_row_callback(|_| Ok(())) {
             Ok(()) => {
+                let affected = conn.changes().max(0);
+                // A row-modifying statement reports its affected count; any other
+                // no-row statement (DDL, transaction control) reports 0.
+                *last_row_count = if is_dml { affected } else { 0 };
                 let ok = OkPacket::with_affected_rows(
-                    conn.changes().max(0) as u64,
+                    affected as u64,
                     conn.last_insert_rowid().max(0) as u64,
                 );
                 encode_frame(&mut out, first_seq, &ok.encode());
                 out
             }
-            Err(e) => error_response(first_seq, &e),
+            Err(e) => {
+                *last_row_count = -1;
+                error_response(first_seq, &e)
+            }
         }
     } else {
+        // A result-set query reports a `ROW_COUNT()` of -1.
+        *last_row_count = -1;
         match encode_result_set(&mut statement, num_columns, first_seq) {
             Ok(bytes) => bytes,
             Err(e) => error_response(first_seq, &e),
@@ -953,5 +1024,29 @@ mod tests {
             error_code_and_state(&LimboError::Constraint("CHECK constraint failed".into())),
             (ER_ERROR_GENERAL, *b"HY000")
         );
+    }
+
+    #[test]
+    fn recognizes_row_count_query() {
+        // The bare standalone form, case- and whitespace-insensitive, with an
+        // optional trailing semicolon and a space before the parens.
+        for sql in [
+            "SELECT ROW_COUNT()",
+            "select row_count()",
+            "  SELECT   ROW_COUNT()  ",
+            "SELECT ROW_COUNT();",
+            "SELECT ROW_COUNT ()",
+        ] {
+            assert!(is_row_count_query(sql), "should match `{sql}`");
+        }
+        // Anything else falls through to the parser (which rejects an inline use).
+        for sql in [
+            "SELECT ROW_COUNT() + 1",
+            "SELECT ROW_COUNT(), 1",
+            "SELECT FOUND_ROWS()",
+            "SELECT 1",
+        ] {
+            assert!(!is_row_count_query(sql), "should not match `{sql}`");
+        }
     }
 }

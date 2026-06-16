@@ -1,0 +1,82 @@
+# ROW_COUNT() — the affected-row count of the previous statement.
+#
+# MySQL's ROW_COUNT() returns the number of rows changed by the last
+# row-modifying statement (INSERT / UPDATE / DELETE), 0 after a statement that
+# changes no rows (DDL, a no-match DML), and -1 after a statement that returns a
+# result set. The engine has no such function, so the server answers a standalone
+# SELECT ROW_COUNT() from the affected-row count it already tracks for each
+# statement — like its SELECT FOUND_ROWS() handling.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its own
+# table name. (Affected-row counts that the engine reports differently from MySQL
+# — REPLACE / INSERT ... ON DUPLICATE KEY that overwrite a row, and an UPDATE
+# that sets a column to its existing value — are not exercised here.)
+
+statement ok
+CREATE TABLE rowcount_demo (id INT PRIMARY KEY, v INT)
+
+# After a CREATE (DDL), ROW_COUNT() is 0.
+query
+SELECT ROW_COUNT()
+----
+0
+
+statement ok
+INSERT INTO rowcount_demo (id, v) VALUES (1, 10), (2, 20), (3, 30)
+
+# Three rows inserted.
+query
+SELECT ROW_COUNT()
+----
+3
+
+statement ok
+UPDATE rowcount_demo SET v = v + 1 WHERE id <= 2
+
+# Two rows changed.
+query
+SELECT ROW_COUNT()
+----
+2
+
+statement ok
+DELETE FROM rowcount_demo WHERE id = 99
+
+# A DML matching no rows reports 0.
+query
+SELECT ROW_COUNT()
+----
+0
+
+statement ok
+DELETE FROM rowcount_demo WHERE id = 1
+
+# One row deleted.
+query
+SELECT ROW_COUNT()
+----
+1
+
+# The SELECT ROW_COUNT() above is itself a result-set query, so the next call
+# reports -1, and stays -1.
+query
+SELECT ROW_COUNT()
+----
+-1
+
+query
+SELECT ROW_COUNT()
+----
+-1
+
+# An ordinary SELECT also leaves ROW_COUNT() at -1.
+query
+SELECT v FROM rowcount_demo ORDER BY id
+----
+21
+30
+
+query
+SELECT ROW_COUNT()
+----
+-1
