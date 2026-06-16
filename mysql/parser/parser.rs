@@ -3863,6 +3863,16 @@ impl Parser {
             return self.to_seconds_call();
         }
 
+        // `PERIOD_DIFF(p1, p2)` is the month count between two `YYYYMM`/`YYMM`
+        // periods; `PERIOD_ADD(p, n)` shifts a period by `n` months. Both are
+        // integer arithmetic on the period format (see their call methods).
+        if upper == "PERIOD_DIFF" {
+            return self.period_diff_call();
+        }
+        if upper == "PERIOD_ADD" {
+            return self.period_add_call();
+        }
+
         // `TIMESTAMPDIFF(unit, a, b)` is `b - a` in whole `unit`s. The
         // fixed-duration units lower to integer division of the epoch-second
         // difference.
@@ -5421,6 +5431,52 @@ impl Parser {
         ))
     }
 
+    /// Lowers `PERIOD_DIFF(p1, p2)` (the name and `(` are already consumed) to
+    /// the number of months between the two periods, `months(p1) - months(p2)`,
+    /// where `months` turns a `YYYYMM`/`YYMM` period into an absolute month count
+    /// (see [`period_to_months`]). NULL propagates.
+    fn period_diff_call(&mut self) -> Result<ast::Expr> {
+        let p1 = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let p2 = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::binary(
+            period_to_months(p1),
+            ast::Operator::Subtract,
+            period_to_months(p2),
+        ))
+    }
+
+    /// Lowers `PERIOD_ADD(p, n)` (the name and `(` are already consumed) to the
+    /// `YYYYMM` period `n` months after `p`. The absolute month count
+    /// `total = months(p) + n` (1-based month) is converted back to a period:
+    /// `((total - 1) / 12) * 100 + ((total - 1) % 12 + 1)`. The integer division
+    /// and remainder assume `total > 0` (always true for real periods); a NULL
+    /// argument propagates.
+    fn period_add_call(&mut self) -> Result<ast::Expr> {
+        let p = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        let twelve = || ast::Expr::Literal(ast::Literal::Numeric("12".to_string()));
+        // total = months(p) + n; then total - 1 splits cleanly into (year, month).
+        let total = ast::Expr::binary(period_to_months(p), ast::Operator::Add, n);
+        let total_m1 = ast::Expr::binary(total, ast::Operator::Subtract, one());
+        let year = ast::Expr::binary(total_m1.clone(), ast::Operator::Divide, twelve());
+        let year_part = ast::Expr::binary(
+            year,
+            ast::Operator::Multiply,
+            ast::Expr::Literal(ast::Literal::Numeric("100".to_string())),
+        );
+        let month_part = ast::Expr::binary(
+            ast::Expr::binary(total_m1, ast::Operator::Modulus, twelve()),
+            ast::Operator::Add,
+            one(),
+        );
+        Ok(ast::Expr::binary(year_part, ast::Operator::Add, month_part))
+    }
+
     /// Lowers `FROM_DAYS(n)` (the name and `(` are already consumed) — the inverse
     /// of `TO_DAYS` — to `date(n + 1721059.5)`. Adding the offset (with the `.5`
     /// for the midnight-vs-noon Julian convention) turns the day number back into
@@ -6965,6 +7021,49 @@ fn time_to_sec_expr(t: ast::Expr) -> ast::Expr {
     let seconds = cast_strftime_int("%S", t);
     let hm = ast::Expr::binary(hours, ast::Operator::Add, minutes);
     ast::Expr::binary(hm, ast::Operator::Add, seconds)
+}
+
+/// Builds the absolute month count of a MySQL period `p` (`YYYYMM` or `YYMM`),
+/// `normalized_year * 12 + month`, shared by `PERIOD_DIFF` and `PERIOD_ADD`.
+///
+/// The month is `p % 100` and the year `p / 100`; a two-digit year is normalized
+/// the way MySQL does — `< 70` becomes `20YY`, `< 100` becomes `19YY`, and a
+/// four-digit year is taken as-is. The month is kept 1-based (it cancels in
+/// `PERIOD_DIFF`'s subtraction and is undone in `PERIOD_ADD`). A NULL period
+/// makes every comparison NULL, so the `CASE` falls to its `ELSE` (`NULL` year)
+/// and the whole count is NULL.
+fn period_to_months(p: ast::Expr) -> ast::Expr {
+    let hundred = || ast::Expr::Literal(ast::Literal::Numeric("100".to_string()));
+    let year = ast::Expr::binary(p.clone(), ast::Operator::Divide, hundred());
+    let month = ast::Expr::binary(p, ast::Operator::Modulus, hundred());
+    let year_less_than = |bound: i64| {
+        ast::Expr::binary(
+            year.clone(),
+            ast::Operator::Less,
+            ast::Expr::Literal(ast::Literal::Numeric(bound.to_string())),
+        )
+    };
+    let year_plus = |add: i64| {
+        ast::Expr::binary(
+            year.clone(),
+            ast::Operator::Add,
+            ast::Expr::Literal(ast::Literal::Numeric(add.to_string())),
+        )
+    };
+    let normalized_year = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (Box::new(year_less_than(70)), Box::new(year_plus(2000))),
+            (Box::new(year_less_than(100)), Box::new(year_plus(1900))),
+        ],
+        else_expr: Some(Box::new(year.clone())),
+    };
+    let year_months = ast::Expr::binary(
+        normalized_year,
+        ast::Operator::Multiply,
+        ast::Expr::Literal(ast::Literal::Numeric("12".to_string())),
+    );
+    ast::Expr::binary(year_months, ast::Operator::Add, month)
 }
 
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
@@ -10532,6 +10631,36 @@ mod tests {
         assert!(matches!(scale.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "86400"));
         // The right term is the time-of-day seconds.
         assert_eq!(*time_term, parse_expr("TIME_TO_SEC(d)").unwrap());
+    }
+
+    #[test]
+    fn period_diff_and_add_lower_to_month_arithmetic() {
+        // PERIOD_DIFF(p1, p2) -> months(p1) - months(p2): a subtraction of the
+        // two period-to-month conversions (each a `* 12 + month` over a
+        // year-normalizing CASE).
+        let ast::Expr::Binary(left, ast::Operator::Subtract, _right) =
+            parse_expr("PERIOD_DIFF(a, b)").unwrap()
+        else {
+            panic!("expected PERIOD_DIFF to lower to a subtraction");
+        };
+        // Each side is `normalized_year * 12 + month`.
+        let ast::Expr::Binary(ny12, ast::Operator::Add, _month) = left.as_ref() else {
+            panic!("expected `year_months + month`");
+        };
+        let ast::Expr::Binary(ny, ast::Operator::Multiply, twelve) = ny12.as_ref() else {
+            panic!("expected `normalized_year * 12`");
+        };
+        assert!(matches!(twelve.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "12"));
+        assert!(matches!(ny.as_ref(), ast::Expr::Case { .. }));
+
+        // PERIOD_ADD(p, n) -> year_part + month_part, the top being an addition.
+        assert!(matches!(
+            parse_expr("PERIOD_ADD(p, 3)").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Add, _)
+        ));
+        // Both require two arguments.
+        assert!(parse_expr("PERIOD_DIFF(a)").is_err());
+        assert!(parse_expr("PERIOD_ADD(a)").is_err());
     }
 
     #[test]

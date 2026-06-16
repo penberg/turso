@@ -1,0 +1,57 @@
+# PERIOD_DIFF(p1, p2) / PERIOD_ADD(p, n) conformance.
+#
+# A MySQL "period" is a year-month written as the integer YYYYMM (or the
+# two-digit-year YYMM). PERIOD_DIFF returns the number of months between two
+# periods, and PERIOD_ADD shifts a period by a number of months.
+#
+# The front-end lowers both via a period-to-months conversion,
+# normalized_year * 12 + month, where the month is p % 100, the year is p / 100,
+# and a two-digit year is normalized like MySQL (< 70 -> 20YY, < 100 -> 19YY).
+# PERIOD_DIFF is months(p1) - months(p2); PERIOD_ADD adds n months and converts
+# the total back to YYYYMM. NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (values
+# from MySQL 8.4). This test needs no tables.
+
+# Months between periods, both directions, and across a year boundary.
+query
+SELECT PERIOD_DIFF(200802, 200703), PERIOD_DIFF(200703, 200802), PERIOD_DIFF(9912, 9911)
+----
+11	-11	1
+
+# Two-digit years are normalized: 69 -> 2069 (< 70), 70 -> 1970, 99 -> 1999.
+query
+SELECT PERIOD_DIFF(202401, 6912), PERIOD_DIFF(7001, 6912), PERIOD_DIFF(202406, 202406)
+----
+-551	-1199	0
+
+# PERIOD_ADD shifts by months, rolling the year over at December.
+query
+SELECT PERIOD_ADD(200801, 2), PERIOD_ADD(200811, 2), PERIOD_ADD(200812, 1)
+----
+200803	200901	200901
+
+# A negative shift moves backward, including across a year boundary.
+query
+SELECT PERIOD_ADD(200801, -1), PERIOD_ADD(202401, -13)
+----
+200712	202212
+
+# Two-digit-year inputs are normalized before the shift.
+query
+SELECT PERIOD_ADD(9912, 1), PERIOD_ADD(6912, 1)
+----
+200001	207001
+
+# PERIOD_ADD and PERIOD_DIFF are inverses: adding n months then differencing
+# recovers n.
+query
+SELECT PERIOD_DIFF(PERIOD_ADD(202401, 7), 202401)
+----
+7
+
+# NULL propagates through either argument of both functions.
+query
+SELECT PERIOD_DIFF(NULL, 200001) IS NULL, PERIOD_ADD(200001, NULL) IS NULL, PERIOD_ADD(NULL, 2) IS NULL
+----
+1	1	1
