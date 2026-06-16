@@ -5,9 +5,10 @@
 # GROUP BY carrying the HAVING; the engine evaluates it the same as MySQL,
 # returning the aggregate row when the condition holds and no rows otherwise.
 #
-# Scope: only the aggregate form is supported. MySQL also allows a non-aggregate
-# HAVING (a post-WHERE row filter), which the engine rejects, so that is not
-# exercised here.
+# MySQL also allows a non-aggregate HAVING with no GROUP BY -- a post-WHERE row
+# filter (WordPress's custom-fields query is `SELECT DISTINCT meta_key ... HAVING
+# meta_key NOT LIKE '_%'`). The engine rejects a non-aggregate HAVING, so the
+# front-end folds it into the WHERE clause, where the filtering is equivalent.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -40,3 +41,30 @@ query
 SELECT COUNT(*) FROM hg_demo WHERE n >= 15 HAVING COUNT(*) = 2
 ----
 2
+
+# A non-aggregate HAVING is a row filter, folded into WHERE. It selects the
+# matching rows individually, not a single aggregate group.
+query
+SELECT id FROM hg_demo HAVING n > 10 ORDER BY id
+----
+2
+3
+
+# It composes with an existing WHERE (both conditions must hold).
+query
+SELECT id FROM hg_demo WHERE id <= 2 HAVING n > 10 ORDER BY id
+----
+2
+
+# The WordPress custom-fields shape: DISTINCT + a HAVING ... NOT LIKE filter.
+statement ok
+CREATE TABLE IF NOT EXISTS hg_meta (id INT PRIMARY KEY, meta_key VARCHAR(50))
+
+statement ok
+INSERT INTO hg_meta (id, meta_key) VALUES (1, 'price'), (2, '_edit_lock'), (3, 'color'), (4, 'price')
+
+query
+SELECT DISTINCT meta_key FROM hg_meta HAVING meta_key NOT LIKE '\_%' ORDER BY meta_key
+----
+color
+price

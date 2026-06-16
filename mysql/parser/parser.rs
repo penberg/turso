@@ -1785,6 +1785,26 @@ impl Parser {
 
         let group_by = self.group_by()?;
 
+        // MySQL allows a standalone `HAVING` (no `GROUP BY`) to filter rows —
+        // WordPress's custom-fields query is `SELECT DISTINCT meta_key ... HAVING
+        // meta_key NOT LIKE '_%'`. The engine rejects a non-aggregate `HAVING`,
+        // so fold such a `HAVING` into the `WHERE` clause, where its row filtering
+        // is equivalent. An aggregate `HAVING` is a whole-table aggregate the
+        // engine handles, so it stays in place.
+        let (where_clause, group_by) = match group_by {
+            Some(ast::GroupBy {
+                exprs,
+                having: Some(having),
+            }) if exprs.is_empty() && !expr_contains_aggregate(&having) => {
+                let combined = match where_clause {
+                    Some(w) => ast::Expr::binary(*w, ast::Operator::And, *having),
+                    None => *having,
+                };
+                (Some(Box::new(combined)), None)
+            }
+            other => (where_clause, other),
+        };
+
         Ok(ast::OneSelect::Select {
             distinctness,
             columns,
@@ -6779,6 +6799,58 @@ fn is_aggregate_function(upper_name: &str) -> bool {
     matches!(upper_name, "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
 }
 
+/// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
+/// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
+/// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
+/// descended into — an aggregate there belongs to the subquery, not this clause.
+fn expr_contains_aggregate(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::FunctionCallStar { .. } => true,
+        ast::Expr::FunctionCall { name, args, .. } => {
+            is_aggregate_function(&name.as_str().to_ascii_uppercase())
+                || args.iter().any(|a| expr_contains_aggregate(a))
+        }
+        ast::Expr::Binary(l, _, r) => expr_contains_aggregate(l) || expr_contains_aggregate(r),
+        ast::Expr::Unary(_, e)
+        | ast::Expr::IsNull(e)
+        | ast::Expr::NotNull(e)
+        | ast::Expr::Collate(e, _)
+        | ast::Expr::Cast { expr: e, .. } => expr_contains_aggregate(e),
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expr_contains_aggregate(lhs)
+                || expr_contains_aggregate(start)
+                || expr_contains_aggregate(end)
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            expr_contains_aggregate(lhs)
+                || expr_contains_aggregate(rhs)
+                || escape.as_deref().is_some_and(expr_contains_aggregate)
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            expr_contains_aggregate(lhs) || rhs.iter().any(|e| expr_contains_aggregate(e))
+        }
+        ast::Expr::Parenthesized(exprs) => exprs.iter().any(|e| expr_contains_aggregate(e)),
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_deref().is_some_and(expr_contains_aggregate)
+                || when_then_pairs
+                    .iter()
+                    .any(|(w, t)| expr_contains_aggregate(w) || expr_contains_aggregate(t))
+                || else_expr.as_deref().is_some_and(expr_contains_aggregate)
+        }
+        // Leaves (Id, Literal, Qualified, ...) and subqueries hold no aggregate
+        // that belongs to this clause.
+        _ => false,
+    }
+}
+
 /// The engine's name for a MySQL function that shares its behaviour but not its
 /// spelling, or `None` to keep the name as written. `CHAR_LENGTH` maps to
 /// `length` because the engine's `length()` counts characters (MySQL's `LENGTH`,
@@ -7121,6 +7193,49 @@ mod tests {
             panic!("expected OneSelect::Select");
         };
         assert!(from.is_none());
+    }
+
+    #[test]
+    fn non_aggregate_having_folds_into_where() {
+        fn one_select(sql: &str) -> (Option<Box<ast::Expr>>, Option<ast::GroupBy>) {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT");
+            };
+            let ast::OneSelect::Select {
+                where_clause,
+                group_by,
+                ..
+            } = select.body.select
+            else {
+                panic!("expected OneSelect::Select");
+            };
+            (where_clause, group_by)
+        }
+
+        // A non-aggregate HAVING with no GROUP BY folds into WHERE; the GROUP BY
+        // is gone and the WHERE is an AND of the original WHERE and the HAVING.
+        let (where_clause, group_by) = one_select("SELECT a FROM t WHERE a > 0 HAVING b < 5");
+        assert!(group_by.is_none());
+        assert!(matches!(
+            where_clause.as_deref(),
+            Some(ast::Expr::Binary(_, ast::Operator::And, _))
+        ));
+
+        // With no prior WHERE, the HAVING becomes the whole WHERE.
+        let (where_clause, group_by) = one_select("SELECT a FROM t HAVING a > 0");
+        assert!(group_by.is_none());
+        assert!(where_clause.is_some());
+
+        // An aggregate HAVING is left in place (the engine handles the
+        // whole-table aggregate).
+        let (_, group_by) = one_select("SELECT COUNT(*) FROM t HAVING COUNT(*) > 2");
+        let gb = group_by.expect("aggregate HAVING stays as a GROUP BY");
+        assert!(gb.exprs.is_empty());
+        assert!(gb.having.is_some());
+
+        // A real GROUP BY with a HAVING is untouched.
+        let (_, group_by) = one_select("SELECT a FROM t GROUP BY a HAVING a > 0");
+        assert!(group_by.is_some_and(|gb| !gb.exprs.is_empty()));
     }
 
     #[test]
