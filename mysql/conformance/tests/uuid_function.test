@@ -1,0 +1,38 @@
+# UUID() generates a UUID string.
+#
+# MySQL's UUID() returns a 36-character hyphenated UUID. The front-end maps it to
+# the engine's uuid4_str (a random version-4 UUID); MySQL's is a time-based
+# version-1 UUID, so the value (and the version nibble) differ, but the shape is
+# the same and the value is non-deterministic either way. This test asserts the
+# stable structural properties, which match on both turso-mysql-server and a real
+# mysqld.
+
+# A UUID is 36 characters.
+query
+SELECT LENGTH(UUID())
+----
+36
+
+# It is five lowercase-hex groups (8-4-4-4-12) joined by hyphens.
+query
+SELECT UUID() REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+----
+1
+
+# The hyphens sit at positions 9, 14, 19, and 24.
+query
+SELECT SUBSTRING(UUID(), 9, 1), SUBSTRING(UUID(), 14, 1), SUBSTRING(UUID(), 19, 1), SUBSTRING(UUID(), 24, 1)
+----
+-	-	-	-
+
+# Distinct UUIDs can be stored as a key (uniqueness across rows).
+statement ok
+CREATE TABLE uuid_keys (id INT PRIMARY KEY, u VARCHAR(36))
+
+statement ok
+INSERT INTO uuid_keys (id, u) VALUES (1, UUID()), (2, UUID())
+
+query
+SELECT COUNT(DISTINCT u) FROM uuid_keys
+----
+2

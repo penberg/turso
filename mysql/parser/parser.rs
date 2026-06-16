@@ -3923,6 +3923,15 @@ impl Parser {
             return self.sha2_call();
         }
 
+        // `UUID()` generates a UUID string, mapped to the engine's `uuid4_str`.
+        // MySQL returns a (time-based) version-1 UUID and the engine a random
+        // version-4 one; both are 36-character hyphenated UUIDs, and the value is
+        // non-deterministic either way. Takes no arguments.
+        if upper == "UUID" {
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(call_fn("uuid4_str", Vec::new()));
+        }
+
         // `HEX(x)` is overloaded: the uppercase hex of a number, or the hex of a
         // string's bytes (see `hex_call`).
         if upper == "HEX" {
@@ -13638,6 +13647,18 @@ mod tests {
         // rejected.
         assert!(parse_expr("SHA2(s, 224)").is_err());
         assert!(parse_expr("SHA2(s, n)").is_err());
+    }
+
+    #[test]
+    fn uuid_lowers_to_engine_uuid4() {
+        // UUID() -> uuid4_str() (a no-argument generator).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("UUID()").unwrap() else {
+            panic!("expected UUID() to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "uuid4_str");
+        assert!(args.is_empty());
+        // It takes no arguments.
+        assert!(parse_expr("UUID(1)").is_err());
     }
 
     #[test]
