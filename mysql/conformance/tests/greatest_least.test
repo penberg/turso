@@ -1,10 +1,12 @@
 # GREATEST / LEAST conformance.
 #
 # MySQL's GREATEST(...) / LEAST(...) return the largest / smallest of their
-# arguments. The front-end maps them to the engine's multi-argument scalar
-# max() / min(), which compare the same way for homogeneous numeric or string
-# arguments and -- like MySQL -- return NULL if ANY argument is NULL (distinct
-# from the aggregate MAX()/MIN(), which skip NULLs).
+# arguments. The front-end lowers them to a balanced reduction of pairwise
+# CASE comparisons under COLLATE NOCASE, so a string comparison folds ASCII case
+# like MySQL's default collation (GREATEST('apple', 'Banana') is 'Banana', not
+# 'apple') while numbers still compare numerically. Like MySQL, the result is
+# NULL if ANY argument is NULL (distinct from the aggregate MAX()/MIN(), which
+# skip NULLs).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name and ORDER BY-deterministic queries.
@@ -26,6 +28,13 @@ query
 SELECT GREATEST('apple', 'banana', 'cherry'), LEAST('apple', 'banana', 'cherry')
 ----
 cherry	apple
+
+# The string comparison is case-insensitive (MySQL's default collation): 'Banana'
+# sorts after 'apple', so it is the greatest even though 'B' < 'a' by byte value.
+query
+SELECT GREATEST('apple', 'Banana'), LEAST('apple', 'Banana'), GREATEST('Zebra', 'apple', 'Mango')
+----
+Banana	apple	Zebra
 
 # Any NULL argument yields NULL (unlike the aggregate MAX/MIN, which skip NULLs).
 query

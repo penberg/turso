@@ -4216,6 +4216,15 @@ impl Parser {
             return self.make_set_call();
         }
 
+        // `GREATEST(...)` / `LEAST(...)` — the largest / smallest argument under a
+        // case-insensitive comparison (see `greatest_least_call`).
+        if upper == "GREATEST" {
+            return self.greatest_least_call(true);
+        }
+        if upper == "LEAST" {
+            return self.greatest_least_call(false);
+        }
+
         // `INET_NTOA(n)` renders a 32-bit number as a dotted-quad IPv4 address
         // (see `inet_ntoa_call`).
         if upper == "INET_NTOA" {
@@ -5054,6 +5063,63 @@ impl Parser {
                 Box::new(ast::Expr::Literal(ast::Literal::Null)),
             )],
             else_expr: Some(Box::new(joined)),
+        })
+    }
+
+    /// Parses `GREATEST(a, b, ...)` (`is_greatest` true) or `LEAST(a, b, ...)` (the
+    /// name and `(` already consumed) and lowers it to the largest / smallest
+    /// argument under a **case-insensitive** comparison, matching MySQL's default
+    /// collation. The engine's `max`/`min` compare strings case-sensitively, so
+    /// each pairwise comparison applies `COLLATE NOCASE` instead — which the engine
+    /// ignores for a numeric operand, so numbers still compare numerically.
+    ///
+    /// The result is a balanced reduction of `CASE WHEN a >= (b COLLATE NOCASE)
+    /// THEN a ELSE b END` (`<=` for `LEAST`), so the expression stays `O(n²)`
+    /// rather than the exponential blow-up of a left-linear fold. A guard returns
+    /// NULL when any argument is NULL, as in MySQL (and as the engine's `max`/`min`
+    /// did). At least two arguments are required.
+    fn greatest_least_call(&mut self, is_greatest: bool) -> Result<ast::Expr> {
+        let mut args = vec![self.expr()?];
+        while self.eat(&Token::Comma) {
+            args.push(self.expr()?);
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        if args.len() < 2 {
+            return Err(ParseError::Unsupported(
+                "GREATEST/LEAST requires at least two arguments".to_string(),
+            ));
+        }
+
+        // NULL in any argument makes the whole result NULL.
+        let null_guard = args
+            .iter()
+            .map(|a| ast::Expr::is_null(a.clone()))
+            .reduce(|acc, g| ast::Expr::binary(acc, ast::Operator::Or, g))
+            .expect("at least two arguments");
+
+        // Balanced pairwise reduction so the argument fan-out is quadratic, not
+        // exponential.
+        let mut level = args;
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut it = level.into_iter();
+            while let Some(a) = it.next() {
+                match it.next() {
+                    Some(b) => next.push(case_insensitive_extremum(a, b, is_greatest)),
+                    None => next.push(a),
+                }
+            }
+            level = next;
+        }
+        let extremum = level.into_iter().next().expect("non-empty");
+
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(null_guard),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(extremum)),
         })
     }
 
@@ -8297,6 +8363,26 @@ fn integer_arg(x: ast::Expr) -> ast::Expr {
     )
 }
 
+/// Builds the case-insensitive pairwise extremum `CASE WHEN a >= (b COLLATE
+/// NOCASE) THEN a ELSE b END` for `GREATEST` (`<=` for `LEAST`). Applying `COLLATE
+/// NOCASE` to the comparison folds ASCII case like MySQL's default collation for
+/// string operands, and is ignored for a numeric operand (so numbers still
+/// compare numerically). The arms return the original `a`/`b` values.
+fn case_insensitive_extremum(a: ast::Expr, b: ast::Expr, is_greatest: bool) -> ast::Expr {
+    let op = if is_greatest {
+        ast::Operator::GreaterEquals
+    } else {
+        ast::Operator::LessEquals
+    };
+    let b_nocase = ast::Expr::collate(b.clone(), ast::Name::from_string("NOCASE"));
+    let cmp = ast::Expr::binary(a.clone(), op, b_nocase);
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(cmp), Box::new(a))],
+        else_expr: Some(Box::new(b)),
+    }
+}
+
 /// Builds `substr(s, start, len)`.
 fn substr_fn(s: ast::Expr, start: ast::Expr, len: ast::Expr) -> ast::Expr {
     ast::Expr::FunctionCall {
@@ -9115,9 +9201,6 @@ fn is_supported_function(upper_name: &str) -> bool {
         // renamed on emit (see `engine_function_name`).
         | "IF"
         | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
-        // The scalar `GREATEST` / `LEAST` map to the engine's multi-argument
-        // `max` / `min`, which — like MySQL — return NULL if any argument is NULL.
-        | "GREATEST" | "LEAST"
         // The single-argument date/time extractors `DATE`/`TIME`/`TIMESTAMP` map
         // onto the engine's `date`/`time`/`datetime` (renamed below). They return
         // the date, time, or full datetime of the value, like MySQL.
@@ -9874,8 +9957,6 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "LCASE" => "lower",
         "UCASE" => "upper",
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
-        "GREATEST" => "max",
-        "LEAST" => "min",
         "CEILING" => "ceil",
         "POWER" => "pow",
         "DATE" => "date",
@@ -15485,8 +15566,6 @@ mod tests {
             ("UCASE('s')", "upper"),
             ("CHAR_LENGTH('s')", "length"),
             ("CHARACTER_LENGTH('s')", "length"),
-            ("GREATEST(1, 2, 3)", "max"),
-            ("LEAST(1, 2, 3)", "min"),
             ("DATE('2020-01-01 10:00')", "date"),
             ("TIME('2020-01-01 10:00')", "time"),
             ("TIMESTAMP('2020-01-01')", "datetime"),
@@ -15498,6 +15577,54 @@ mod tests {
             };
             assert_eq!(name.as_str().to_ascii_lowercase(), engine, "{input}");
         }
+    }
+
+    #[test]
+    fn greatest_least_lower_to_nocase_case_fold_with_null_guard() {
+        // GREATEST(a, b) -> CASE WHEN a IS NULL OR b IS NULL THEN NULL
+        //   ELSE CASE WHEN a >= (b COLLATE NOCASE) THEN a ELSE b END END.
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("GREATEST(a, b)").unwrap()
+        else {
+            panic!("expected GREATEST to lower to a CASE");
+        };
+        // The guard is `a IS NULL OR b IS NULL`.
+        assert_eq!(
+            *when_then_pairs[0].0,
+            ast::Expr::binary(
+                ast::Expr::is_null(col("a")),
+                ast::Operator::Or,
+                ast::Expr::is_null(col("b")),
+            )
+        );
+        assert_eq!(*when_then_pairs[0].1, ast::Expr::Literal(ast::Literal::Null));
+        // The ELSE is the case-insensitive pairwise comparison.
+        let else_branch = else_expr.unwrap();
+        let ast::Expr::Case { when_then_pairs, .. } = else_branch.as_ref() else {
+            panic!("expected the ELSE to be a comparison CASE");
+        };
+        let ast::Expr::Binary(_, ast::Operator::GreaterEquals, rhs) = when_then_pairs[0].0.as_ref()
+        else {
+            panic!("expected `a >= b COLLATE NOCASE`");
+        };
+        assert!(matches!(rhs.as_ref(), ast::Expr::Collate(_, n) if n.as_str() == "NOCASE"));
+
+        // LEAST uses `<=`, and at least two arguments are required.
+        let ast::Expr::Case { else_expr, .. } = parse_expr("LEAST(a, b)").unwrap() else {
+            panic!("expected LEAST to lower to a CASE");
+        };
+        let else_branch = else_expr.unwrap();
+        let ast::Expr::Case { when_then_pairs, .. } = else_branch.as_ref() else {
+            panic!("expected a comparison CASE");
+        };
+        assert!(matches!(
+            when_then_pairs[0].0.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::LessEquals, _)
+        ));
+        assert!(parse_expr("GREATEST(1)").is_err());
     }
 
     #[test]
