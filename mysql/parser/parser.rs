@@ -7123,17 +7123,39 @@ impl Parser {
     /// read only the time part. (MySQL's `TIME_FORMAT` returns NULL for a *date*
     /// specifier whereas this evaluates it — an invalid-usage edge documented in
     /// `mysql/COMPAT.md`.)
+    ///
+    /// The format need only be *constant at parse time*: a string literal, a run
+    /// of adjacent literals, or a `GET_FORMAT(...)` call (which folds to the
+    /// matching format string), so MySQL's `DATE_FORMAT(d, GET_FORMAT(DATE, 'EUR'))`
+    /// pairing works (see [`Self::constant_format_arg`]).
     fn format_call(&mut self, fn_name: &str) -> Result<ast::Expr> {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
-        let Some(Token::Str(fmt)) = self.peek() else {
-            return Err(self.unexpected(&format!("a string-literal {fn_name} format")));
-        };
-        let fmt = fmt.clone();
-        self.advance();
+        let fmt = self.constant_format_arg(fn_name)?;
         self.expect(&Token::RParen, "`)`")?;
+        match fmt {
+            Some(fmt) => date_format_expr(&fmt, target),
+            // A NULL format (e.g. `GET_FORMAT` with an unknown locale) makes the
+            // whole call NULL, as in MySQL.
+            None => Ok(ast::Expr::Literal(ast::Literal::Null)),
+        }
+    }
 
-        date_format_expr(&fmt, target)
+    /// Parses a `DATE_FORMAT`/`TIME_FORMAT`/`FROM_UNIXTIME` format argument, which
+    /// must be a string constant known at translation. Accepts a string literal, a
+    /// run of adjacent string literals, and a `GET_FORMAT(...)` call (both fold to
+    /// an [`ast::Literal::String`]). Returns the decoded format, or `None` if it
+    /// folds to NULL (a `GET_FORMAT` with an unknown locale), which makes the
+    /// caller's result NULL. A non-constant format (a column, an expression) is
+    /// rejected. The closing `)` is left to the caller.
+    fn constant_format_arg(&mut self, fn_name: &str) -> Result<Option<String>> {
+        match self.expr()? {
+            ast::Expr::Literal(ast::Literal::String(s)) => Ok(Some(unrequote(&s))),
+            ast::Expr::Literal(ast::Literal::Null) => Ok(None),
+            _ => Err(ParseError::Unsupported(format!(
+                "{fn_name} format must be a string literal"
+            ))),
+        }
     }
 
     /// Lowers a MySQL current date/time function (`NOW()`, `CURDATE()`, ...) to
@@ -7899,13 +7921,12 @@ impl Parser {
         };
         // FROM_UNIXTIME(n, fmt) == DATE_FORMAT(FROM_UNIXTIME(n), fmt).
         if self.eat(&Token::Comma) {
-            let Some(Token::Str(fmt)) = self.peek() else {
-                return Err(self.unexpected("a string-literal FROM_UNIXTIME format"));
-            };
-            let fmt = fmt.clone();
-            self.advance();
+            let fmt = self.constant_format_arg("FROM_UNIXTIME")?;
             self.expect(&Token::RParen, "`)`")?;
-            return date_format_expr(&fmt, datetime);
+            return match fmt {
+                Some(fmt) => date_format_expr(&fmt, datetime),
+                None => Ok(ast::Expr::Literal(ast::Literal::Null)),
+            };
         }
         self.expect(&Token::RParen, "`)`")?;
         Ok(datetime)
@@ -9580,6 +9601,18 @@ fn regexp_flag_prefix(match_type: Option<&str>) -> Result<String> {
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
 fn requote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Reverses [`requote`]: strips the surrounding single quotes and un-doubles any
+/// `''` back to `'`, recovering a string literal's decoded text. Used where a
+/// clause needs the *content* of a parse-time string-literal expression (one a
+/// fast path would otherwise read straight off a `Str` token).
+fn unrequote(literal: &str) -> String {
+    let inner = literal
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(literal);
+    inner.replace("''", "'")
 }
 
 /// Whether `word` is a MySQL charset introducer that can precede a string literal:
@@ -13873,6 +13906,33 @@ mod tests {
         ));
         // An unrecognized type keyword is rejected rather than mistranslated.
         assert!(parse_expr("GET_FORMAT(WIDGET, 'EUR')").is_err());
+    }
+
+    #[test]
+    fn date_format_accepts_a_get_format_argument() {
+        // `DATE_FORMAT(x, GET_FORMAT(...))` — the intended pairing — works because
+        // the format need only be a parse-time string constant: the folded
+        // GET_FORMAT literal lowers exactly like the inline format string.
+        assert_eq!(
+            parse_expr("DATE_FORMAT(d, GET_FORMAT(DATE, 'EUR'))").unwrap(),
+            parse_expr("DATE_FORMAT(d, '%d.%m.%Y')").unwrap()
+        );
+        assert_eq!(
+            parse_expr("TIME_FORMAT(d, GET_FORMAT(TIME, 'USA'))").unwrap(),
+            parse_expr("TIME_FORMAT(d, '%h:%i:%s %p')").unwrap()
+        );
+        // A run of adjacent string literals is also a valid (concatenated) format.
+        assert_eq!(
+            parse_expr("DATE_FORMAT(d, '%Y' '-' '%m')").unwrap(),
+            parse_expr("DATE_FORMAT(d, '%Y-%m')").unwrap()
+        );
+        // A GET_FORMAT that resolves to NULL makes the whole call a NULL literal.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, GET_FORMAT(DATE, 'XYZ'))").unwrap(),
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        // A non-constant format (a column) is still rejected.
+        assert!(parse_expr("DATE_FORMAT(d, f)").is_err());
     }
 
     #[test]

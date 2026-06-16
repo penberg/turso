@@ -46,3 +46,31 @@ query
 SELECT GET_FORMAT(DATE, 'XYZ') IS NULL, GET_FORMAT(TIME, '') IS NULL
 ----
 1	1
+
+# GET_FORMAT pairs with DATE_FORMAT, its intended use: the format string it
+# resolves to is applied to the value (USA date is month-first, INTERNAL is the
+# compact form).
+query
+SELECT DATE_FORMAT('2026-06-15', GET_FORMAT(DATE, 'EUR')), DATE_FORMAT('2026-06-15', GET_FORMAT(DATE, 'USA')), DATE_FORMAT('2026-06-15', GET_FORMAT(DATE, 'INTERNAL'))
+----
+15.06.2026	06.15.2026	20260615
+
+# It pairs with TIME_FORMAT (USA is the 12-hour AM/PM clock) and the DATETIME type
+# with a datetime value.
+query
+SELECT TIME_FORMAT('14:30:05', GET_FORMAT(TIME, 'USA')), DATE_FORMAT('2026-06-15 14:30:00', GET_FORMAT(DATETIME, 'ISO'))
+----
+02:30:05 PM	2026-06-15 14:30:00
+
+# And with the two-argument FROM_UNIXTIME, whose format follows the same rule.
+query
+SELECT FROM_UNIXTIME(1781481600, GET_FORMAT(DATETIME, 'JIS'))
+----
+2026-06-15 00:00:00
+
+# A GET_FORMAT that resolves to NULL (unknown locale) makes the whole format NULL,
+# as does a NULL value -- the same as DATE_FORMAT(x, NULL).
+query
+SELECT DATE_FORMAT('2026-06-15', GET_FORMAT(DATE, 'BOGUS')), DATE_FORMAT(NULL, GET_FORMAT(DATE, 'EUR'))
+----
+NULL	NULL
