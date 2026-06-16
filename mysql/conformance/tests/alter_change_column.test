@@ -1,0 +1,60 @@
+# ALTER TABLE ... CHANGE COLUMN (the rename form) conformance.
+#
+# MySQL's CHANGE COLUMN old new <definition> renames a column (and would retype
+# it). The engine can rename a column but not change its type in place, so the
+# front-end lowers a CHANGE that renames (old != new) to the engine's
+# RENAME COLUMN old TO new, parsing and discarding the trailing column
+# definition. Since the engine's columns are affinity-typed, the redeclared type
+# is advisory. A same-name CHANGE and the MODIFY form (a pure in-place type
+# change) are rejected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS chgcol_demo (id INT PRIMARY KEY, old_name VARCHAR(20))
+
+statement ok
+INSERT INTO chgcol_demo (id, old_name) VALUES (1, 'alpha'), (2, 'beta')
+
+# CHANGE COLUMN renames the column and preserves the existing rows.
+statement ok
+ALTER TABLE chgcol_demo CHANGE COLUMN old_name new_name VARCHAR(50) NOT NULL DEFAULT ''
+
+query
+SELECT id, new_name FROM chgcol_demo ORDER BY id
+----
+1	alpha
+2	beta
+
+# The renamed column accepts new rows under its new name.
+statement ok
+INSERT INTO chgcol_demo (id, new_name) VALUES (3, 'gamma')
+
+query
+SELECT new_name FROM chgcol_demo WHERE id = 3
+----
+gamma
+
+# The CHANGE keyword works without the optional COLUMN keyword too.
+statement ok
+ALTER TABLE chgcol_demo CHANGE new_name label VARCHAR(50)
+
+query
+SELECT id, label FROM chgcol_demo ORDER BY id
+----
+1	alpha
+2	beta
+3	gamma
+
+# The old column name no longer resolves after the rename.
+statement error
+SELECT old_name FROM chgcol_demo
+
+# A same-name CHANGE is a pure type change and is rejected.
+statement error
+ALTER TABLE chgcol_demo CHANGE COLUMN id id BIGINT
+
+# MODIFY (a pure in-place type change) is rejected.
+statement error
+ALTER TABLE chgcol_demo MODIFY COLUMN id BIGINT

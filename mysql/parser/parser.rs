@@ -387,9 +387,13 @@ impl Parser {
     ///   - `DROP PRIMARY KEY` → `DROP INDEX <table>_primary`, the inverse of the
     ///     `ADD PRIMARY KEY` emulation (see [`Self::alter_drop`]).
     ///
+    ///   - `CHANGE [COLUMN] old new <def>` with `old` ≠ `new` → `RENAME COLUMN`
+    ///     (the rename; the redeclared type is advisory — see [`Self::alter_change`]).
+    ///
     /// Everything else — `ADD FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
-    /// `DROP {FOREIGN KEY|CONSTRAINT}`, the type-changing `CHANGE`/`MODIFY`
-    /// operations, and `RENAME INDEX` — is rejected as unsupported. The
+    /// `DROP {FOREIGN KEY|CONSTRAINT}`, `MODIFY` and same-name `CHANGE` (an
+    /// in-place column type change), and `RENAME INDEX` — is rejected as
+    /// unsupported. The
     /// comma-separated multi-operation form has no single-statement engine
     /// equivalent and is rejected here, but [`Self::parse_statement_list`] expands
     /// it into one statement per operation.
@@ -416,9 +420,26 @@ impl Parser {
         if self.eat_keyword("RENAME") {
             return self.alter_rename(name);
         }
+        // `CHANGE [COLUMN] old new <def>` renames `old` to `new` (and would
+        // retype it); the engine can rename but not retype in place (see
+        // `alter_change`).
+        if self.eat_keyword("CHANGE") {
+            return self.alter_change(name);
+        }
+        // `MODIFY [COLUMN] col <def>` only retypes a column — no engine
+        // equivalent.
+        if self.eat_keyword("MODIFY") {
+            self.eat_keyword("COLUMN");
+            let (def, _) = self.column_def()?;
+            return Err(ParseError::Unsupported(format!(
+                "ALTER TABLE MODIFY COLUMN `{}` is not supported: the engine \
+                 cannot change a column's type in place",
+                def.col_name.as_str()
+            )));
+        }
         if !self.eat_keyword("ADD") {
             return Err(ParseError::Unsupported(
-                "only ALTER TABLE ... ADD / DROP COLUMN / RENAME is supported yet".to_string(),
+                "only ALTER TABLE ... ADD / DROP / RENAME / CHANGE is supported yet".to_string(),
             ));
         }
 
@@ -654,6 +675,34 @@ impl Parser {
         Ok(ast::Stmt::AlterTable(ast::AlterTable {
             name,
             body: ast::AlterTableBody::RenameTo(new_table.name),
+        }))
+    }
+
+    /// Parses `ALTER TABLE ... CHANGE [COLUMN] old new <definition>` and lowers a
+    /// *rename* (`old` ≠ `new`) to the engine's `RENAME COLUMN old TO new`. The
+    /// trailing column definition (the new name's type and constraints) is parsed
+    /// to consume it but discarded: the engine's columns are affinity-typed, so
+    /// the redeclared type is advisory — a same-affinity retype is a no-op, and a
+    /// fundamental type change is not applied (a documented limitation). A
+    /// same-name `CHANGE` is purely a type change with no rename, so it is
+    /// rejected like `MODIFY`.
+    fn alter_change(&mut self, name: ast::QualifiedName) -> Result<ast::Stmt> {
+        self.eat_keyword("COLUMN");
+        let old = self.name()?;
+        // `new <type> <constraints>` is exactly a column definition.
+        let (def, _) = self.column_def()?;
+        let new = def.col_name;
+        if old.as_str().eq_ignore_ascii_case(new.as_str()) {
+            return Err(ParseError::Unsupported(format!(
+                "ALTER TABLE CHANGE COLUMN `{}` to the same name is a column type \
+                 change, which is not supported: the engine cannot change a \
+                 column's type in place",
+                old.as_str()
+            )));
+        }
+        Ok(ast::Stmt::AlterTable(ast::AlterTable {
+            name,
+            body: ast::AlterTableBody::RenameColumn { old, new },
         }))
     }
 
@@ -10304,13 +10353,38 @@ mod tests {
     }
 
     #[test]
+    fn alter_table_change_column_renames() {
+        // CHANGE [COLUMN] old new <def> with old != new -> RENAME COLUMN; the
+        // trailing definition is consumed and discarded.
+        for sql in [
+            "ALTER TABLE t CHANGE COLUMN a b INT",
+            "ALTER TABLE t CHANGE a b VARCHAR(50) NOT NULL DEFAULT ''",
+        ] {
+            let ast::Stmt::AlterTable(alter) = parse(sql).unwrap() else {
+                panic!("expected `{sql}` to parse as ALTER TABLE");
+            };
+            let ast::AlterTableBody::RenameColumn { old, new } = &alter.body else {
+                panic!("expected RENAME COLUMN for `{sql}`");
+            };
+            assert_eq!(old.as_str(), "a", "{sql}");
+            assert_eq!(new.as_str(), "b", "{sql}");
+        }
+
+        // A same-name CHANGE is a pure type change and is rejected.
+        assert!(matches!(
+            parse("ALTER TABLE t CHANGE COLUMN a a BIGINT").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+    }
+
+    #[test]
     fn alter_table_unsupported_variants() {
-        // Foreign-key and other constraint adds and drops, the type-changing
-        // CHANGE/MODIFY operations, RENAME INDEX, and the multi-operation comma
-        // form are all rejected (a real mysqld accepts them, but the engine has
-        // no in-place equivalent). `ADD`/`DROP PRIMARY KEY` are the exceptions --
-        // they lower to creating / dropping a UNIQUE index (see
-        // `alter_table_add_primary_key_lowers_to_unique_index` and
+        // Foreign-key and other constraint adds and drops, the in-place type
+        // change `MODIFY` (and same-name `CHANGE`), `RENAME INDEX`, and the
+        // multi-operation comma form are all rejected (a real mysqld accepts
+        // them, but the engine has no in-place equivalent). `ADD`/`DROP PRIMARY
+        // KEY` are the exceptions -- they lower to creating / dropping a UNIQUE
+        // index (see `alter_table_add_primary_key_lowers_to_unique_index` and
         // `alter_table_drop_primary_key_drops_the_emulated_index`).
         for sql in [
             "ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (c) REFERENCES u (id)",
@@ -10318,7 +10392,6 @@ mod tests {
             "ALTER TABLE t ADD COLUMN c INT AUTO_INCREMENT",
             "ALTER TABLE t ADD a INT, ADD b INT",
             "ALTER TABLE t DROP FOREIGN KEY fk",
-            "ALTER TABLE t CHANGE COLUMN a b INT",
             "ALTER TABLE t MODIFY COLUMN a BIGINT",
             "ALTER TABLE t RENAME INDEX a TO b",
         ] {
