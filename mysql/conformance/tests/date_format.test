@@ -6,13 +6,15 @@
 # number), %U (Sunday-first week), %v (ISO week -> %V), %x (ISO week-year ->
 # %G), %T (-> %H:%M:%S), %% --
 # and expands the name specifiers (%M month name, %b abbreviated month, %W
-# weekday name, %a abbreviated weekday) to CASE lookups, and the no-leading-zero
-# numeric specifiers (%e day, %c month, %k hour) to integer casts, the 12-hour
-# clock (%l no-pad, %h/%I padded, %r = hh:mm:ss AM/PM), meridiem (%p), the
-# two-digit year (%y), and the day-with-ordinal-suffix %D to CASE / strftime
-# expressions, concatenating the pieces. Literal characters pass through. The
-# format must be a string literal; specifiers without any of these forms (the
-# week modes %u/%V/%X and microseconds %f) are rejected. See mysql/COMPAT.md.
+# weekday name, %a abbreviated weekday) to CASE lookups, the no-leading-zero
+# numeric specifiers (%e day, %c month, %k hour) to integer casts, the week
+# numbers %u (Monday-first mode 1) and %V (Sunday-first mode 2) to the WEEK()
+# mode lowering zero-padded to two digits, the 12-hour clock (%l no-pad, %h/%I
+# padded, %r = hh:mm:ss AM/PM), meridiem (%p), the two-digit year (%y), and the
+# day-with-ordinal-suffix %D to CASE / strftime expressions, concatenating the
+# pieces. Literal characters pass through. The format must be a string literal;
+# specifiers without any of these forms (%X and microseconds %f) are rejected.
+# See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -96,6 +98,33 @@ query
 SELECT DATE_FORMAT('2021-01-01', '%x'), DATE_FORMAT('2023-01-01', '%x'), DATE_FORMAT('2026-06-15', '%x-W%v')
 ----
 2020	2022	2026-W25
+
+# %u is the Monday-first week, mode 1 (00..53) -- like WEEK(d, 1) -- zero-padded
+# to two digits, and %V is the Sunday-first week, mode 2 (01..53), like
+# WEEK(d, 2). Both differ from the %U/%v already covered above.
+query
+SELECT DATE_FORMAT('2020-06-15', '%u'), DATE_FORMAT('2020-06-15', '%V')
+----
+25	24
+
+# Their year-boundary behavior: %u is 00 for a leading partial week (2021-01-01,
+# 2023-01-01) and 53 at the end of 2020; %V renumbers a leading partial week as
+# the previous year's last (52).
+query
+SELECT DATE_FORMAT('2021-01-01', '%u'), DATE_FORMAT('2023-01-01', '%u'), DATE_FORMAT('2020-12-31', '%u')
+----
+00	00	53
+
+query
+SELECT DATE_FORMAT('2021-01-01', '%V'), DATE_FORMAT('2020-01-01', '%V'), DATE_FORMAT('2023-01-01', '%V')
+----
+52	52	01
+
+# All four week specifiers compose in one format (Sunday/Monday x 0-53/1-53).
+query
+SELECT DATE_FORMAT('2020-06-15', '%U/%u/%V/%v'), DATE_FORMAT(NULL, '%u')
+----
+24/25/24/25	NULL
 
 # %M is the full month name, %W the full weekday name (2020-03-15 is a Sunday in
 # March). These have no strftime form and expand to CASE lookups.

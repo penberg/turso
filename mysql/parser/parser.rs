@@ -6551,26 +6551,9 @@ impl Parser {
         self.expect(&Token::RParen, "`)`")?;
 
         // Mode 1: ISO week (`%V`), but 0 in a previous-year partial week and 53
-        // in a next-year partial week (see the doc comment).
+        // in a next-year partial week (see [`week_mode1_expr`]).
         if mode == 1 {
-            let iso_year_below = ast::Expr::binary(
-                strftime_int("%G", arg.clone()),
-                ast::Operator::Less,
-                strftime_int("%Y", arg.clone()),
-            );
-            let iso_year_above = ast::Expr::binary(
-                strftime_int("%G", arg.clone()),
-                ast::Operator::Greater,
-                strftime_int("%Y", arg.clone()),
-            );
-            return Ok(ast::Expr::Case {
-                base: None,
-                when_then_pairs: vec![
-                    (Box::new(iso_year_below), numeric_expr("0")),
-                    (Box::new(iso_year_above), numeric_expr("53")),
-                ],
-                else_expr: Some(Box::new(strftime_int("%V", arg))),
-            });
+            return Ok(week_mode1_expr(arg));
         }
 
         // Modes 2 and 7 are the 1–53 ("week year") siblings of modes 0 (`%U`,
@@ -8344,6 +8327,52 @@ fn week_push_zero(arg: ast::Expr, code: &str) -> ast::Expr {
     }
 }
 
+/// Builds the `WEEK(d, 1)` lowering: the ISO week (`%V`), renumbered the way
+/// MySQL's mode 1 does at the year boundaries — `0` for a date whose ISO week
+/// belongs to the previous year (`%G` < `%Y`) and `53` for one whose ISO week
+/// belongs to the next (`%G` > `%Y`). Shared by `WEEK(d, 1)` and `DATE_FORMAT`'s
+/// `%u`.
+fn week_mode1_expr(arg: ast::Expr) -> ast::Expr {
+    let iso_year_below = ast::Expr::binary(
+        strftime_int("%G", arg.clone()),
+        ast::Operator::Less,
+        strftime_int("%Y", arg.clone()),
+    );
+    let iso_year_above = ast::Expr::binary(
+        strftime_int("%G", arg.clone()),
+        ast::Operator::Greater,
+        strftime_int("%Y", arg.clone()),
+    );
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (Box::new(iso_year_below), numeric_expr("0")),
+            (Box::new(iso_year_above), numeric_expr("53")),
+        ],
+        else_expr: Some(Box::new(strftime_int("%V", arg))),
+    }
+}
+
+/// Zero-pads an integer expression to two digits — the form MySQL's
+/// `DATE_FORMAT` week specifiers render (`00`..`53`). Built as
+/// `substr('0' || n, -2, 2)`, which keeps the last two characters of the
+/// left-padded value and propagates NULL (`'0' || n` is NULL when `n` is, so the
+/// `substr` is too).
+fn pad2(n: ast::Expr) -> ast::Expr {
+    call_fn(
+        "substr",
+        vec![
+            ast::Expr::binary(
+                ast::Expr::Literal(ast::Literal::String(requote("0"))),
+                ast::Operator::Concat,
+                n,
+            ),
+            *numeric_expr("-2"),
+            *numeric_expr("2"),
+        ],
+    )
+}
+
 /// Builds `lower(',' || x || ',')` — the value `x` wrapped in commas and
 /// lower-cased, the building block of the [`Parser::find_in_set_call`] lowering.
 fn comma_wrapped_lower(x: ast::Expr) -> ast::Expr {
@@ -9405,9 +9434,11 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
 /// 2nd…), and the two-digit year `%y` are each a `strftime`/`CASE` expression.
 /// The pieces are concatenated with `||`. A NULL `target` makes every piece NULL,
 /// so the whole result is NULL, as in MySQL. The ISO week-year `%x` maps to
-/// strftime's `%G` (pairing with `%v`→`%V`); the week-of-year modes with no
-/// matching strftime form (`%u`, `%V`, `%X`) and microseconds (`%f`, no
-/// sub-second precision) are rejected rather than silently mistranslated.
+/// strftime's `%G` (pairing with `%v`→`%V`). The week numbers with no single
+/// strftime code — `%u` (mode 1) and `%V` (mode 2) — reuse the `WEEK()` mode
+/// lowering, zero-padded to two digits. Only `%X` (the year of the Sunday-first
+/// `%V` week) and microseconds (`%f`, no sub-second precision) are rejected
+/// rather than silently mistranslated.
 fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
     // A piece is a strftime format run, a name lookup, or an integer extraction
     // (a strftime code cast to an integer, which renders without leading zeros).
@@ -9419,6 +9450,9 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Hour12 { padded: bool },
         OrdinalDay,
         YearTwoDigit,
+        // A `WEEK(d, mode)` number zero-padded to two digits (`%u` mode 1,
+        // `%V` mode 2), for the week schemes with no single strftime code.
+        Week(i64),
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut run = String::new();
@@ -9448,10 +9482,20 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
             // Week numbers: MySQL `%U` (Sunday-first, mode 0) is strftime `%U`,
             // and MySQL `%v` (Monday-first ISO, mode 3) is strftime `%V` — the
             // same mode-to-format mapping the `WEEK()` function uses (and which
-            // its conformance test verifies). MySQL `%u`/`%V` (modes 1/2) have no
-            // matching strftime format and stay rejected.
+            // its conformance test verifies). MySQL `%u` (Monday-first, mode 1)
+            // and `%V` (Sunday-first, mode 2) have no single strftime code, so
+            // they reuse the `WEEK()` mode-1/mode-2 lowering, zero-padded to two
+            // digits like MySQL.
             Some('U') => run.push_str("%U"),
             Some('v') => run.push_str("%V"),
+            Some('u') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Week(1));
+            }
+            Some('V') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Week(2));
+            }
             // `%x` is the year of the `%v` (ISO 8601, Monday-first) week — so a
             // late-December date in week 1 of the next year, or an early-January
             // date in week 52/53 of the previous one, carries the ISO year. That
@@ -9549,6 +9593,11 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
             Piece::Hour12 { padded } => hour12_expr(target.clone(), padded),
             Piece::OrdinalDay => ordinal_day_expr(target.clone()),
             Piece::YearTwoDigit => year_two_digit_expr(target.clone()),
+            // `%u` (mode 1) reuses `WEEK(d, 1)`; `%V` (mode 2) reuses the
+            // mode-2 `week_push_zero('%U')` lowering. Both are zero-padded to
+            // two digits, as MySQL renders them.
+            Piece::Week(1) => pad2(week_mode1_expr(target.clone())),
+            Piece::Week(_) => pad2(week_push_zero(target.clone(), "%U")),
         })
         .collect();
     // An empty format renders strftime('', target) — the empty string for a
@@ -12759,13 +12808,31 @@ mod tests {
             parse_expr("DATE_FORMAT(d, '%D')").unwrap(),
             ast::Expr::Binary(_, ast::Operator::Concat, _)
         ));
+        // `%u` (mode 1) and `%V` (mode 2) reuse the `WEEK()` mode lowering,
+        // zero-padded to two digits via `substr('0' || week, -2, 2)`. `%u` is
+        // the mode-1 ISO-with-boundary CASE; `%V` the mode-2 `week_push_zero`,
+        // also a CASE. Each piece is wrapped in the padding substr().
+        for (fmt, mode) in [("%u", 1), ("%V", 2)] {
+            let ast::Expr::FunctionCall { name, args, .. } =
+                parse_expr(&format!("DATE_FORMAT(d, '{fmt}')")).unwrap()
+            else {
+                panic!("expected {fmt} to lower to a substr() pad");
+            };
+            assert_eq!(name.as_str(), "substr", "wrong pad for {fmt}");
+            // substr('0' || <week CASE>, -2, 2): the first arg is the `||`.
+            let ast::Expr::Binary(_, ast::Operator::Concat, week) = args[0].as_ref() else {
+                panic!("expected the padded value to be a concat for {fmt}");
+            };
+            assert!(
+                matches!(week.as_ref(), ast::Expr::Case { .. }),
+                "mode {mode} week should be a CASE for {fmt}"
+            );
+        }
         // Specifiers still without a lowering are rejected (microseconds `%f`,
-        // and the week-of-year modes `%u`/`%V`/`%X` — note `%X`, the year of the
-        // Sunday-first `%V` week, has no strftime form, unlike the supported `%x`).
+        // and `%X`, the year of the Sunday-first `%V` week, which has no strftime
+        // form — unlike the now-supported `%x`).
         for fmt in [
             "DATE_FORMAT(d, '%f')",
-            "DATE_FORMAT(d, '%u')",
-            "DATE_FORMAT(d, '%V')",
             "DATE_FORMAT(d, '%X')",
         ] {
             assert!(matches!(
