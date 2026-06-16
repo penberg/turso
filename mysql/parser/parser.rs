@@ -869,7 +869,22 @@ impl Parser {
     fn column_def(&mut self) -> Result<(ast::ColumnDefinition, bool)> {
         let col_name = self.name()?;
         let col_type = self.column_type()?;
-        let (mut constraints, auto_increment) = self.column_constraints()?;
+        let (mut constraints, auto_increment, collation) = self.column_constraints()?;
+
+        // MySQL's default collation (`utf8mb4_general_ci`) compares text
+        // case-insensitively, while the engine — like SQLite's `BINARY` default —
+        // compares case-sensitively. For a character column with no explicit
+        // case-sensitive (`_bin`/`_cs`) collation, declare `COLLATE NOCASE` so
+        // equality, `ORDER BY`, `UNIQUE`, and index lookups fold ASCII case as
+        // MySQL does. (NOCASE folds only ASCII A–Z, not the full Unicode set MySQL
+        // does, but that covers the slugs, option names, and emails WordPress
+        // compares.) BLOB and `BINARY`/`VARBINARY` columns stay case-sensitive.
+        let case_sensitive = collation.as_deref().is_some_and(is_case_sensitive_collation);
+        if col_type.as_ref().is_some_and(is_character_type) && !case_sensitive {
+            constraints.push(named(ast::ColumnConstraint::Collate {
+                collation_name: ast::Name::from_string("NOCASE"),
+            }));
+        }
 
         // MySQL (in its default non-strict `sql_mode`, which WordPress's test
         // harness uses) supplies an implicit type default for a `NOT NULL` column
@@ -986,11 +1001,15 @@ impl Parser {
         }
     }
 
-    /// Parses zero or more inline column constraints. Returns the constraints
-    /// and whether `AUTO_INCREMENT` was declared on the column.
-    fn column_constraints(&mut self) -> Result<(Vec<ast::NamedColumnConstraint>, bool)> {
+    /// Parses zero or more inline column constraints. Returns the constraints,
+    /// whether `AUTO_INCREMENT` was declared, and any explicit `COLLATE` name (so
+    /// the caller can decide the column's case sensitivity).
+    fn column_constraints(
+        &mut self,
+    ) -> Result<(Vec<ast::NamedColumnConstraint>, bool, Option<String>)> {
         let mut out: Vec<ast::NamedColumnConstraint> = Vec::new();
         let mut auto_increment = false;
+        let mut collation: Option<String> = None;
         let mut primary_key_at = None;
 
         loop {
@@ -1024,7 +1043,7 @@ impl Parser {
             } else if self.eat_keyword("COMMENT") {
                 self.expect_string()?;
             } else if self.eat_keyword("COLLATE") {
-                let _ = self.name()?;
+                collation = Some(self.name()?.as_str().to_string());
             } else if self.eat_keyword("CHARACTER") {
                 self.expect_keyword("SET")?;
                 let _ = self.name()?;
@@ -1076,7 +1095,7 @@ impl Parser {
                 }
             }
         }
-        Ok((out, auto_increment))
+        Ok((out, auto_increment, collation))
     }
 
     /// Parses a column `DEFAULT` value into a literal expression.
@@ -3434,13 +3453,13 @@ impl Parser {
     /// and/or followed by a `COLLATE collation_name` postfix.
     ///
     /// MySQL's `COLLATE` overrides the collation used for comparison and sorting,
-    /// and the `BINARY expr` prefix forces a binary (case- and accent-sensitive)
-    /// comparison. The engine is effectively single-collation (binary), which is
-    /// already what `BINARY` asks for, so the operator is dropped and the value
-    /// returned unchanged; `COLLATE` is likewise parsed and discarded. Honoring a
-    /// case-insensitive collation would need engine support — an intentional
-    /// divergence (see `mysql/COMPAT.md`). Both bind tighter than the arithmetic
-    /// operators, so they are applied here at the primary tier.
+    /// and the `BINARY expr` prefix forces a binary (case-sensitive) comparison.
+    /// Character columns default to the engine's case-insensitive `NOCASE`
+    /// collation (matching MySQL's `utf8mb4_general_ci`; see `column_def`), so
+    /// these override it: `BINARY expr` becomes `expr COLLATE BINARY`, and a
+    /// `COLLATE <name>` postfix maps to `BINARY` for a `_bin`/`_cs` collation or
+    /// `NOCASE` otherwise. Both bind tighter than the arithmetic operators, so
+    /// they are applied here at the primary tier.
     fn collate_expr(&mut self) -> Result<ast::Expr> {
         // `!expr` — logical NOT, MySQL's high-precedence prefix form (distinct
         // from the low-precedence `NOT` keyword). It maps to the same engine
@@ -3463,10 +3482,13 @@ impl Parser {
             let inner = self.collate_expr()?;
             return Ok(ast::Expr::unary(ast::UnaryOperator::BitwiseNot, inner));
         }
-        // `BINARY expr` — drop the operator; the engine compares binary already.
+        // `BINARY expr` — force a case-sensitive comparison with `COLLATE BINARY`
+        // (character columns are `NOCASE` by default, so the operator can no
+        // longer be a no-op).
         if self.is_keyword("BINARY") {
             self.advance();
-            return self.collate_expr();
+            let inner = self.collate_expr()?;
+            return Ok(ast::Expr::collate(inner, ast::Name::from_string("BINARY")));
         }
         // Unary minus / plus on an expression (`-a`, `-ABS(x)`, `-(a + 1)`, `+a`).
         // A signed *numeric literal* (`-5`) is folded into the literal by
@@ -3500,9 +3522,16 @@ impl Parser {
                 let path = self.primary_expr()?;
                 expr = ast::Expr::binary(expr, ast::Operator::ArrowRightShift, path);
             } else if self.eat_keyword("COLLATE") {
-                // The collation name is an identifier (e.g. `utf8mb4_general_ci`);
-                // consume and drop it.
-                self.name()?;
+                // Map the MySQL collation (e.g. `utf8mb4_general_ci`) onto the
+                // engine collation that compares the same way: `BINARY` for a
+                // case-sensitive `_bin`/`_cs` collation, else `NOCASE`.
+                let name = self.name()?;
+                let engine = if is_case_sensitive_collation(name.as_str()) {
+                    "BINARY"
+                } else {
+                    "NOCASE"
+                };
+                expr = ast::Expr::collate(expr, ast::Name::from_string(engine));
             } else {
                 break;
             }
@@ -6958,6 +6987,31 @@ fn named(constraint: ast::ColumnConstraint) -> ast::NamedColumnConstraint {
     }
 }
 
+/// Whether a column's declared type is a non-binary character type, for which
+/// MySQL's default collation is case-insensitive. The `BLOB` and
+/// `BINARY`/`VARBINARY` byte-string types are excluded — they compare by byte.
+fn is_character_type(col_type: &ast::Type) -> bool {
+    let base = col_type
+        .name
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        base.as_str(),
+        "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
+    )
+}
+
+/// Whether an explicit MySQL `COLLATE <name>` selects a case-sensitive
+/// collation — a `_bin` (binary) or `_cs` (case-sensitive) collation, or the
+/// `binary` collation. Any other collation (notably the `_ci` default) is
+/// case-insensitive.
+fn is_case_sensitive_collation(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "binary" || name.ends_with("_bin") || name.ends_with("_cs")
+}
+
 fn numeric_expr(value: &str) -> Box<ast::Expr> {
     Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())))
 }
@@ -8600,6 +8654,46 @@ mod tests {
             default_of("e"),
             Some(ast::Expr::Literal(ast::Literal::Numeric("7".to_string())))
         );
+    }
+
+    #[test]
+    fn character_columns_default_to_nocase_collation() {
+        let stmt = parse(
+            "CREATE TABLE t (\
+                id INT PRIMARY KEY, \
+                name VARCHAR(50), \
+                body TEXT, \
+                n INT, \
+                bn VARCHAR(50) COLLATE utf8mb4_bin, \
+                ci VARCHAR(50) COLLATE utf8mb4_general_ci, \
+                blob_col BLOB, \
+                bin_col VARBINARY(16))",
+        )
+        .expect("should parse");
+        let ast::Stmt::CreateTable { body, .. } = stmt else {
+            panic!("expected CreateTable");
+        };
+        let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+            panic!("expected columns");
+        };
+        let collation_of = |name: &str| -> Option<String> {
+            let col = columns.iter().find(|c| c.col_name.as_str() == name).unwrap();
+            col.constraints.iter().find_map(|c| match &c.constraint {
+                ast::ColumnConstraint::Collate { collation_name } => {
+                    Some(collation_name.as_str().to_string())
+                }
+                _ => None,
+            })
+        };
+        // Character columns (incl. an explicit `_ci`) get NOCASE; numeric, BLOB,
+        // and binary columns get none; an explicit `_bin` stays case-sensitive.
+        assert_eq!(collation_of("name").as_deref(), Some("NOCASE"));
+        assert_eq!(collation_of("body").as_deref(), Some("NOCASE"));
+        assert_eq!(collation_of("ci").as_deref(), Some("NOCASE"));
+        assert_eq!(collation_of("n"), None);
+        assert_eq!(collation_of("blob_col"), None);
+        assert_eq!(collation_of("bin_col"), None);
+        assert_eq!(collation_of("bn"), None);
     }
 
     #[test]
@@ -12904,33 +12998,48 @@ mod tests {
     }
 
     #[test]
-    fn collate_clause_is_parsed_and_dropped() {
-        // `expr COLLATE name` parses to just `expr` (collation is not honored).
-        assert_eq!(parse_expr("a COLLATE utf8mb4_bin").unwrap(), col("a"));
-        // COLLATE binds tighter than arithmetic: `a + b COLLATE x` is `a + b`.
+    fn collate_clause_maps_to_engine_collation() {
+        let collated = |name: &str, collation: &str| {
+            ast::Expr::collate(col(name), ast::Name::from_string(collation))
+        };
+        // `expr COLLATE name` maps to the engine collation comparing the same way.
+        assert_eq!(
+            parse_expr("a COLLATE utf8mb4_bin").unwrap(),
+            collated("a", "BINARY")
+        );
+        // COLLATE binds tighter than arithmetic: `a + b COLLATE x` is
+        // `a + (b COLLATE x)`.
         assert_eq!(
             parse_expr("a + b COLLATE utf8mb4_general_ci").unwrap(),
-            ast::Expr::binary(col("a"), ast::Operator::Add, col("b"))
+            ast::Expr::binary(col("a"), ast::Operator::Add, collated("b", "NOCASE"))
         );
     }
 
     #[test]
-    fn binary_operator_is_parsed_and_dropped() {
-        // `BINARY expr` parses to just `expr` (the engine is binary already), on
-        // either operand, and composes with a trailing COLLATE.
-        assert_eq!(parse_expr("BINARY a").unwrap(), col("a"));
-        // Composes with a trailing COLLATE (both dropped).
-        assert_eq!(
-            parse_expr("BINARY a COLLATE utf8mb4_bin").unwrap(),
-            col("a")
-        );
+    fn binary_and_collate_map_to_engine_collations() {
+        let collated = |name: &str, collation: &str| {
+            ast::Expr::collate(col(name), ast::Name::from_string(collation))
+        };
+        // `BINARY expr` forces a case-sensitive comparison via `COLLATE BINARY`
+        // (character columns are NOCASE by default).
+        assert_eq!(parse_expr("BINARY a").unwrap(), collated("a", "BINARY"));
         assert_eq!(
             parse_expr("BINARY a = b").unwrap(),
-            ast::Expr::binary(col("a"), ast::Operator::Equals, col("b"))
+            ast::Expr::binary(collated("a", "BINARY"), ast::Operator::Equals, col("b"))
         );
         assert_eq!(
             parse_expr("a = BINARY b").unwrap(),
-            ast::Expr::binary(col("a"), ast::Operator::Equals, col("b"))
+            ast::Expr::binary(col("a"), ast::Operator::Equals, collated("b", "BINARY"))
+        );
+        // A `COLLATE` postfix maps onto the engine collation that compares the
+        // same way: `_bin`/`_cs` -> BINARY, any `_ci` (or other) -> NOCASE.
+        assert_eq!(
+            parse_expr("a COLLATE utf8mb4_bin").unwrap(),
+            collated("a", "BINARY")
+        );
+        assert_eq!(
+            parse_expr("a COLLATE utf8mb4_general_ci").unwrap(),
+            collated("a", "NOCASE")
         );
     }
 

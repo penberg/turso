@@ -1,0 +1,80 @@
+# Character columns compare case-insensitively, like MySQL's default collation.
+#
+# MySQL's default collation (utf8mb4_general_ci) folds case in comparison,
+# ordering, DISTINCT, LIKE, and UNIQUE indexes, while the engine — like SQLite's
+# BINARY default — is case-sensitive. WordPress relies on the case-insensitive
+# default everywhere: matching slugs, option names, and user emails regardless of
+# case. The front-end now declares character columns COLLATE NOCASE so they fold
+# ASCII case as MySQL does, while a column declared COLLATE utf8mb4_bin (or an
+# expression-level COLLATE / BINARY) stays case-sensitive.
+#
+# Verified against MySQL 8.4. Uses file-unique names (the conformance DB is
+# shared).
+
+statement ok
+CREATE TABLE collci (id INT PRIMARY KEY, name VARCHAR(50), bn VARCHAR(50) COLLATE utf8mb4_bin)
+
+statement ok
+INSERT INTO collci VALUES (1, 'Apple', 'Apple'), (2, 'banana', 'banana'), (3, 'CHERRY', 'CHERRY'), (4, 'apple', 'apple')
+
+# Equality folds case: both 'Apple' and 'apple' match.
+query
+SELECT name FROM collci WHERE name = 'APPLE' ORDER BY id
+----
+Apple
+apple
+
+# Ordering folds case (so 'Apple'/'apple' sort together, ahead of 'banana').
+query
+SELECT name FROM collci ORDER BY name, id
+----
+Apple
+apple
+banana
+CHERRY
+
+# DISTINCT and IN fold case too: 'apple' and 'APPLE' are one value.
+query
+SELECT COUNT(DISTINCT name) FROM collci WHERE name IN ('apple', 'APPLE', 'banana')
+----
+2
+
+# A column declared COLLATE utf8mb4_bin stays case-sensitive.
+query
+SELECT bn FROM collci WHERE bn = 'apple'
+----
+apple
+
+# Uppercase sorts before lowercase under the binary collation.
+query
+SELECT bn FROM collci ORDER BY bn, id
+----
+Apple
+CHERRY
+apple
+banana
+
+# An expression-level COLLATE utf8mb4_bin forces a case-sensitive comparison.
+query
+SELECT name FROM collci WHERE name COLLATE utf8mb4_bin = 'apple'
+----
+apple
+
+# As does the BINARY operator.
+query
+SELECT name FROM collci ORDER BY BINARY name, id
+----
+Apple
+CHERRY
+apple
+banana
+
+# A UNIQUE index folds case, so a differently-cased duplicate conflicts.
+statement ok
+CREATE TABLE collci_uq (id INT PRIMARY KEY, k VARCHAR(30) UNIQUE)
+
+statement ok
+INSERT INTO collci_uq VALUES (1, 'MyKey')
+
+statement error 1062
+INSERT INTO collci_uq VALUES (2, 'mykey')
