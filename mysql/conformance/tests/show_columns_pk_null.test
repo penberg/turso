@@ -49,3 +49,27 @@ query
 SHOW FULL COLUMNS FROM pkn_one WHERE Field = 'note'
 ----
 note	text	utf8mb4_general_ci	YES		NULL		select,insert,update,references	
+
+# A NOT NULL column that is a table-level PRIMARY KEY keeps a NULL Default, like
+# MySQL -- the implicit NOT NULL default (which non-key NOT NULL columns receive)
+# is not applied to a primary-key column, whether the key is declared inline or
+# at table level.
+statement ok
+CREATE TABLE IF NOT EXISTS pkn_nn (id INT NOT NULL, n INT, PRIMARY KEY (id))
+
+query
+SHOW COLUMNS FROM pkn_nn
+----
+id	int	NO	PRI	NULL	
+n	int	YES		NULL	
+
+# A composite NOT NULL primary key keeps NULL for every key column.
+statement ok
+CREATE TABLE IF NOT EXISTS pkn_nn2 (a INT NOT NULL, b BIGINT NOT NULL, c INT, PRIMARY KEY (a, b))
+
+query
+SHOW COLUMNS FROM pkn_nn2
+----
+a	int	NO	PRI	NULL	
+b	bigint	NO	PRI	NULL	
+c	int	YES		NULL	

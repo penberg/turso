@@ -396,6 +396,30 @@ impl Parser {
         }
 
         Self::apply_auto_increment(&mut columns, &mut constraints)?;
+
+        // Apply MySQL's implicit `NOT NULL` default to every non-key column. A
+        // primary-key column — inline (skipped inside `add_implicit_not_null_default`)
+        // or table-level (skipped here via `table_pk`) — and an `AUTO_INCREMENT`
+        // column are left to the engine's rowid / value generation and keep a
+        // `NULL` `SHOW COLUMNS` default, matching MySQL.
+        let table_pk: Vec<String> = constraints
+            .iter()
+            .find_map(|c| match &c.constraint {
+                ast::TableConstraint::PrimaryKey { columns, .. } => Some(
+                    columns
+                        .iter()
+                        .map(|sc| sorted_column_name(sc).to_ascii_lowercase())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        for (col, auto_increment) in columns.iter_mut() {
+            if !*auto_increment && !table_pk.contains(&col.col_name.as_str().to_ascii_lowercase()) {
+                add_implicit_not_null_default(col);
+            }
+        }
+
         let columns: Vec<ast::ColumnDefinition> = columns.into_iter().map(|(c, _)| c).collect();
 
         // Each inline secondary key becomes a deferred CREATE INDEX, emitted by
@@ -583,12 +607,17 @@ impl Parser {
             }
         }
 
-        let (column, auto_increment) = self.column_def()?;
+        let (mut column, auto_increment) = self.column_def()?;
         if auto_increment {
             return Err(ParseError::Unsupported(
                 "ALTER TABLE ... ADD COLUMN with AUTO_INCREMENT is not supported yet".to_string(),
             ));
         }
+        // A NOT NULL column added to a table with existing rows needs MySQL's
+        // implicit default (the engine rejects a NOT NULL add without one). An
+        // added column is never a table-level primary key, so the inline-PK skip
+        // inside the helper is sufficient.
+        add_implicit_not_null_default(&mut column);
 
         // A trailing `FIRST` / `AFTER col` clause positions the new column. The
         // engine always appends, so the position is consumed and ignored
@@ -918,38 +947,11 @@ impl Parser {
             }));
         }
 
-        // MySQL (in its default non-strict `sql_mode`, which WordPress's test
-        // harness uses) supplies an implicit type default for a `NOT NULL` column
-        // that has no explicit `DEFAULT`, so a row that omits the column still
-        // inserts -- `0` for numeric types and `''` for string types. The engine
-        // enforces `NOT NULL` strictly and would reject the row, so materialize
-        // that implicit default as an explicit `DEFAULT` (see
-        // `implicit_not_null_default`). Skip `AUTO_INCREMENT` and `PRIMARY KEY`
-        // columns: the former generates its own values and the latter is left to
-        // the engine's rowid handling (and so keeps its `NULL` `SHOW COLUMNS`
-        // default).
-        if !auto_increment {
-            let is_not_null = constraints.iter().any(|c| {
-                matches!(
-                    &c.constraint,
-                    ast::ColumnConstraint::NotNull {
-                        nullable: false,
-                        ..
-                    }
-                )
-            });
-            let has_default = constraints
-                .iter()
-                .any(|c| matches!(&c.constraint, ast::ColumnConstraint::Default(_)));
-            let is_primary_key = constraints
-                .iter()
-                .any(|c| matches!(&c.constraint, ast::ColumnConstraint::PrimaryKey { .. }));
-            if is_not_null && !has_default && !is_primary_key {
-                if let Some(default) = col_type.as_ref().and_then(implicit_not_null_default) {
-                    constraints.push(named(ast::ColumnConstraint::Default(default)));
-                }
-            }
-        }
+        // MySQL's implicit `NOT NULL` default (a `NOT NULL` column with no explicit
+        // `DEFAULT` still inserts in the default non-strict `sql_mode`) is applied
+        // by the caller, which knows the table-level primary key: `create_table`
+        // skips every primary-key column, and `ALTER TABLE ... ADD COLUMN` applies
+        // it to the lone added column. (See `add_implicit_not_null_default`.)
 
         Ok((
             ast::ColumnDefinition {
@@ -8188,6 +8190,39 @@ fn named(constraint: ast::ColumnConstraint) -> ast::NamedColumnConstraint {
     ast::NamedColumnConstraint {
         name: None,
         constraint,
+    }
+}
+
+/// Appends MySQL's implicit `NOT NULL` default to `col`: a `NOT NULL` column with
+/// no explicit `DEFAULT` and a type that has such a default (`0` for numeric, `''`
+/// for string/binary — see [`implicit_not_null_default`]) is given that default,
+/// so a row that omits it still inserts in MySQL's default non-strict `sql_mode`
+/// (the engine enforces `NOT NULL` strictly and would otherwise reject the row).
+/// An inline `PRIMARY KEY` column is skipped — it is left to the engine's rowid
+/// handling and keeps its `NULL` `SHOW COLUMNS` default; callers also skip
+/// table-level primary-key and `AUTO_INCREMENT` columns for the same reason.
+fn add_implicit_not_null_default(col: &mut ast::ColumnDefinition) {
+    let is_not_null = col.constraints.iter().any(|c| {
+        matches!(
+            &c.constraint,
+            ast::ColumnConstraint::NotNull {
+                nullable: false,
+                ..
+            }
+        )
+    });
+    let has_default = col
+        .constraints
+        .iter()
+        .any(|c| matches!(&c.constraint, ast::ColumnConstraint::Default(_)));
+    let is_inline_pk = col
+        .constraints
+        .iter()
+        .any(|c| matches!(&c.constraint, ast::ColumnConstraint::PrimaryKey { .. }));
+    if is_not_null && !has_default && !is_inline_pk {
+        if let Some(default) = col.col_type.as_ref().and_then(implicit_not_null_default) {
+            col.constraints.push(named(ast::ColumnConstraint::Default(default)));
+        }
     }
 }
 
