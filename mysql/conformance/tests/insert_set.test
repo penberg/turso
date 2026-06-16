@@ -3,8 +3,10 @@
 # MySQL's INSERT [INTO] tbl SET col = expr, ... is the assignment-list form of
 # INSERT, equivalent to INSERT INTO tbl (col, ...) VALUES (expr, ...). The
 # front-end lowers it to exactly that, so a column omitted from the SET list
-# takes its DEFAULT. The IGNORE / REPLACE conflict modifiers and a trailing
-# ON DUPLICATE KEY UPDATE carry through, like the VALUES form.
+# takes its DEFAULT, and an explicit `col = DEFAULT` inserts that same declared
+# default (the engine's DEFAULT keyword, honored in the lowered VALUES). The
+# IGNORE / REPLACE conflict modifiers and a trailing ON DUPLICATE KEY UPDATE
+# carry through, like the VALUES form.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name and ORDER BY-deterministic queries.
@@ -49,3 +51,26 @@ SELECT id, name, n FROM iset_demo ORDER BY id
 # A bare duplicate-key INSERT ... SET (no IGNORE / ON DUPLICATE) still errors.
 statement error
 INSERT INTO iset_demo SET id = 1, name = 'x'
+
+# An explicit `col = DEFAULT` inserts the column's declared default, the same as
+# omitting it: a numeric default, a string default, and a column with no default
+# (which is NULL-able, so it defaults to NULL).
+statement ok
+CREATE TABLE IF NOT EXISTS iset_dflt (id INT PRIMARY KEY, a INT DEFAULT 7, b VARCHAR(10) DEFAULT 'x', c INT)
+
+statement ok
+INSERT INTO iset_dflt SET id = 1, a = DEFAULT, b = DEFAULT, c = DEFAULT
+
+query
+SELECT a, b, c FROM iset_dflt WHERE id = 1
+----
+7	x	NULL
+
+# DEFAULT mixes with explicit values in the same assignment list.
+statement ok
+INSERT INTO iset_dflt SET id = 2, a = 99, b = DEFAULT
+
+query
+SELECT a, b FROM iset_dflt WHERE id = 2
+----
+99	x

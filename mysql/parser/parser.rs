@@ -1621,7 +1621,10 @@ impl Parser {
         loop {
             columns.push(self.name()?);
             self.expect(&Token::Eq, "`=`")?;
-            row.push(Box::new(self.expr()?));
+            // `col = DEFAULT` inserts the column's declared default — the same
+            // `Expr::Default` the `VALUES` form uses, honored by the engine since
+            // this lowers to `INSERT ... VALUES`.
+            row.push(Box::new(self.value_or_default()?));
             if self.eat(&Token::Comma) {
                 continue;
             }
@@ -1690,11 +1693,12 @@ impl Parser {
         })
     }
 
-    /// Parses an `INSERT ... VALUES` element, recognizing the MySQL `DEFAULT`
-    /// keyword (insert the column's declared default) as the engine's
-    /// `Expr::Default`. Anything else is an ordinary expression. (The engine only
-    /// honors `DEFAULT` in `INSERT ... VALUES`, not in `UPDATE ... SET`, so this
-    /// is used there only.)
+    /// Parses an `INSERT ... VALUES` / `INSERT ... SET` element, recognizing the
+    /// MySQL `DEFAULT` keyword (insert the column's declared default) as the
+    /// engine's `Expr::Default`. Anything else is an ordinary expression. (The
+    /// engine only honors `DEFAULT` in an `INSERT` — both the `VALUES` form and the
+    /// `SET` form, which lowers to it — not in `UPDATE ... SET`, so this is used in
+    /// those insert paths only.)
     fn value_or_default(&mut self) -> Result<ast::Expr> {
         if self.is_keyword("DEFAULT") && self.peek_nth(1) != Some(&Token::LParen) {
             self.advance();
