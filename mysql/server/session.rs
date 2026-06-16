@@ -31,6 +31,18 @@ pub fn try_handle(sql: &str) -> Option<SessionResponse> {
         return Some(SessionResponse::Ok);
     }
 
+    // `LOCK TABLE[S] ...` / `UNLOCK TABLE[S]` are no-ops: the engine is a single
+    // writer, so the table locks MySQL uses to serialize access are unnecessary.
+    // Acknowledge with OK. (MySQL's `LOCK TABLES` also commits an active
+    // transaction and confines the session to the locked tables; neither of those
+    // side effects is reproduced — a documented divergence.)
+    let words: Vec<&str> = upper.split_whitespace().collect();
+    if matches!(words.first(), Some(&"LOCK") | Some(&"UNLOCK"))
+        && matches!(words.get(1), Some(&"TABLES") | Some(&"TABLE"))
+    {
+        return Some(SessionResponse::Ok);
+    }
+
     // `SELECT @@var, ...` / `SELECT VERSION()` and similar introspection.
     if upper.starts_with("SELECT ") || upper.starts_with("SELECT\t") {
         return handle_select(&trimmed[6..]);
@@ -219,5 +231,23 @@ mod tests {
     fn real_select_falls_through() {
         assert!(try_handle("SELECT id FROM users").is_none());
         assert!(try_handle("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn lock_tables_is_ok() {
+        for sql in [
+            "LOCK TABLES wp_options WRITE",
+            "LOCK TABLES a READ, b WRITE",
+            "LOCK TABLE t WRITE",
+            "UNLOCK TABLES",
+            "UNLOCK TABLE",
+        ] {
+            assert!(
+                matches!(try_handle(sql), Some(SessionResponse::Ok)),
+                "expected `{sql}` to be acknowledged"
+            );
+        }
+        // `LOCK INSTANCE` / `LOCK TABLESPACE` are not table locks and fall through.
+        assert!(try_handle("LOCK INSTANCE FOR BACKUP").is_none());
     }
 }

@@ -1,0 +1,63 @@
+# LOCK TABLES / UNLOCK TABLES conformance.
+#
+# MySQL's LOCK TABLES acquires explicit table locks to serialize access; the
+# engine is a single writer, so those locks are unnecessary. The server accepts
+# LOCK TABLE[S] ... and UNLOCK TABLE[S] as no-ops that report success (handled
+# ahead of the parser, like SET), and the statements between them run normally.
+# (MySQL's LOCK TABLES also commits an active transaction and confines the
+# session to the locked tables; neither side effect is reproduced.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS lktab_demo (id INT PRIMARY KEY, v INT)
+
+# LOCK TABLES ... WRITE is accepted; writes under it work normally.
+statement ok
+LOCK TABLES lktab_demo WRITE
+
+statement ok
+INSERT INTO lktab_demo VALUES (1, 10), (2, 20)
+
+statement ok
+UPDATE lktab_demo SET v = v + 1 WHERE id = 1
+
+statement ok
+UNLOCK TABLES
+
+query
+SELECT id, v FROM lktab_demo ORDER BY id
+----
+1	11
+2	20
+
+# The singular LOCK TABLE and a READ lock are accepted too; reads work.
+statement ok
+LOCK TABLE lktab_demo READ
+
+query
+SELECT v FROM lktab_demo WHERE id = 2
+----
+20
+
+statement ok
+UNLOCK TABLE
+
+# Multiple tables and lock types in one statement.
+statement ok
+CREATE TABLE IF NOT EXISTS lktab_demo2 (id INT PRIMARY KEY)
+
+statement ok
+LOCK TABLES lktab_demo WRITE, lktab_demo2 READ
+
+statement ok
+INSERT INTO lktab_demo VALUES (3, 30)
+
+statement ok
+UNLOCK TABLES
+
+query
+SELECT COUNT(*) FROM lktab_demo
+----
+3

@@ -448,7 +448,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | RELEASE SAVEPOINT name                           | ✅     | Discards a savepoint without rolling back, via the engine's `RELEASE`. The `SAVEPOINT` keyword is required (MySQL syntax). |
 | SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE | 🚧 | The trailing locking-read clause is accepted and ignored, including the `OF tbl [, tbl] ...` table list and the `NOWAIT` / `SKIP LOCKED` lock-acquisition options. The engine is a single writer, so the locked query returns the same rows as the unlocked one; no real row locking is performed, and `NOWAIT` / `SKIP LOCKED` (which only matter under contention) are no-ops. |
 | LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE       | ❌     |         |
-| LOCK TABLES / UNLOCK TABLES                      | ❌     |         |
+| LOCK TABLES / UNLOCK TABLES                      | 🚧     | `LOCK TABLE[S] ... {READ\|WRITE}` (any number of tables) and `UNLOCK TABLE[S]` are accepted as **no-ops** that report success — the engine is a single writer, so the table locks MySQL uses to serialize access are unnecessary. The statements between them run normally. MySQL's side effects are not reproduced: `LOCK TABLES` does not commit an active transaction and does not confine the session to the locked tables (accessing an unlocked table still works). |
 | SET TRANSACTION                                  | ❌     |         |
 | XA transactions (XA START/END/PREPARE/COMMIT...) | ❌     |         |
 
