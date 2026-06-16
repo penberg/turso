@@ -1,0 +1,51 @@
+# SHOW COLUMNS: a primary-key column reports Null = NO.
+#
+# In MySQL a PRIMARY KEY column is implicitly NOT NULL, so SHOW COLUMNS reports
+# its Null as "NO". The engine does not flag the column (an `INT PRIMARY KEY`
+# rowid alias reports notnull = 0 in PRAGMA table_info), so the front-end forces
+# Null = NO whenever the column is part of the primary key, matching MySQL.
+# WordPress's dbDelta compares this column when deciding whether to alter a table.
+#
+# Rows are tab-separated; the trailing empty Extra/Comment column produces a
+# trailing tab. Expected to pass against both turso-mysql-server and a real
+# mysqld. Uses its own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS pkn_one (id INT PRIMARY KEY, opt VARCHAR(20), note TEXT)
+
+# The single PRIMARY KEY column is NO/PRI; the nullable columns are YES.
+query
+SHOW COLUMNS FROM pkn_one
+----
+id	int	NO	PRI	NULL	
+opt	varchar(20)	YES		NULL	
+note	text	YES		NULL	
+
+# A WHERE filter on the key column still reports NO.
+query
+SHOW COLUMNS FROM pkn_one WHERE Field = 'id'
+----
+id	int	NO	PRI	NULL	
+
+# A composite primary key marks every key column NO/PRI; a non-key column is YES.
+statement ok
+CREATE TABLE IF NOT EXISTS pkn_two (a INT, b INT, c INT, PRIMARY KEY (a, b))
+
+query
+SHOW COLUMNS FROM pkn_two
+----
+a	int	NO	PRI	NULL	
+b	int	NO	PRI	NULL	
+c	int	YES		NULL	
+
+# SHOW FULL COLUMNS carries the same Null, plus the per-column collation
+# (NULL for the integer key, utf8mb4_general_ci for text).
+query
+SHOW FULL COLUMNS FROM pkn_one WHERE Field = 'id'
+----
+id	int	NULL	NO	PRI	NULL		select,insert,update,references	
+
+query
+SHOW FULL COLUMNS FROM pkn_one WHERE Field = 'note'
+----
+note	text	utf8mb4_general_ci	YES		NULL		select,insert,update,references	

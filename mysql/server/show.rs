@@ -776,7 +776,10 @@ struct ColumnInfo {
 impl ColumnInfo {
     /// Reshapes the column into a MySQL `SHOW [FULL] COLUMNS` row.
     fn into_row(self, full: bool) -> Vec<Option<String>> {
-        let null = if self.notnull { "NO" } else { "YES" };
+        // A primary-key column is always NOT NULL in MySQL, even when the engine
+        // does not flag it (an `INTEGER PRIMARY KEY` rowid alias reports
+        // `notnull = 0` in `PRAGMA table_info`).
+        let null = if self.notnull || self.pk { "NO" } else { "YES" };
         let key = if self.pk { "PRI" } else { "" };
         let collation = if is_text_type(&self.ty) {
             Some(COLLATION.to_string())

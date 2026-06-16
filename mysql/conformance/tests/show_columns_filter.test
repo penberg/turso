@@ -33,11 +33,12 @@ SHOW COLUMNS FROM scf LIKE 'BODY'
 ----
 body	text	YES		NULL	
 
-# WHERE on a named output column.
+# WHERE on a named output column. The primary-key column reports Null = NO (a
+# PK is implicitly NOT NULL in MySQL, even for the rowid-alias `INT PRIMARY KEY`).
 query
 SHOW COLUMNS FROM scf WHERE Field = 'id'
 ----
-id	int	YES	PRI	NULL	
+id	int	NO	PRI	NULL	
 
 # A pattern matching no column yields an empty result.
 query
