@@ -563,6 +563,16 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: ast::Stmt, first_seq: u8) -> Vec<u
         }
     }
 
+    // MySQL drops a column even when an index covers it (a single-column index is
+    // dropped, a multi-column one keeps its remaining columns); the engine refuses
+    // to drop a column referenced by any index. Adjust those indexes first so the
+    // `DROP COLUMN` below succeeds, matching MySQL.
+    if let ast::Stmt::AlterTable(at) = &stmt {
+        if let ast::AlterTableBody::DropColumn(column) = &at.body {
+            show::adjust_indexes_for_dropped_column(conn, at.name.name.as_str(), column.as_str());
+        }
+    }
+
     let mut statement = match conn.prepare_stmt(stmt) {
         Ok(statement) => statement,
         Err(e) => return error_response(first_seq, &e),

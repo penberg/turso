@@ -1,0 +1,90 @@
+# ALTER TABLE ... DROP COLUMN of an indexed column.
+#
+# MySQL drops a column even when an index covers it: a single-column index on the
+# column is dropped along with it, and a multi-column index survives over its
+# remaining columns (keeping its uniqueness). The engine instead refuses to drop
+# a column referenced by any index, so the server first adjusts those indexes —
+# dropping single-column ones and recreating multi-column ones without the
+# column — before running the DROP COLUMN.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its own
+# table names. (SHOW INDEX output is not compared directly here because its
+# Cardinality / row order differ cosmetically from MySQL; the index changes are
+# verified through their effects instead.)
+
+# A single-column index: dropping its column succeeds and the rest is intact.
+statement ok
+CREATE TABLE dropcol_single (id INT PRIMARY KEY, a INT, b INT, KEY k_a (a))
+
+statement ok
+INSERT INTO dropcol_single (id, a, b) VALUES (1, 10, 20), (2, 30, 40)
+
+statement ok
+ALTER TABLE dropcol_single DROP COLUMN a
+
+query
+SELECT id, b FROM dropcol_single ORDER BY id
+----
+1	20
+2	40
+
+# A UNIQUE multi-column index survives over its remaining column and keeps
+# enforcing uniqueness there: after dropping `a`, the unique index is on `b`.
+statement ok
+CREATE TABLE dropcol_uniq (id INT PRIMARY KEY, a INT, b INT, UNIQUE KEY u_ab (a, b))
+
+statement ok
+INSERT INTO dropcol_uniq (id, a, b) VALUES (1, 10, 20), (2, 10, 30)
+
+statement ok
+ALTER TABLE dropcol_uniq DROP COLUMN a
+
+# `b` = 20 already exists, so the surviving unique index rejects the duplicate.
+statement error
+INSERT INTO dropcol_uniq (id, b) VALUES (3, 20)
+
+# A new `b` value is accepted.
+statement ok
+INSERT INTO dropcol_uniq (id, b) VALUES (4, 50)
+
+query
+SELECT id, b FROM dropcol_uniq ORDER BY id
+----
+1	20
+2	30
+4	50
+
+# A non-unique multi-column index also survives over its remaining column, but —
+# being non-unique — does not enforce uniqueness there: duplicate `b` is allowed.
+statement ok
+CREATE TABLE dropcol_multi (id INT PRIMARY KEY, a INT, b INT, KEY k_ab (a, b))
+
+statement ok
+INSERT INTO dropcol_multi (id, a, b) VALUES (1, 10, 20)
+
+statement ok
+ALTER TABLE dropcol_multi DROP COLUMN a
+
+statement ok
+INSERT INTO dropcol_multi (id, b) VALUES (2, 20)
+
+query
+SELECT id, b FROM dropcol_multi ORDER BY id
+----
+1	20
+2	20
+
+# Dropping a non-indexed column still works (the index on `b` is untouched).
+statement ok
+CREATE TABLE dropcol_plain (id INT PRIMARY KEY, a INT, b INT, KEY k_b (b))
+
+statement ok
+INSERT INTO dropcol_plain (id, a, b) VALUES (1, 10, 20)
+
+statement ok
+ALTER TABLE dropcol_plain DROP COLUMN a
+
+query
+SELECT id, b FROM dropcol_plain ORDER BY id
+----
+1	20

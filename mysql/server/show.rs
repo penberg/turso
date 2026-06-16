@@ -1043,6 +1043,86 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+/// Quotes an identifier for engine SQL with double quotes, doubling any embedded
+/// quote (`a"b` → `"a""b"`).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Makes the engine accept an `ALTER TABLE <table> DROP COLUMN <column>` even when
+/// an index covers the column, matching MySQL.
+///
+/// MySQL drops a column that participates in an index by adjusting the indexes: a
+/// single-column index on the column is dropped outright, and a multi-column
+/// index survives over its remaining columns. The engine instead refuses to drop
+/// a column referenced by any index ("cannot drop column ...: it is referenced in
+/// the index ..."), so this runs first and, for every index covering `column`,
+/// drops it and — when other columns remain — recreates it without `column`. The
+/// primary-key index is left untouched (dropping a primary-key column is a
+/// distinct, restricted operation, and a rowid primary key has no droppable
+/// index).
+///
+/// Best effort: any introspection or DDL step that fails is ignored, so the
+/// caller's `DROP COLUMN` still runs and surfaces the real error (e.g. an unknown
+/// table or a column that does not exist). The index rewrites are not atomic with
+/// the column drop — like the front-end's other `ALTER TABLE` emulations.
+pub(crate) fn adjust_indexes_for_dropped_column(
+    conn: &Arc<Connection>,
+    table: &str,
+    column: &str,
+) {
+    // `index_list`: seq, name, unique, origin, partial.
+    let mut indexes: Vec<(String, bool, String)> = Vec::new();
+    let list_sql = format!("PRAGMA index_list('{}')", table.replace('\'', "''"));
+    if let Ok(Some(mut stmt)) = conn.query(&list_sql) {
+        let _ = stmt.run_with_row_callback(|row| {
+            let name = value_to_string(row.get_value(1)).unwrap_or_default();
+            let unique = value_to_string(row.get_value(2)).as_deref() == Some("1");
+            let origin = value_to_string(row.get_value(3)).unwrap_or_default();
+            indexes.push((name, unique, origin));
+            Ok(())
+        });
+    }
+
+    for (name, unique, origin) in &indexes {
+        // The primary-key index is not adjusted here.
+        if origin.eq_ignore_ascii_case("pk") {
+            continue;
+        }
+        // `index_info`: seqno, cid, column.
+        let mut cols: Vec<String> = Vec::new();
+        let info_sql = format!("PRAGMA index_info('{}')", name.replace('\'', "''"));
+        if let Ok(Some(mut stmt)) = conn.query(&info_sql) {
+            let _ = stmt.run_with_row_callback(|row| {
+                cols.push(value_to_string(row.get_value(2)).unwrap_or_default());
+                Ok(())
+            });
+        }
+        if !cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            continue;
+        }
+
+        let _ = conn.execute(format!("DROP INDEX {}", quote_ident(name)));
+        let remaining: Vec<&String> = cols
+            .iter()
+            .filter(|c| !c.eq_ignore_ascii_case(column))
+            .collect();
+        if !remaining.is_empty() {
+            let cols_sql = remaining
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let unique_kw = if *unique { "UNIQUE " } else { "" };
+            let _ = conn.execute(format!(
+                "CREATE {unique_kw}INDEX {} ON {} ({cols_sql})",
+                quote_ident(name),
+                quote_ident(table),
+            ));
+        }
+    }
+}
+
 /// Parses `SHOW [FULL] {COLUMNS|FIELDS} {FROM|IN} tbl [{FROM|IN} db]`. Returns
 /// `None` for any other statement, including `SHOW COLUMNS ... LIKE`/`WHERE`
 /// (not yet handled) so those fall through to the parser.
