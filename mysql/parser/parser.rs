@@ -4533,10 +4533,13 @@ impl Parser {
     }
 
     /// Parses a `FIELD(x, a, b, ...)` call (the name and `(` are already
-    /// consumed) and lowers it to `CASE x WHEN a THEN 1 WHEN b THEN 2 ... ELSE 0
-    /// END`, which the engine evaluates the same way MySQL's `FIELD` does: the
-    /// 1-based index of the first argument among the rest, or 0 if absent or
-    /// NULL. At least one argument is required.
+    /// consumed) and lowers it to `CASE x COLLATE NOCASE WHEN a THEN 1 WHEN b THEN
+    /// 2 ... ELSE 0 END`, which the engine evaluates the same way MySQL's `FIELD`
+    /// does: the 1-based index of the first argument among the rest, or 0 if
+    /// absent or NULL. The `COLLATE NOCASE` on the base makes the `WHEN`
+    /// comparisons fold ASCII case like MySQL's default collation
+    /// (`FIELD('a', 'A', 'b')` is `1`); it is harmless for a numeric `x`. At least
+    /// one argument is required.
     fn field_call(&mut self) -> Result<ast::Expr> {
         let mut args = Vec::new();
         if !self.is(&Token::RParen) {
@@ -4556,6 +4559,7 @@ impl Parser {
                 "FIELD() requires at least one argument".to_string(),
             ));
         };
+        let base = ast::Expr::collate(base, ast::Name::from_string("NOCASE"));
         let when_then_pairs = iter
             .enumerate()
             .map(|(i, value)| {
@@ -12096,7 +12100,8 @@ mod tests {
 
     #[test]
     fn field_lowers_to_case() {
-        // FIELD(x, a, b) -> CASE x WHEN a THEN 1 WHEN b THEN 2 ELSE 0 END.
+        // FIELD(x, a, b) -> CASE x COLLATE NOCASE WHEN a THEN 1 WHEN b THEN 2
+        // ELSE 0 END (the NOCASE base folds case, like MySQL's default collation).
         let ast::Expr::Case {
             base,
             when_then_pairs,
@@ -12105,7 +12110,10 @@ mod tests {
         else {
             panic!("expected FIELD to lower to a CASE");
         };
-        assert_eq!(base.as_deref(), Some(&col("id")));
+        assert_eq!(
+            base.as_deref(),
+            Some(&ast::Expr::collate(col("id"), ast::Name::from_string("NOCASE")))
+        );
         assert_eq!(when_then_pairs.len(), 3);
         // The THEN results are the 1-based indices.
         for (i, (_, then)) in when_then_pairs.iter().enumerate() {
