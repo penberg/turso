@@ -4682,7 +4682,10 @@ impl Parser {
 
     /// Parses a `CHAR(n1, n2, ...)` call (the name and `(` are already consumed)
     /// and lowers it to the engine's `char()`, which builds a string from the
-    /// Unicode code points of its integer arguments. For the common ASCII and
+    /// Unicode code points of its integer arguments. Each code is coerced to an
+    /// integer the way `CAST(... AS SIGNED)` is — a numeric value rounds
+    /// (`CHAR(65.9)` → `B`), a string parses its leading integer (`CHAR('66')` →
+    /// `B`) — so a non-integer code matches MySQL. For the common ASCII and
     /// control-character codes (e.g. `CHAR(10)` newline, `CHAR(72, 73)` -> `HI`)
     /// this matches MySQL exactly. Two documented divergences: MySQL skips NULL
     /// arguments whereas the engine stops at the first NULL, and for code points
@@ -4694,7 +4697,8 @@ impl Parser {
     fn char_call(&mut self) -> Result<ast::Expr> {
         let mut args = Vec::new();
         loop {
-            args.push(self.expr()?);
+            // MySQL rounds/parses each code to an integer before building the byte.
+            args.push(integer_arg(self.expr()?));
             if self.eat(&Token::Comma) {
                 continue;
             }
@@ -14249,13 +14253,14 @@ mod tests {
 
     #[test]
     fn char_lowers_to_engine_char() {
-        // CHAR(72, 73) -> char(72, 73).
+        // CHAR(72, 73) -> char(<int 72>, <int 73>), each code coerced to an
+        // integer like CAST(code AS SIGNED) so a numeric/string code rounds/parses.
         let ast::Expr::FunctionCall { name, args, .. } = parse_expr("CHAR(72, 73)").unwrap() else {
             panic!("expected CHAR to lower to a function call");
         };
         assert_eq!(name.as_str(), "char");
         assert_eq!(args.len(), 2);
-        assert_eq!(*args[0], num("72"));
+        assert_eq!(*args[0], parse_expr("CAST(72 AS SIGNED)").unwrap());
 
         // A trailing `USING charset` clause is parsed and ignored; the call
         // still lowers to `char()` with the same code-point arguments.
@@ -14266,7 +14271,7 @@ mod tests {
         };
         assert_eq!(name.as_str(), "char");
         assert_eq!(args.len(), 2);
-        assert_eq!(*args[1], num("105"));
+        assert_eq!(*args[1], parse_expr("CAST(105 AS SIGNED)").unwrap());
     }
 
     #[test]

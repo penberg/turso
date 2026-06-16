@@ -3,7 +3,9 @@
 # CHAR builds a string from the character codes of its integer arguments. The
 # front-end maps it to the engine's char(), which is exact for the ASCII and
 # control-character codes that are the common use (e.g. CHAR(10) newline,
-# CHAR(72, 73) -> 'HI').
+# CHAR(72, 73) -> 'HI'). Each code is coerced to an integer the way
+# CAST(... AS SIGNED) is, so a numeric code rounds and a string parses its leading
+# integer, matching MySQL.
 #
 # Two divergences, not exercised here: MySQL skips NULL arguments whereas the
 # engine stops at the first NULL, and for codes above 127 MySQL emits raw bytes
@@ -24,6 +26,18 @@ query
 SELECT CHAR(48, 49, 50), CHAR(124)
 ----
 012	|
+
+# A fractional code rounds (65.9 -> 66 -> 'B', 97.5 -> 98 -> 'b').
+query
+SELECT CHAR(65.9, 66.4), CHAR(65.4), CHAR(97.5)
+----
+BB	A	b
+
+# A string code parses its leading integer ('66' -> 66, '66.9' -> 66).
+query
+SELECT CHAR('66'), CHAR('66.9'), CHAR('72', '73')
+----
+B	B	HI
 
 # Control characters are produced as single bytes (checked by length to avoid
 # embedding them): tab, newline, carriage return.
