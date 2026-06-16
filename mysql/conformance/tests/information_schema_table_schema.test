@@ -1,0 +1,58 @@
+# information_schema TABLE_SCHEMA filtering conformance.
+#
+# MySQL reports the owning database in the TABLE_SCHEMA column of every
+# information_schema view (TABLE_CATALOG stays the constant 'def'). WordPress
+# (charset detection in §8.3, Site Health, dbDelta) routinely filters by it --
+# `... WHERE TABLE_SCHEMA = '<db>'` and `... WHERE TABLE_SCHEMA = DATABASE()`.
+#
+# The front-end emulates information_schema by rewriting references into derived
+# SELECTs over sqlite_schema/pragma_*; TABLE_SCHEMA used to be a constant 'def'
+# placeholder, so filtering on it matched nothing. It now reports the connection's
+# current database, including in the UNION branches of the index/constraint views.
+#
+# These checks compare against DATABASE() rather than a literal, so they hold
+# whatever database the connection selected, on both turso-mysql-server and a real
+# mysqld. Uses its own table and index names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS iss_demo (id INT PRIMARY KEY, nm VARCHAR(30), KEY k_iss (nm), UNIQUE u_iss (nm))
+
+# TABLES is filterable by the connection's database via DATABASE().
+query
+SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iss_demo'
+----
+iss_demo
+
+# A non-matching schema selects nothing.
+query
+SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'no_such_db' AND TABLE_NAME = 'iss_demo'
+----
+0
+
+# COLUMNS reports the same schema, so its rows survive the filter.
+query
+SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iss_demo' ORDER BY ORDINAL_POSITION
+----
+id
+nm
+
+# STATISTICS includes the PRIMARY plus both secondary indexes (3 rows) -- the fix
+# also substitutes TABLE_SCHEMA in the view's UNION branch, not just the first.
+query
+SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iss_demo'
+----
+3
+
+# TABLE_CONSTRAINTS keeps the PRIMARY and UNIQUE constraints under the filter.
+query
+SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iss_demo' ORDER BY CONSTRAINT_NAME
+----
+PRIMARY
+u_iss
+
+# KEY_COLUMN_USAGE keeps the PRIMARY and UNIQUE key columns under the filter.
+query
+SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iss_demo' ORDER BY COLUMN_NAME
+----
+id
+nm

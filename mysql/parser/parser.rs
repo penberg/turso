@@ -2318,7 +2318,7 @@ impl Parser {
             let alias = self.table_alias()?;
             self.skip_index_hints()?;
             return Ok(ast::SelectTable::Select(
-                information_schema_tables_select()?,
+                information_schema_tables_select(self.current_db.as_deref())?,
                 alias,
             ));
         }
@@ -2330,7 +2330,7 @@ impl Parser {
             let alias = self.table_alias()?;
             self.skip_index_hints()?;
             return Ok(ast::SelectTable::Select(
-                information_schema_columns_select(),
+                information_schema_columns_select(self.current_db.as_deref()),
                 alias,
             ));
         }
@@ -2341,7 +2341,7 @@ impl Parser {
             let alias = self.table_alias()?;
             self.skip_index_hints()?;
             return Ok(ast::SelectTable::Select(
-                information_schema_statistics_select(),
+                information_schema_statistics_select(self.current_db.as_deref()),
                 alias,
             ));
         }
@@ -2353,7 +2353,7 @@ impl Parser {
             let alias = self.table_alias()?;
             self.skip_index_hints()?;
             return Ok(ast::SelectTable::Select(
-                information_schema_table_constraints_select(),
+                information_schema_table_constraints_select(self.current_db.as_deref()),
                 alias,
             ));
         }
@@ -2365,7 +2365,7 @@ impl Parser {
             let alias = self.table_alias()?;
             self.skip_index_hints()?;
             return Ok(ast::SelectTable::Select(
-                information_schema_key_column_usage_select(),
+                information_schema_key_column_usage_select(self.current_db.as_deref()),
                 alias,
             ));
         }
@@ -10316,7 +10316,23 @@ fn is_information_schema_tables(name: &ast::QualifiedName) -> bool {
 /// nothing — a documented limitation in `mysql/COMPAT.md`. SQLite's `sqlite_%` and
 /// turso's `__turso_internal_*` bookkeeping tables are excluded, as in `SHOW
 /// TABLES`.
-fn information_schema_tables_select() -> Result<ast::Select> {
+/// Substitutes the connection's current database for the `'def'` `TABLE_SCHEMA`
+/// placeholder in an `information_schema` emulation query, so a `WHERE
+/// TABLE_SCHEMA = '<db>'` predicate (and `= DATABASE()`) selects the rows as
+/// MySQL does — WordPress's charset detection and Site Health filter by it.
+/// `TABLE_CATALOG` keeps MySQL's constant `def`. A connection with no current
+/// database (rare) keeps the placeholder, since the real schema is then unknown.
+fn info_schema_with_schema(sql: &str, current_db: Option<&str>) -> String {
+    match current_db {
+        Some(db) => sql.replace(
+            "'def' AS TABLE_SCHEMA",
+            &format!("'{}' AS TABLE_SCHEMA", db.replace('\'', "''")),
+        ),
+        None => sql.to_string(),
+    }
+}
+
+fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Select> {
     const SQL: &str = "SELECT \
          name AS TABLE_NAME, \
          'def' AS TABLE_SCHEMA, \
@@ -10329,7 +10345,8 @@ fn information_schema_tables_select() -> Result<ast::Select> {
          WHERE type = 'table' \
          AND name NOT LIKE 'sqlite_%' \
          AND substr(name, 1, 17) <> '__turso_internal_'";
-    match Parser::new(SQL.as_bytes())?.parse_statement()? {
+    let sql = info_schema_with_schema(SQL, current_db);
+    match Parser::new(sql.as_bytes())?.parse_statement()? {
         ast::Stmt::Select(select) => Ok(select),
         _ => unreachable!("the information_schema.TABLES emulation parses as a SELECT"),
     }
@@ -10363,8 +10380,8 @@ fn is_information_schema_columns(name: &ast::QualifiedName) -> bool {
 /// server's default (e.g. 8.4's `utf8mb4_0900_ai_ci`); and `COLUMN_TYPE` carries
 /// no length/precision (`varchar`, not `varchar(20)`) because the engine catalog
 /// drops it. `sqlite_%` and `__turso_internal_*` bookkeeping tables are excluded.
-fn information_schema_columns_select() -> ast::Select {
-    const SQL: &[u8] = b"SELECT \
+fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
+    const SQL: &str = "SELECT \
          'def' AS TABLE_CATALOG, \
          'def' AS TABLE_SCHEMA, \
          m.name AS TABLE_NAME, \
@@ -10383,7 +10400,8 @@ fn information_schema_columns_select() -> ast::Select {
          WHERE m.type = 'table' \
          AND m.name NOT LIKE 'sqlite_%' \
          AND substr(m.name, 1, 17) <> '__turso_internal_'";
-    let mut parser = turso_parser::parser::Parser::new(SQL);
+    let sql = info_schema_with_schema(SQL, current_db);
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     match parser.next() {
         Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
         _ => unreachable!("the information_schema.COLUMNS emulation parses as a SELECT"),
@@ -10417,8 +10435,8 @@ fn is_information_schema_statistics(name: &ast::QualifiedName) -> bool {
 /// `CARDINALITY` is `0` (no statistics); and an unnamed unique constraint
 /// (SQLite's `origin = 'u'` auto-index) is not reported, since its engine name is
 /// not MySQL's.
-fn information_schema_statistics_select() -> ast::Select {
-    const SQL: &[u8] = b"SELECT \
+fn information_schema_statistics_select(current_db: Option<&str>) -> ast::Select {
+    const SQL: &str = "SELECT \
          'def' AS TABLE_CATALOG, \
          'def' AS TABLE_SCHEMA, \
          m.name AS TABLE_NAME, \
@@ -10438,7 +10456,7 @@ fn information_schema_statistics_select() -> ast::Select {
          UNION ALL \
          SELECT \
          'def', \
-         'def', \
+         'def' AS TABLE_SCHEMA, \
          m.name, \
          CASE WHEN il.\"unique\" = 1 THEN 0 ELSE 1 END, \
          il.name, \
@@ -10455,7 +10473,8 @@ fn information_schema_statistics_select() -> ast::Select {
          WHERE m.type = 'table' AND il.origin = 'c' \
          AND m.name NOT LIKE 'sqlite_%' \
          AND substr(m.name, 1, 17) <> '__turso_internal_'";
-    let mut parser = turso_parser::parser::Parser::new(SQL);
+    let sql = info_schema_with_schema(SQL, current_db);
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     match parser.next() {
         Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
         _ => unreachable!("the information_schema.STATISTICS emulation parses as a SELECT"),
@@ -10486,8 +10505,8 @@ fn is_information_schema_table_constraints(name: &ast::QualifiedName) -> bool {
 /// the placeholder `def` (filtering on them matches nothing); and `FOREIGN KEY` /
 /// `CHECK` constraints and unnamed unique constraints are not reported (the engine
 /// does not enforce or name them as MySQL does).
-fn information_schema_table_constraints_select() -> ast::Select {
-    const SQL: &[u8] = b"SELECT DISTINCT \
+fn information_schema_table_constraints_select(current_db: Option<&str>) -> ast::Select {
+    const SQL: &str = "SELECT DISTINCT \
          'def' AS CONSTRAINT_CATALOG, \
          'def' AS CONSTRAINT_SCHEMA, \
          'PRIMARY' AS CONSTRAINT_NAME, \
@@ -10505,7 +10524,7 @@ fn information_schema_table_constraints_select() -> ast::Select {
          'def', \
          'def', \
          il.name, \
-         'def', \
+         'def' AS TABLE_SCHEMA, \
          m.name, \
          'UNIQUE', \
          'YES' \
@@ -10514,7 +10533,8 @@ fn information_schema_table_constraints_select() -> ast::Select {
          WHERE m.type = 'table' AND il.origin = 'c' AND il.\"unique\" = 1 \
          AND m.name NOT LIKE 'sqlite_%' \
          AND substr(m.name, 1, 17) <> '__turso_internal_'";
-    let mut parser = turso_parser::parser::Parser::new(SQL);
+    let sql = info_schema_with_schema(SQL, current_db);
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     match parser.next() {
         Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
         _ => unreachable!("the information_schema.TABLE_CONSTRAINTS emulation parses as a SELECT"),
@@ -10544,8 +10564,8 @@ fn is_information_schema_key_column_usage(name: &ast::QualifiedName) -> bool {
 /// the engine parser (`turso_parser`), like the other emulations. Same
 /// `TABLE_SCHEMA` placeholder limitation as `TABLES` (filtering on it matches
 /// nothing); see `mysql/COMPAT.md`.
-fn information_schema_key_column_usage_select() -> ast::Select {
-    const SQL: &[u8] = b"SELECT \
+fn information_schema_key_column_usage_select(current_db: Option<&str>) -> ast::Select {
+    const SQL: &str = "SELECT \
          'def' AS CONSTRAINT_CATALOG, \
          'def' AS CONSTRAINT_SCHEMA, \
          'PRIMARY' AS CONSTRAINT_NAME, \
@@ -10569,7 +10589,7 @@ fn information_schema_key_column_usage_select() -> ast::Select {
          'def', \
          il.name, \
          'def', \
-         'def', \
+         'def' AS TABLE_SCHEMA, \
          m.name, \
          ii.name, \
          ii.seqno + 1, \
@@ -10583,7 +10603,8 @@ fn information_schema_key_column_usage_select() -> ast::Select {
          WHERE m.type = 'table' AND il.origin = 'c' AND il.\"unique\" = 1 \
          AND m.name NOT LIKE 'sqlite_%' \
          AND substr(m.name, 1, 17) <> '__turso_internal_'";
-    let mut parser = turso_parser::parser::Parser::new(SQL);
+    let sql = info_schema_with_schema(SQL, current_db);
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     match parser.next() {
         Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
         _ => unreachable!("the information_schema.KEY_COLUMN_USAGE emulation parses as a SELECT"),

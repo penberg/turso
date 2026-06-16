@@ -172,7 +172,10 @@ if [[ $run_turso -eq 1 ]]; then
         exit 1
     fi
 
-    run_suite "Turso front-end" "mysql://root@127.0.0.1:$TURSO_PORT/" && turso_rc=0 || turso_rc=$?
+    # Connect to a named database (as the MySQL reference does) so the front-end
+    # has a current database -- DATABASE()/SCHEMA() and information_schema's
+    # TABLE_SCHEMA report it, and tests can filter on it the way real clients do.
+    run_suite "Turso front-end" "mysql://root@127.0.0.1:$TURSO_PORT/conformance" && turso_rc=0 || turso_rc=$?
 fi
 
 # ---------------------------------------------------------------------------
