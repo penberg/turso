@@ -4059,6 +4059,13 @@ impl Parser {
             return self.char_call();
         }
 
+        // `QUOTE(str)` produces a single-quoted, escaped SQL string literal (see
+        // `quote_call`). The engine's own `quote` uses SQLite's escaping (doubled
+        // quotes), so the MySQL form (backslash escapes) is synthesized.
+        if upper == "QUOTE" {
+            return self.quote_call();
+        }
+
         // `ASCII(str)` / `ORD(str)` return the code point of the first character,
         // mapping to the engine's `unicode()` with MySQL's edge cases restored
         // (see `ascii_call`).
@@ -4640,6 +4647,58 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
         Ok(call_fn("char", args))
+    }
+
+    /// Parses a `QUOTE(str)` call (the name and `(` are already consumed) and
+    /// lowers it to MySQL's quoted, escaped string literal: the value wrapped in
+    /// single quotes with `'` → `\'`, `\` → `\\`, and Ctrl-Z (`0x1A`) → `\Z`,
+    /// built from nested `replace()`s (backslash escaped first so the escapes
+    /// added afterwards are not re-escaped). A NULL argument yields the literal
+    /// string `NULL` (unquoted), as in MySQL. A non-string argument is coerced to
+    /// a string first, exactly as MySQL coerces it.
+    ///
+    /// One divergence from MySQL (see `mysql/COMPAT.md`): a NUL (`0x00`) byte in
+    /// the value is not escaped to `\0`, because the engine's `replace()` treats
+    /// strings as NUL-terminated and cannot match a NUL needle. Such embedded-NUL
+    /// strings do not occur in practice.
+    fn quote_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let str_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+        // Escape the backslash first, then the single quote and Ctrl-Z; doing the
+        // backslash first keeps the backslashes introduced by the later escapes
+        // from being doubled.
+        let mut escaped = call_fn(
+            "replace",
+            vec![arg.clone(), str_lit("\\"), str_lit("\\\\")],
+        );
+        escaped = call_fn("replace", vec![escaped, str_lit("'"), str_lit("\\'")]);
+        escaped = call_fn(
+            "replace",
+            vec![
+                escaped,
+                call_fn("char", vec![*numeric_expr("26")]),
+                str_lit("\\Z"),
+            ],
+        );
+
+        // Wrap in single quotes: `'` || escaped || `'`.
+        let wrapped = ast::Expr::binary(
+            ast::Expr::binary(str_lit("'"), ast::Operator::Concat, escaped),
+            ast::Operator::Concat,
+            str_lit("'"),
+        );
+
+        // QUOTE(NULL) is the literal string `NULL`, not SQL NULL.
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(arg)),
+                Box::new(str_lit("NULL")),
+            )],
+            else_expr: Some(Box::new(wrapped)),
+        })
     }
 
     /// Parses an `ASCII(str)` / `ORD(str)` call (the name and `(` are already
@@ -13682,6 +13741,53 @@ mod tests {
         assert_eq!(
             *args[0],
             ast::Expr::Literal(ast::Literal::String("'%s%02d:%02d:%02d'".to_string()))
+        );
+    }
+
+    #[test]
+    fn quote_lowers_to_escaping_replaces_with_null_word_guard() {
+        // QUOTE(s) -> CASE WHEN s IS NULL THEN 'NULL'
+        //                  ELSE '\'' || replace(replace(replace(s, ...)...)) || '\'' END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("QUOTE(s)").unwrap()
+        else {
+            panic!("expected QUOTE to lower to a CASE");
+        };
+        assert!(base.is_none(), "searched CASE, no base expression");
+
+        // The single WHEN guards NULL, returning the literal word `NULL`.
+        assert_eq!(when_then_pairs.len(), 1);
+        assert_eq!(*when_then_pairs[0].0, ast::Expr::is_null(col("s")));
+        assert_eq!(
+            *when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::String("'NULL'".to_string()))
+        );
+
+        // The ELSE wraps the escaped value in single quotes: `'` || <esc> || `'`.
+        // A single-quote literal is stored requoted as four quote characters.
+        let wrapped = else_expr.unwrap();
+        let ast::Expr::Binary(left, ast::Operator::Concat, right) = wrapped.as_ref() else {
+            panic!("expected the ELSE to concatenate a trailing quote");
+        };
+        assert_eq!(
+            **right,
+            ast::Expr::Literal(ast::Literal::String("''''".to_string()))
+        );
+        // The left side is `'` || replace(...), the outermost escape being Ctrl-Z.
+        let ast::Expr::Binary(_, ast::Operator::Concat, esc) = left.as_ref() else {
+            panic!("expected `'` || <escaped> on the left");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = esc.as_ref() else {
+            panic!("expected the escaped value to be a replace() call");
+        };
+        assert_eq!(name.as_str(), "replace");
+        // Ctrl-Z (char(26)) is the outermost replacement; its target is `\Z`.
+        assert_eq!(
+            *args[2],
+            ast::Expr::Literal(ast::Literal::String("'\\Z'".to_string()))
         );
     }
 

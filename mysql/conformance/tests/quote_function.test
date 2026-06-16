@@ -1,0 +1,66 @@
+# QUOTE(str) — produce an escaped, single-quoted SQL string literal.
+#
+# MySQL's QUOTE wraps the value in single quotes and backslash-escapes the
+# characters that would otherwise break out of a string literal: a single quote
+# becomes \', a backslash becomes \\, and Ctrl-Z (0x1A) becomes \Z. A NULL
+# argument returns the bare word NULL (not a quoted string), and a non-string
+# argument is coerced to a string first. The front-end synthesizes this with
+# nested replace() over the value (the engine's own `quote` uses SQLite's
+# doubled-quote escaping instead).
+#
+# Not exercised (documented divergence, see mysql/COMPAT.md): a NUL (0x00) byte is
+# not escaped to \0, because the engine's replace() cannot match a NUL needle.
+# Such embedded-NUL strings do not occur in practice.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# A plain string is just wrapped in single quotes.
+query
+SELECT QUOTE('abc')
+----
+'abc'
+
+# A single quote is escaped as \', and a backslash as \\.
+query
+SELECT QUOTE('O''Reilly'), QUOTE('a\\b')
+----
+'O\'Reilly'	'a\\b'
+
+# The empty string quotes to '', and a number is coerced to its string form.
+query
+SELECT QUOTE(''), QUOTE(123)
+----
+''	'123'
+
+# Ctrl-Z (CHAR(26)) is escaped as \Z.
+query
+SELECT QUOTE(CONCAT('x', CHAR(26), 'y'))
+----
+'x\Zy'
+
+# A value mixing a quote and a backslash escapes both.
+query
+SELECT QUOTE(CONCAT('it', CHAR(39), 's a ', CHAR(92), ' test'))
+----
+'it\'s a \\ test'
+
+# QUOTE(NULL) is the literal word NULL, not a quoted string: concatenating proves
+# it is the four-character string, not SQL NULL.
+query
+SELECT CONCAT('[', QUOTE(NULL), ']')
+----
+[NULL]
+
+statement ok
+CREATE TABLE quote_t (id INT PRIMARY KEY, s VARCHAR(40))
+
+statement ok
+INSERT INTO quote_t VALUES (1, 'plain'), (2, 'has '' quote'), (3, 'back \\ slash')
+
+# Applied to a column, ready to splice into generated SQL.
+query
+SELECT id, QUOTE(s) FROM quote_t ORDER BY id
+----
+1	'plain'
+2	'has \' quote'
+3	'back \\ slash'
