@@ -5662,8 +5662,9 @@ impl Parser {
     /// epoch-second difference `unixepoch(b) - unixepoch(a)` by the unit's length
     /// in seconds; SQLite's integer division truncates toward zero, matching
     /// MySQL's "complete units" semantics for both signs. The calendar units
-    /// (`MICROSECOND`, `MONTH`, `QUARTER`, `YEAR`) have no fixed length and are
-    /// rejected. NULL propagates.
+    /// `MONTH`/`QUARTER`/`YEAR` (no fixed length) are counted by month via
+    /// [`timestampdiff_months`]. `MICROSECOND` is rejected: the engine's
+    /// datetimes carry only millisecond precision. NULL propagates.
     fn timestampdiff_call(&mut self) -> Result<ast::Expr> {
         let Some(Token::Word(u)) = self.peek() else {
             return Err(self.unexpected("a TIMESTAMPDIFF unit"));
@@ -5676,6 +5677,15 @@ impl Parser {
         let b = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
 
+        // The calendar units have no fixed second-length; count whole months
+        // and scale (a quarter is 3 months, a year is 12).
+        match unit.as_str() {
+            "MONTH" => return Ok(timestampdiff_months(a, b, 1)),
+            "QUARTER" => return Ok(timestampdiff_months(a, b, 3)),
+            "YEAR" => return Ok(timestampdiff_months(a, b, 12)),
+            _ => {}
+        }
+
         let seconds_per_unit: i64 = match unit.as_str() {
             "SECOND" => 1,
             "MINUTE" => 60,
@@ -5685,7 +5695,8 @@ impl Parser {
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "TIMESTAMPDIFF unit {other} is not supported yet \
-                     (only SECOND, MINUTE, HOUR, DAY, and WEEK have a fixed length)"
+                     (the engine's datetimes have only millisecond precision, \
+                     so MICROSECOND cannot be counted)"
                 )))
             }
         };
@@ -6734,6 +6745,64 @@ fn extract_compound(arg: ast::Expr, parts: &[(&str, i64)]) -> ast::Expr {
         });
     }
     result.expect("at least one field")
+}
+
+/// Builds MySQL's calendar-based `TIMESTAMPDIFF(MONTH|QUARTER|YEAR, a, b)` as a
+/// whole count of months from `a` to `b` (the `b - a` operand order), divided by
+/// `divisor` (1 for MONTH, 3 for QUARTER, 12 for YEAR).
+///
+/// The raw month span is `(year_b*12 + month_b) - (year_a*12 + month_a)`. MySQL
+/// counts only *complete* months, so a partial trailing month is dropped: when
+/// `b` is after `a` (a positive span) but `b`'s day-and-time within its month is
+/// earlier than `a`'s, the span is reduced by one — and symmetrically by one
+/// toward zero for a negative span. The day-and-time position is compared as the
+/// integer `DDhhmmss` (`strftime('%d%H%M%S', x)`), which is monotonic in
+/// (day, hour, minute, second). SQLite's integer division then truncates the
+/// month count toward zero for QUARTER/YEAR, matching MySQL. A NULL operand
+/// makes every `strftime` NULL, so the whole result is NULL.
+fn timestampdiff_months(a: ast::Expr, b: ast::Expr, divisor: i64) -> ast::Expr {
+    let zero = || ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+    let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+    let ym = |x: ast::Expr| extract_compound(x, &[("%Y", 12), ("%m", 1)]);
+    let raw = ast::Expr::binary(ym(b.clone()), ast::Operator::Subtract, ym(a.clone()));
+    let sfx_a = cast_strftime_int("%d%H%M%S", a);
+    let sfx_b = cast_strftime_int("%d%H%M%S", b);
+
+    // Positive span with an incomplete trailing month: drop it.
+    let pos_partial = ast::Expr::binary(
+        ast::Expr::binary(raw.clone(), ast::Operator::Greater, zero()),
+        ast::Operator::And,
+        ast::Expr::binary(sfx_b.clone(), ast::Operator::Less, sfx_a.clone()),
+    );
+    // Negative span with an incomplete trailing month: pull it toward zero.
+    let neg_partial = ast::Expr::binary(
+        ast::Expr::binary(raw.clone(), ast::Operator::Less, zero()),
+        ast::Operator::And,
+        ast::Expr::binary(sfx_b, ast::Operator::Greater, sfx_a),
+    );
+    let months = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (
+                Box::new(pos_partial),
+                Box::new(ast::Expr::binary(raw.clone(), ast::Operator::Subtract, one())),
+            ),
+            (
+                Box::new(neg_partial),
+                Box::new(ast::Expr::binary(raw.clone(), ast::Operator::Add, one())),
+            ),
+        ],
+        else_expr: Some(Box::new(raw)),
+    };
+    if divisor == 1 {
+        months
+    } else {
+        ast::Expr::binary(
+            months,
+            ast::Operator::Divide,
+            ast::Expr::Literal(ast::Literal::Numeric(divisor.to_string())),
+        )
+    }
 }
 
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
@@ -10155,13 +10224,27 @@ mod tests {
             ast::Expr::Binary(_, ast::Operator::Subtract, _)
         ));
 
-        // Calendar units have no fixed length and are rejected.
-        for unit in ["MICROSECOND", "MONTH", "QUARTER", "YEAR"] {
+        // The calendar units count whole months: MONTH lowers to a CASE (the
+        // complete-month adjustment), QUARTER/YEAR divide that by 3 / 12.
+        assert!(matches!(
+            parse_expr("TIMESTAMPDIFF(MONTH, a, b)").unwrap(),
+            ast::Expr::Case { .. }
+        ));
+        for (unit, div) in [("QUARTER", "3"), ("YEAR", "12")] {
+            let ast::Expr::Binary(months, ast::Operator::Divide, divisor) =
+                parse_expr(&format!("TIMESTAMPDIFF({unit}, a, b)")).unwrap()
+            else {
+                panic!("expected {unit} to divide the month count");
+            };
+            assert!(matches!(months.as_ref(), ast::Expr::Case { .. }), "{unit}");
             assert!(
-                parse_expr(&format!("TIMESTAMPDIFF({unit}, a, b)")).is_err(),
-                "TIMESTAMPDIFF unit {unit} should be unsupported"
+                matches!(divisor.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == div),
+                "{unit}"
             );
         }
+
+        // MICROSECOND stays rejected: the engine has only millisecond precision.
+        assert!(parse_expr("TIMESTAMPDIFF(MICROSECOND, a, b)").is_err());
     }
 
     #[test]
