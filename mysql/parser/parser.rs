@@ -6905,8 +6905,9 @@ impl Parser {
     /// engine's `datetime(x, '<signed-n> <unit>')` modifier. The interval value
     /// may be an integer literal or a quoted numeric string (`INTERVAL '30'
     /// SECOND`, which WordPress emits and MySQL coerces); `WEEK` is expanded to
-    /// days. `datetime()` returns `'YYYY-MM-DD HH:MM:SS'`, matching MySQL's
-    /// result for a DATETIME argument.
+    /// days. A date-unit step on a bare DATE argument returns a DATE, while a
+    /// time-unit step (or a target with a time) returns a datetime, matching
+    /// MySQL — see `date_unit_result`.
     fn date_add_call(&mut self, subtract: bool) -> Result<ast::Expr> {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
@@ -6925,8 +6926,8 @@ impl Parser {
     ///     `datetime(d, printf('%+d days', ±n))`. The `printf` gives the modifier
     ///     its explicit sign so a negative amount stays valid.
     ///
-    /// As with `DATE_ADD`, on a bare DATE value MySQL returns a DATE while the
-    /// engine keeps the time part — a documented divergence (see `mysql/COMPAT.md`).
+    /// As with `DATE_ADD`, a whole-day step is a date unit, so a bare DATE value
+    /// returns a DATE and a value with a time keeps it (see `date_unit_result`).
     fn adddate_call(&mut self, subtract: bool) -> Result<ast::Expr> {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
@@ -6968,7 +6969,7 @@ impl Parser {
         let shifted = ast::Expr::FunctionCall {
             name: ast::Name::from_string("datetime"),
             distinctness: None,
-            args: vec![Box::new(target), Box::new(modifier)],
+            args: vec![Box::new(target.clone()), Box::new(modifier)],
             order_by: Vec::new(),
             within_group: Vec::new(),
             filter_over: ast::FunctionTail {
@@ -6976,6 +6977,9 @@ impl Parser {
                 over_clause: None,
             },
         };
+        // The numeric form steps whole days, a date unit, so a bare DATE target
+        // yields a DATE while a value with a time keeps it (MySQL).
+        let shifted = date_unit_result(&target, shifted);
         // `printf` treats a NULL amount as 0, so guard a NULL days count back to
         // NULL (MySQL propagates it); a NULL target is already handled by
         // `datetime` returning NULL.
@@ -7598,9 +7602,10 @@ impl Parser {
     /// consumed) to `datetime(dt, '+<value × mult> <engine-unit>')` — the same
     /// modifier as `DATE_ADD(dt, INTERVAL value unit)` (see
     /// [`Self::apply_interval`]). The value must be an integer literal (optionally
-    /// signed). As with `DATE_ADD`, a bare DATE argument keeps the engine's
-    /// `00:00:00` time. `MICROSECOND` and any unit without an engine modifier are
-    /// rejected. Exactly three arguments are required.
+    /// signed). As with `DATE_ADD`, a date-unit step on a bare DATE argument
+    /// returns a DATE (see `date_unit_result`); month/year overflow is not clamped
+    /// here, unlike `DATE_ADD`. `MICROSECOND` and any unit without an engine
+    /// modifier are rejected. Exactly three arguments are required.
     fn timestampadd_call(&mut self) -> Result<ast::Expr> {
         let Some(Token::Word(u)) = self.peek() else {
             return Err(self.unexpected("a TIMESTAMPADD unit"));
@@ -7631,11 +7636,11 @@ impl Parser {
             amount = -amount;
         }
         let modifier = format!("{amount:+} {engine_unit}");
-        Ok(ast::Expr::FunctionCall {
+        let shifted = ast::Expr::FunctionCall {
             name: ast::Name::from_string("datetime"),
             distinctness: None,
             args: vec![
-                Box::new(target),
+                Box::new(target.clone()),
                 Box::new(ast::Expr::Literal(ast::Literal::String(requote(&modifier)))),
             ],
             order_by: Vec::new(),
@@ -7644,6 +7649,12 @@ impl Parser {
                 filter_clause: None,
                 over_clause: None,
             },
+        };
+        // A date-unit step returns a DATE on a bare DATE target; a time-unit step
+        // always returns a datetime (MySQL) — see `date_unit_result`.
+        Ok(match engine_unit {
+            "days" | "months" | "years" => date_unit_result(&target, shifted),
+            _ => shifted,
         })
     }
 
@@ -8246,16 +8257,32 @@ fn build_interval(target: ast::Expr, spec: &IntervalSpec, subtract: bool) -> Res
     // rolls `Jan 31 + 1 month` into March, but MySQL clamps to the last day
     // of the month (`Feb 28`). Wrap those with the clamp; day/time steps never
     // overflow and pass through as a plain `datetime(target, '<modifier>')`.
-    if engine_unit == "months" || engine_unit == "years" {
-        Ok(clamp_month_overflow(target, &modifier))
-    } else {
-        Ok(call_fn(
+    //
+    // A date-unit step (`days`/`months`/`years`) returns a DATE when the target
+    // has no time of day; a time-unit step (`hours`/`minutes`/`seconds`) always
+    // returns a datetime — see `date_unit_result`.
+    match engine_unit {
+        "months" | "years" => {
+            let rolled = clamp_month_overflow(target.clone(), &modifier);
+            Ok(date_unit_result(&target, rolled))
+        }
+        "days" => {
+            let shifted = call_fn(
+                "datetime",
+                vec![
+                    target.clone(),
+                    ast::Expr::Literal(ast::Literal::String(requote(&modifier))),
+                ],
+            );
+            Ok(date_unit_result(&target, shifted))
+        }
+        _ => Ok(call_fn(
             "datetime",
             vec![
                 target,
                 ast::Expr::Literal(ast::Literal::String(requote(&modifier))),
             ],
-        ))
+        )),
     }
 }
 
@@ -9898,6 +9925,39 @@ fn clamp_month_overflow(target: ast::Expr, modifier: &str) -> ast::Expr {
         base: None,
         when_then_pairs: vec![(Box::new(overflowed), Box::new(clamped))],
         else_expr: Some(Box::new(rolled())),
+    }
+}
+
+/// MySQL returns a DATE — not a DATETIME — from a date-unit interval step
+/// (`DAY`/`WEEK`/`MONTH`/`QUARTER`/`YEAR`) when the target has no time of day:
+/// `DATE_ADD(DATE '2026-06-15', INTERVAL 1 DAY)` is `'2026-06-16'`, while the same
+/// step on a value that carries a time keeps it. The engine's `datetime()` always
+/// renders `'YYYY-MM-DD HH:MM:SS'`, so wrap its result: when the original
+/// `target`'s text holds a time component (it contains a `:`) keep the datetime,
+/// otherwise truncate to the date with `date()`. The decision is made on the
+/// target's *own* text — not the result's — so a midnight datetime like
+/// `'2026-06-15 00:00:00'` stays a datetime, matching MySQL. A NULL target makes
+/// the test NULL, so the `CASE` falls to `date()` of the (also NULL) result, which
+/// is still NULL as MySQL propagates. A time-unit or compound step always yields a
+/// datetime and must not be passed through here.
+fn date_unit_result(target: &ast::Expr, datetime_result: ast::Expr) -> ast::Expr {
+    // `instr(target, ':') > 0` — a datetime/time string contains a `:` in its time
+    // of day, a bare date does not.
+    let has_time = ast::Expr::binary(
+        call_fn(
+            "instr",
+            vec![
+                target.clone(),
+                ast::Expr::Literal(ast::Literal::String(requote(":"))),
+            ],
+        ),
+        ast::Operator::Greater,
+        *numeric_expr("0"),
+    );
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(has_time), Box::new(datetime_result.clone()))],
+        else_expr: Some(Box::new(call_fn("date", vec![datetime_result]))),
     }
 }
 
@@ -13286,8 +13346,11 @@ mod tests {
     #[test]
     fn date_add_sub_lower_to_datetime_modifier() {
         // Each day/time interval lowers to datetime(target, '<signed-n> <unit>').
-        // (MONTH/YEAR steps add a clamping CASE — see
-        // `month_and_year_intervals_clamp_to_month_end`.)
+        // A date-unit step (DAY/WEEK) additionally wraps that call in a
+        // DATE/DATETIME selector CASE so a bare DATE returns a DATE (its THEN
+        // branch is the datetime() call — see `date_unit_result`); a time-unit
+        // step (HOUR/SECOND) is the plain call. (MONTH/YEAR steps also add a
+        // clamping CASE — see `month_and_year_intervals_clamp_to_month_end`.)
         let cases = [
             ("DATE_ADD(d, INTERVAL 5 DAY)", "'+5 days'"),
             ("DATE_SUB(d, INTERVAL 1 DAY)", "'-1 days'"),
@@ -13303,7 +13366,15 @@ mod tests {
             ("d - INTERVAL 3 HOUR", "'-3 hours'"),
         ];
         for (sql, modifier) in cases {
-            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+            // Unwrap the date-unit DATE/DATETIME selector (its THEN branch holds
+            // the datetime() call); a time-unit step is already the plain call.
+            let call = match parse_expr(sql).unwrap() {
+                ast::Expr::Case { when_then_pairs, .. } => {
+                    *when_then_pairs.into_iter().next().unwrap().1
+                }
+                other => other,
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = call else {
                 panic!("expected `{sql}` to lower to a datetime() call");
             };
             assert_eq!(name.as_str(), "datetime");
@@ -13334,13 +13405,29 @@ mod tests {
                 "expected `{sql}` to clamp via a CASE"
             );
         }
-        // Day and time steps never overflow, so they stay a plain datetime() call.
-        for sql in ["DATE_ADD(d, INTERVAL 5 DAY)", "DATE_ADD(d, INTERVAL 3 HOUR)"] {
-            assert!(
-                matches!(parse_expr(sql).unwrap(), ast::Expr::FunctionCall { .. }),
-                "expected `{sql}` to stay a plain datetime() call"
-            );
-        }
+        // A time-unit step never overflows and never carries a DATE/DATETIME
+        // selector, so it stays a plain datetime() call.
+        assert!(
+            matches!(
+                parse_expr("DATE_ADD(d, INTERVAL 3 HOUR)").unwrap(),
+                ast::Expr::FunctionCall { .. }
+            ),
+            "expected an hour step to stay a plain datetime() call"
+        );
+        // A day-unit step wraps in the DATE/DATETIME selector CASE, but its
+        // datetime() (the THEN branch) is unclamped — no month-end CASE.
+        let ast::Expr::Case { when_then_pairs, .. } =
+            parse_expr("DATE_ADD(d, INTERVAL 5 DAY)").unwrap()
+        else {
+            panic!("expected a day step to wrap in a DATE/DATETIME selector CASE");
+        };
+        assert!(
+            matches!(
+                when_then_pairs[0].1.as_ref(),
+                ast::Expr::FunctionCall { name, .. } if name.as_str() == "datetime"
+            ),
+            "expected the day step's selector to hold a plain datetime() call"
+        );
     }
 
     #[test]
@@ -13501,13 +13588,19 @@ mod tests {
             parse_expr("DATE_SUB(d, INTERVAL 1 DAY)").unwrap()
         );
 
-        // The integer-days form lowers to a NULL-guarded datetime(printf(...))
-        // shift; the ELSE branch is the datetime() call.
+        // The integer-days form lowers to a NULL-guarded shift; the ELSE branch
+        // is the DATE/DATETIME selector (a whole-day step is a date unit), whose
+        // THEN branch is the datetime(printf(...)) call.
         let ast::Expr::Case { else_expr, .. } = parse_expr("ADDDATE(d, 5)").unwrap() else {
             panic!("expected ADDDATE(d, n) to lower to a guarded CASE");
         };
-        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
-            panic!("expected the ELSE branch to be a datetime() call");
+        let ast::Expr::Case { when_then_pairs, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE branch to be a DATE/DATETIME selector CASE");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } =
+            *when_then_pairs.into_iter().next().unwrap().1
+        else {
+            panic!("expected the selector's THEN branch to be a datetime() call");
         };
         assert_eq!(name.as_str(), "datetime");
         // datetime(target, printf('%+d days', n)).
@@ -13953,7 +14046,15 @@ mod tests {
             ("TIMESTAMPADD(QUARTER, 1, d)", "'+3 months'"),
             ("TIMESTAMPADD(MINUTE, -30, d)", "'-30 minutes'"),
         ] {
-            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+            // A date-unit step wraps its datetime() in a DATE/DATETIME selector
+            // CASE (THEN branch); a time-unit step is the plain call.
+            let call = match parse_expr(sql).unwrap() {
+                ast::Expr::Case { when_then_pairs, .. } => {
+                    *when_then_pairs.into_iter().next().unwrap().1
+                }
+                other => other,
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = call else {
                 panic!("expected `{sql}` to lower to datetime()");
             };
             assert_eq!(name.as_str(), "datetime");

@@ -1,0 +1,91 @@
+# DATE_ADD / DATE_SUB / ADDDATE / SUBDATE / TIMESTAMPADD return-type fidelity.
+#
+# MySQL's interval arithmetic returns a DATE (no time of day) — not a DATETIME —
+# when the target has no time component AND the interval is a date unit
+# (DAY/WEEK/MONTH/QUARTER/YEAR). With a time unit (HOUR/MINUTE/SECOND/compound),
+# or a target that carries a time, the result is a DATETIME. The front-end
+# lowers a date-unit step to date(...) when the target's text has no time
+# component (no `:`) and to datetime(...) otherwise, so a bare DATE input keeps
+# MySQL's DATE result while a DATETIME input keeps the time.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# A bare DATE input with a date-unit interval returns a DATE (no `00:00:00`).
+query
+SELECT DATE_ADD('2026-06-15', INTERVAL 1 DAY), DATE_ADD('2026-06-15', INTERVAL 2 WEEK)
+----
+2026-06-16	2026-06-29
+
+query
+SELECT DATE_ADD('2026-06-15', INTERVAL 1 MONTH), DATE_ADD('2026-06-15', INTERVAL 1 YEAR)
+----
+2026-07-15	2027-06-15
+
+# DATE_SUB and the ADDDATE/SUBDATE INTERVAL spellings behave identically.
+query
+SELECT DATE_SUB('2026-06-15', INTERVAL 2 DAY), ADDDATE('2026-06-15', INTERVAL 1 DAY), SUBDATE('2026-06-15', INTERVAL 1 DAY)
+----
+2026-06-13	2026-06-16	2026-06-14
+
+# The ADDDATE/SUBDATE whole-day numeric form is a date unit too.
+query
+SELECT ADDDATE('2026-06-15', 7), SUBDATE('2026-06-15', 7)
+----
+2026-06-22	2026-06-08
+
+# The `date + INTERVAL` / `date - INTERVAL` operator forms, and TIMESTAMPADD.
+query
+SELECT '2026-06-15' + INTERVAL 1 DAY, '2026-06-15' - INTERVAL 1 MONTH, TIMESTAMPADD(DAY, 1, '2026-06-15')
+----
+2026-06-16	2026-05-15	2026-06-16
+
+# A time-unit interval always yields a DATETIME, even on a bare DATE input.
+query
+SELECT DATE_ADD('2026-06-15', INTERVAL 1 HOUR), DATE_ADD('2026-06-15', INTERVAL 30 SECOND)
+----
+2026-06-15 01:00:00	2026-06-15 00:00:30
+
+# A compound interval is a time-bearing unit, so the result is a DATETIME.
+query
+SELECT DATE_ADD('2026-06-15', INTERVAL '1:30' HOUR_MINUTE)
+----
+2026-06-15 01:30:00
+
+# A target that already carries a time keeps the time (DATETIME result), even at
+# midnight: the type is decided by the input's text, not the result's value.
+query
+SELECT DATE_ADD('2026-06-15 08:30:00', INTERVAL 1 DAY), DATE_ADD('2026-06-15 00:00:00', INTERVAL 1 DAY)
+----
+2026-06-16 08:30:00	2026-06-16 00:00:00
+
+# Month-end clamping still applies, and preserves the DATE vs DATETIME type: a
+# bare DATE clamps to a DATE, a DATETIME keeps its time.
+query
+SELECT DATE_ADD('2026-01-31', INTERVAL 1 MONTH), DATE_ADD('2026-01-31 09:15:00', INTERVAL 1 MONTH)
+----
+2026-02-28	2026-02-28 09:15:00
+
+# A stored DATE column returns a DATE; a DATETIME column keeps its time. This is
+# the WordPress shape: shifting post/comment date columns by an interval.
+statement ok
+CREATE TABLE IF NOT EXISTS rettype_demo (id INT PRIMARY KEY, d DATE, dt DATETIME)
+
+statement ok
+INSERT INTO rettype_demo (id, d, dt) VALUES (1, '2026-06-15', '2026-06-15 08:30:00')
+
+query
+SELECT DATE_ADD(d, INTERVAL 1 DAY), DATE_ADD(dt, INTERVAL 1 DAY) FROM rettype_demo
+----
+2026-06-16	2026-06-16 08:30:00
+
+query
+SELECT ADDDATE(d, 5), d + INTERVAL 1 MONTH FROM rettype_demo
+----
+2026-06-20	2026-07-15
+
+# NULL propagates regardless of the return type.
+query
+SELECT DATE_ADD(NULL, INTERVAL 1 DAY), ADDDATE('2026-06-15', NULL)
+----
+NULL	NULL

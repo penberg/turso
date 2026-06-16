@@ -9,9 +9,9 @@
 # string (`INTERVAL '30' SECOND`, which WordPress emits and MySQL coerces).
 # MONTH/YEAR/QUARTER arithmetic that overflows a shorter month is clamped to that
 # month's last day, as in MySQL (the engine would otherwise roll into the next
-# month). The one remaining divergence, avoided here, is that on a bare DATE
-# value MySQL returns a DATE (no time) while the engine keeps the `00:00:00`
-# time, so the clamp cases below use DATETIME inputs (see mysql/COMPAT.md).
+# month). A date-unit step on a bare DATE value returns a DATE while a DATETIME
+# value keeps its time; that return-type fidelity is covered in
+# date_add_return_type.test, so the clamp cases here use DATETIME inputs.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
