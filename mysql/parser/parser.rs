@@ -3088,6 +3088,13 @@ impl Parser {
                 self.advance();
                 Ok(ast::Expr::Literal(ast::Literal::String(lit)))
             }
+            // A MySQL hex literal (`0x41` / `X'41'`) is a binary string; lower it
+            // to the engine's blob literal, which holds the same hex digits.
+            Some(Token::Blob(b)) => {
+                let b = b.clone();
+                self.advance();
+                Ok(ast::Expr::Literal(ast::Literal::Blob(b)))
+            }
             // A `?` positional placeholder, bound at execution time. Each one
             // takes the next 1-based parameter index in appearance order.
             Some(Token::Param) => {
@@ -7114,6 +7121,23 @@ mod tests {
             panic!("expected OneSelect::Select");
         };
         assert!(from.is_none());
+    }
+
+    #[test]
+    fn hex_literal_lowers_to_blob() {
+        // `0x41` and `X'41'` lower to the engine's blob literal with the same
+        // hex digits.
+        for sql in ["0x41", "X'41'", "x'41'"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::Literal(ast::Literal::Blob(b)) if b == "41"),
+                "expected `{sql}` to lower to Blob(\"41\")"
+            );
+        }
+        // An odd-length `0x` literal is left-padded to even.
+        assert!(matches!(
+            parse_expr("0xABC").unwrap(),
+            ast::Expr::Literal(ast::Literal::Blob(b)) if b == "0ABC"
+        ));
     }
 
     #[test]

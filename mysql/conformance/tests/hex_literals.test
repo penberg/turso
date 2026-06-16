@@ -1,0 +1,50 @@
+# MySQL hexadecimal literals: 0x41 and X'41' / x'41'.
+#
+# In MySQL a hex literal is a binary string: 0x48656C6C6F is 'Hello'. The
+# front-end previously mis-lexed `0x41` as the number 0 followed by an
+# identifier `x41`, silently returning the wrong value. It now lexes both the
+# `0x..` and `X'..'` forms into the engine's blob literal (same hex digits), so
+# they evaluate as the bytes they encode. An odd number of `0x` digits is
+# left-padded to even, as MySQL does.
+#
+# In a *string* context this matches MySQL exactly; in a numeric / bitwise
+# context MySQL coerces a hex literal to its integer value while the engine's
+# blob coerces to 0 -- a documented divergence, so this file stays in the string
+# domain. Expected to pass against both turso-mysql-server and a real mysqld.
+
+# The bytes of a hex literal spell out a string.
+query
+SELECT 0x48656C6C6F, X'576F726C64'
+----
+Hello	World
+
+# HEX() round-trips the literal; LENGTH() counts its bytes.
+query
+SELECT HEX(0x4142), HEX(X'48656C6C6F'), LENGTH(0x414243)
+----
+4142	48656C6C6F	3
+
+# An odd digit count is left-padded to even (0xABC behaves as 0x0ABC).
+query
+SELECT HEX(0xABC)
+----
+0ABC
+
+# The 0x and X'' spellings produce the same blob, so they compare equal.
+query
+SELECT 0x41 = X'41', 0x4142 = 0x4142
+----
+1	1
+
+# Usable as a column value, stored and read back as its bytes.
+statement ok
+CREATE TABLE IF NOT EXISTS hexlit_demo (id INT PRIMARY KEY, b BLOB)
+
+statement ok
+INSERT INTO hexlit_demo (id, b) VALUES (1, 0x48656C6C6F), (2, X'4F4B')
+
+query
+SELECT id, b, HEX(b) FROM hexlit_demo ORDER BY id
+----
+1	Hello	48656C6C6F
+2	OK	4F4B

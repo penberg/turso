@@ -15,6 +15,10 @@ pub enum Token {
     Str(String),
     /// A numeric literal, kept verbatim.
     Num(String),
+    /// A hexadecimal literal — MySQL `0x41` or `X'41'` — holding the (even-length)
+    /// hex digits. MySQL types these as a binary string, so they lower to the
+    /// engine's blob literal.
+    Blob(String),
     /// `(`
     LParen,
     /// `)`
@@ -71,6 +75,7 @@ impl Token {
             Token::QuotedIdent(s) => format!("identifier `{s}`"),
             Token::Str(_) => "a string literal".to_string(),
             Token::Num(n) => format!("number `{n}`"),
+            Token::Blob(b) => format!("hex literal `0x{b}`"),
             Token::LParen => "`(`".to_string(),
             Token::RParen => "`)`".to_string(),
             Token::Comma => "`,`".to_string(),

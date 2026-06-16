@@ -89,6 +89,9 @@ impl<'a> Lexer<'a> {
             b'`' => self.read_delimited(b'`', "identifier")?,
             b'"' => self.read_delimited(b'"', "identifier")?,
             b'\'' => self.read_string()?,
+            // MySQL hex-string literal `X'41'` / `x'41'` — checked before the
+            // identifier path, which `x` would otherwise take.
+            b'x' | b'X' if self.peek_at(1) == Some(b'\'') => self.read_hex_string()?,
             c if c.is_ascii_digit() => self.read_number(),
             c if is_ident_start(c) => self.read_word(),
             other => self.single(Token::Other(other as char)),
@@ -163,6 +166,24 @@ impl<'a> Lexer<'a> {
 
     fn read_number(&mut self) -> Token {
         let start = self.pos;
+        // MySQL hex literal `0x41` — a binary string, not an integer. Requires at
+        // least one hex digit after `0x`; otherwise fall through to a plain `0`.
+        if self.peek() == Some(b'0')
+            && matches!(self.peek_at(1), Some(b'x') | Some(b'X'))
+            && matches!(self.peek_at(2), Some(c) if c.is_ascii_hexdigit())
+        {
+            self.pos += 2; // `0x`
+            let hex_start = self.pos;
+            while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
+                self.pos += 1;
+            }
+            let mut hex = String::from_utf8_lossy(&self.input[hex_start..self.pos]).into_owned();
+            // MySQL left-pads an odd number of digits to an even count.
+            if hex.len() % 2 == 1 {
+                hex.insert(0, '0');
+            }
+            return Token::Blob(hex);
+        }
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.pos += 1;
         }
@@ -184,6 +205,32 @@ impl<'a> Lexer<'a> {
         }
         let s = String::from_utf8_lossy(&self.input[start..self.pos]).into_owned();
         Token::Num(s)
+    }
+
+    /// Reads a MySQL hex-string literal `X'41'` / `x'41'` (the `x`/`X` and
+    /// opening quote are at the cursor). Like MySQL, the digit count must be
+    /// even — `X'4'` is an error — and an empty `X''` is a valid empty blob.
+    fn read_hex_string(&mut self) -> Result<Token> {
+        let start = self.pos;
+        self.pos += 2; // `x` and the opening `'`
+        let hex_start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
+            self.pos += 1;
+        }
+        let hex = String::from_utf8_lossy(&self.input[hex_start..self.pos]).into_owned();
+        if self.peek() != Some(b'\'') {
+            return Err(ParseError::Unterminated {
+                offset: start,
+                kind: "hex literal",
+            });
+        }
+        self.pos += 1; // closing `'`
+        if hex.len() % 2 == 1 {
+            return Err(ParseError::Unsupported(format!(
+                "hex literal X'{hex}' must contain an even number of digits"
+            )));
+        }
+        Ok(Token::Blob(hex))
     }
 
     /// Reads a delimited identifier (backtick or double quote). The delimiter is
@@ -350,6 +397,23 @@ mod tests {
 
     fn word(w: &str) -> Token {
         Token::Word(w.to_string())
+    }
+
+    #[test]
+    fn hex_literals_lex_to_blob() {
+        // `0x..` and `X'..'` / `x'..'` are hex (blob) literals, not `0` + `x..`.
+        assert_eq!(tokens("0x41"), vec![Token::Blob("41".into())]);
+        assert_eq!(tokens("0X4142"), vec![Token::Blob("4142".into())]);
+        assert_eq!(tokens("X'41'"), vec![Token::Blob("41".into())]);
+        assert_eq!(tokens("x'4142'"), vec![Token::Blob("4142".into())]);
+        // An odd number of `0x` digits is left-padded to even (as MySQL does).
+        assert_eq!(tokens("0xABC"), vec![Token::Blob("0ABC".into())]);
+        // `0x` with no hex digit is a plain `0` followed by an identifier.
+        assert_eq!(tokens("0xZ"), vec![Token::Num("0".into()), word("xZ")]);
+        // A space breaks the `x'..'` form into an identifier and a string.
+        assert_eq!(tokens("x '41'"), vec![word("x"), Token::Str("41".into())]);
+        // An odd-length `X'..'` is rejected.
+        assert!(Lexer::new(b"X'4'").tokenize().is_err());
     }
 
     #[test]
