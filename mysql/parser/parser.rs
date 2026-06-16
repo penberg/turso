@@ -7682,8 +7682,9 @@ impl Parser {
     /// modifier as `DATE_ADD(dt, INTERVAL value unit)` (see
     /// [`Self::apply_interval`]). The value must be an integer literal (optionally
     /// signed). As with `DATE_ADD`, a date-unit step on a bare DATE argument
-    /// returns a DATE (see `date_unit_result`); month/year overflow is not clamped
-    /// here, unlike `DATE_ADD`. `MICROSECOND` and any unit without an engine
+    /// returns a DATE (see `date_unit_result`), and a `MONTH`/`QUARTER`/`YEAR` step
+    /// that overflows a shorter month is clamped to that month's last day (see
+    /// `clamp_month_overflow`). `MICROSECOND` and any unit without an engine
     /// modifier are rejected. Exactly three arguments are required.
     fn timestampadd_call(&mut self) -> Result<ast::Expr> {
         let Some(Token::Word(u)) = self.peek() else {
@@ -7715,19 +7716,19 @@ impl Parser {
             amount = -amount;
         }
         let modifier = format!("{amount:+} {engine_unit}");
-        let shifted = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("datetime"),
-            distinctness: None,
-            args: vec![
-                Box::new(target.clone()),
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote(&modifier)))),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+        // Mirror `build_interval`: a month/year step that overflows a shorter
+        // target month is clamped to that month's last day (`Jan 31 + 1 month` →
+        // `Feb 28`), as in MySQL, while a day/time step is a plain `datetime()`.
+        let shifted = if engine_unit == "months" || engine_unit == "years" {
+            clamp_month_overflow(target.clone(), &modifier)
+        } else {
+            call_fn(
+                "datetime",
+                vec![
+                    target.clone(),
+                    ast::Expr::Literal(ast::Literal::String(requote(&modifier))),
+                ],
+            )
         };
         // A date-unit step returns a DATE on a bare DATE target; a time-unit step
         // always returns a datetime (MySQL) — see `date_unit_result`.
@@ -14194,18 +14195,15 @@ mod tests {
 
     #[test]
     fn timestampadd_lowers_to_datetime_modifier() {
-        // TIMESTAMPADD(unit, n, dt) -> datetime(dt, '+<n × mult> <engine-unit>'),
-        // matching DATE_ADD(dt, INTERVAL n unit). WEEK and QUARTER scale the
-        // amount (7 days, 3 months).
+        // A day/time unit lowers to datetime(dt, '+<n × mult> <engine-unit>')
+        // (WEEK scales to 7 days); a date unit (DAY) wraps the call in the
+        // DATE/DATETIME selector CASE, whose THEN branch is that datetime() call.
         for (sql, modifier) in [
             ("TIMESTAMPADD(DAY, 5, d)", "'+5 days'"),
             ("TIMESTAMPADD(HOUR, 2, d)", "'+2 hours'"),
             ("TIMESTAMPADD(WEEK, 1, d)", "'+7 days'"),
-            ("TIMESTAMPADD(QUARTER, 1, d)", "'+3 months'"),
             ("TIMESTAMPADD(MINUTE, -30, d)", "'-30 minutes'"),
         ] {
-            // A date-unit step wraps its datetime() in a DATE/DATETIME selector
-            // CASE (THEN branch); a time-unit step is the plain call.
             let call = match parse_expr(sql).unwrap() {
                 ast::Expr::Case { when_then_pairs, .. } => {
                     *when_then_pairs.into_iter().next().unwrap().1
@@ -14221,11 +14219,20 @@ mod tests {
                 "wrong modifier for `{sql}`"
             );
         }
-        // TIMESTAMPADD matches the equivalent DATE_ADD lowering.
-        assert_eq!(
-            parse_expr("TIMESTAMPADD(DAY, 5, d)").unwrap(),
-            parse_expr("DATE_ADD(d, INTERVAL 5 DAY)").unwrap()
-        );
+        // TIMESTAMPADD shares the DATE_ADD lowering exactly — same scaling (QUARTER
+        // → 3 months), and the same month-end clamp on a MONTH/QUARTER/YEAR step.
+        for (ts, da) in [
+            ("TIMESTAMPADD(DAY, 5, d)", "DATE_ADD(d, INTERVAL 5 DAY)"),
+            ("TIMESTAMPADD(MONTH, 1, d)", "DATE_ADD(d, INTERVAL 1 MONTH)"),
+            ("TIMESTAMPADD(QUARTER, 1, d)", "DATE_ADD(d, INTERVAL 1 QUARTER)"),
+            ("TIMESTAMPADD(YEAR, 2, d)", "DATE_ADD(d, INTERVAL 2 YEAR)"),
+        ] {
+            assert_eq!(
+                parse_expr(ts).unwrap(),
+                parse_expr(da).unwrap(),
+                "`{ts}` should lower like `{da}`"
+            );
+        }
         // A unit without an engine modifier and a non-literal amount are rejected.
         assert!(parse_expr("TIMESTAMPADD(MICROSECOND, 1, d)").is_err());
         assert!(parse_expr("TIMESTAMPADD(DAY, x, d)").is_err());

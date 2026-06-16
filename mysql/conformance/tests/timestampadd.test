@@ -7,9 +7,10 @@
 # integer literal.
 #
 # Scope: exercised on DATETIME values so both targets return 'YYYY-MM-DD
-# HH:MM:SS'. As with DATE_ADD, a bare DATE keeps the engine's 00:00:00 time, and
-# MONTH/QUARTER/YEAR arithmetic that overflows a month end clamps in MySQL but
-# rolls over in the engine -- both diverge and are avoided here.
+# HH:MM:SS'. MONTH/QUARTER/YEAR arithmetic that overflows a shorter month is
+# clamped to that month's last day (like DATE_ADD), as in MySQL. The DATE-vs-
+# DATETIME return type on a bare DATE argument is covered by
+# date_add_return_type.test.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -37,11 +38,26 @@ SELECT TIMESTAMPADD(WEEK, 1, d), TIMESTAMPADD(MONTH, 2, d), TIMESTAMPADD(QUARTER
 ----
 2020-01-22 10:20:30	2020-03-15 10:20:30	2020-04-15 10:20:30
 
-# It matches DATE_ADD with the equivalent INTERVAL.
+# A MONTH/QUARTER/YEAR step that overflows a shorter month clamps to that month's
+# last day (Jan 31 + 1 month is Feb 28, not the rolled-over March), keeping the
+# time -- the same clamp DATE_ADD applies. A leap day clamps in a non-leap year.
 query
-SELECT TIMESTAMPADD(DAY, 3, d) = DATE_ADD(d, INTERVAL 3 DAY) FROM tsa_demo
+SELECT TIMESTAMPADD(MONTH, 1, '2026-01-31 09:15:00'), TIMESTAMPADD(QUARTER, 1, '2026-01-31'), TIMESTAMPADD(YEAR, 1, '2024-02-29')
 ----
-1
+2026-02-28 09:15:00	2026-04-30	2025-02-28
+
+# A negative step clamps the same way, and a step that does not overflow is
+# unchanged.
+query
+SELECT TIMESTAMPADD(MONTH, -1, '2026-03-31'), TIMESTAMPADD(MONTH, 1, '2026-01-15')
+----
+2026-02-28	2026-02-15
+
+# It matches DATE_ADD with the equivalent INTERVAL, including the clamp.
+query
+SELECT TIMESTAMPADD(DAY, 3, d) = DATE_ADD(d, INTERVAL 3 DAY), TIMESTAMPADD(MONTH, 1, '2026-01-31') = DATE_ADD('2026-01-31', INTERVAL 1 MONTH) FROM tsa_demo
+----
+1	1
 
 # NULL propagates.
 query
