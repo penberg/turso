@@ -1,0 +1,66 @@
+# MAKE_SET(bits, s1, s2, ...) conformance.
+#
+# MySQL's MAKE_SET returns the comma-separated set of the strings whose
+# corresponding bit in `bits` is set: s1 when bit 0 is on, s2 when bit 1 is on,
+# and so on. The front-end lowers it to
+# CONCAT_WS(',', CASE WHEN bits & 1 THEN s1 END, CASE WHEN bits & 2 THEN s2 END,
+# ...): each string appears only when its bit is set, CONCAT_WS skips the unset
+# (NULL) slots and any NULL string, and an outer guard returns NULL for a NULL
+# bitmask.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Brackets
+# make the empty-string result visible. Uses its own table name.
+
+# Bits 0 and 2 select the first and third strings.
+query
+SELECT MAKE_SET(5, 'a', 'b', 'c')
+----
+a,c
+
+# The bitmask may be written as an OR of powers of two; bit 1 alone selects the
+# second string.
+query
+SELECT MAKE_SET(1 | 4, 'hello', 'nice', 'world'), MAKE_SET(2, 'a', 'b', 'c')
+----
+hello,world	b
+
+# Zero selects nothing (the empty string), and a string whose bit is unset is
+# omitted even though earlier ones are present.
+query
+SELECT CONCAT('[', MAKE_SET(0, 'a', 'b'), ']'), MAKE_SET(1, 'a', 'b', 'c')
+----
+[]	a
+
+# A NULL string is skipped even when its bit is set (here bit 1).
+query
+SELECT MAKE_SET(7, 'a', NULL, 'c')
+----
+a,c
+
+# A NULL bitmask yields NULL (not the empty string).
+query
+SELECT MAKE_SET(NULL, 'a', 'b') IS NULL
+----
+1
+
+# All bits set (-1) selects every string.
+query
+SELECT MAKE_SET(-1, 'a', 'b', 'c')
+----
+a,b,c
+
+# Usable over a column: render the permissions a flag bitmask selects. The
+# brackets keep the empty (flags = 0) result a visible field.
+statement ok
+CREATE TABLE IF NOT EXISTS mkset_demo (id INT PRIMARY KEY, flags INT)
+
+statement ok
+INSERT INTO mkset_demo (id, flags) VALUES (1, 5), (2, 2), (3, 0), (4, 7)
+
+query
+SELECT id, CONCAT('[', MAKE_SET(flags, 'read', 'write', 'exec'), ']') FROM mkset_demo ORDER BY id
+----
+1	[read,exec]
+2	[write]
+3	[]
+4	[read,write,exec]

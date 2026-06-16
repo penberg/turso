@@ -3706,6 +3706,12 @@ impl Parser {
             return self.elt_call();
         }
 
+        // `MAKE_SET(bits, s1, s2, ...)` joins the strings whose corresponding bit
+        // in `bits` is set, comma-separated (see `make_set_call`).
+        if upper == "MAKE_SET" {
+            return self.make_set_call();
+        }
+
         // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
         // comma-separated `strlist`, or 0; synthesized from comma-wrapped
         // string surgery.
@@ -4219,6 +4225,58 @@ impl Parser {
             base: Some(Box::new(index)),
             when_then_pairs,
             else_expr: None,
+        })
+    }
+
+    /// Parses a `MAKE_SET(bits, s1, s2, ...)` call (the name and `(` are already
+    /// consumed) and lowers it to the comma-joined set of the strings whose
+    /// corresponding bit in `bits` is set: string `s_i` (1-based `i`) is in the
+    /// result when bit `i-1` of `bits` is on.
+    ///
+    /// The lowering is `CONCAT_WS(',', CASE WHEN bits & 1 THEN s1 END,
+    /// CASE WHEN bits & 2 THEN s2 END, ...)`. Each `CASE` yields its string when
+    /// the bit is set and NULL otherwise; `CONCAT_WS` joins the present strings
+    /// with `,` and skips the NULL (unset) slots — and also skips a NULL string
+    /// argument even when its bit is set, exactly as MySQL does. A NULL `bits`
+    /// makes every `bits & mask` NULL, so `CONCAT_WS` would return the empty
+    /// string; an outer guard restores MySQL's NULL result. At least one string
+    /// argument is required; strings past the 64th cannot be addressed by the
+    /// 64-bit mask and are dropped (their bit is always zero).
+    fn make_set_call(&mut self) -> Result<ast::Expr> {
+        let bits = self.expr()?;
+        let mut strings = Vec::new();
+        while self.eat(&Token::Comma) {
+            strings.push(self.expr()?);
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        if strings.is_empty() {
+            return Err(ParseError::Unsupported(
+                "MAKE_SET() requires at least one string argument".to_string(),
+            ));
+        }
+
+        let mut args = vec![ast::Expr::Literal(ast::Literal::String(requote(",")))];
+        for (i, s) in strings.into_iter().enumerate() {
+            if i >= 64 {
+                break;
+            }
+            let mask = ast::Expr::Literal(ast::Literal::Numeric((1u64 << i).to_string()));
+            let test = ast::Expr::binary(bits.clone(), ast::Operator::BitwiseAnd, mask);
+            args.push(ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(Box::new(test), Box::new(s))],
+                else_expr: None,
+            });
+        }
+        let joined = call_fn("concat_ws", args);
+
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(bits)),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(joined)),
         })
     }
 
@@ -10677,6 +10735,48 @@ mod tests {
         // ELT requires the index plus at least one string.
         assert!(matches!(
             parse_expr("ELT(1)").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn make_set_lowers_to_concat_ws_of_bit_cases() {
+        // MAKE_SET(bits, a, b, c) -> CASE WHEN bits IS NULL THEN NULL ELSE
+        // concat_ws(',', CASE WHEN bits & 1 THEN a END, ..., bits & 4 ...) END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("MAKE_SET(bits, 'a', 'b', 'c')").unwrap()
+        else {
+            panic!("expected MAKE_SET to lower to a CASE");
+        };
+        assert!(base.is_none());
+        // The outer guard is the NULL-bits check.
+        assert_eq!(when_then_pairs.len(), 1);
+        assert_eq!(*when_then_pairs[0].1, ast::Expr::Literal(ast::Literal::Null));
+
+        // The ELSE is concat_ws(',', <three bit CASEs>).
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE to be concat_ws()");
+        };
+        assert_eq!(name.as_str(), "concat_ws");
+        assert_eq!(args.len(), 4); // separator + three strings
+        assert_eq!(*args[0], ast::Expr::Literal(ast::Literal::String("','".to_string())));
+        // Each remaining arg is a `bits & 2^i` test guarding the string.
+        for (i, arg) in args[1..].iter().enumerate() {
+            let ast::Expr::Case { when_then_pairs, .. } = arg.as_ref() else {
+                panic!("expected a bit-test CASE");
+            };
+            let ast::Expr::Binary(_, ast::Operator::BitwiseAnd, mask) = &*when_then_pairs[0].0 else {
+                panic!("expected a `bits & mask` test");
+            };
+            assert_eq!(**mask, num(&(1u64 << i).to_string()));
+        }
+
+        // At least one string argument is required.
+        assert!(matches!(
+            parse_expr("MAKE_SET(5)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
     }
