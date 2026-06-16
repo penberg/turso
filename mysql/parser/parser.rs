@@ -4266,6 +4266,12 @@ impl Parser {
             return self.isnull_call();
         }
 
+        // `NULLIF(x, y)` is NULL when `x` equals `y` (case-insensitively, like
+        // MySQL's default collation), else `x` (see `nullif_call`).
+        if upper == "NULLIF" {
+            return self.nullif_call();
+        }
+
         // `MOD(a, b)` is the function spelling of the `a MOD b` operator; MySQL
         // defines them identically, so lower it the same way (exact for floats,
         // unlike the engine's `%`).
@@ -5525,6 +5531,35 @@ impl Parser {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(ast::Expr::is_null(arg))
+    }
+
+    /// Parses `NULLIF(x, y)` (the name and `(` are already consumed) and lowers it
+    /// to `CASE WHEN x = (y COLLATE NOCASE) THEN NULL ELSE x END` — NULL when `x`
+    /// equals `y`, else `x`. The `COLLATE NOCASE` makes the equality fold ASCII
+    /// case on a string comparison, like MySQL's default collation
+    /// (`NULLIF('a', 'A')` is NULL), and is ignored for a numeric operand. The
+    /// engine's own `nullif` compares case-sensitively, hence the explicit
+    /// lowering. A NULL `x` (where `x = y` is NULL, not true) returns `x` (NULL),
+    /// and a NULL `y` returns `x`, both as in MySQL. Exactly two arguments are
+    /// required.
+    fn nullif_call(&mut self) -> Result<ast::Expr> {
+        let x = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let y = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let equal = ast::Expr::binary(
+            x.clone(),
+            ast::Operator::Equals,
+            ast::Expr::collate(y, ast::Name::from_string("NOCASE")),
+        );
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(equal),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(x)),
+        })
     }
 
     /// Parses an `INSTR(str, substr)` or `LOCATE(substr, str[, pos])` call (the
@@ -9173,8 +9208,9 @@ fn sorted_column_name(sc: &ast::SortedColumn) -> &str {
 fn is_supported_function(upper_name: &str) -> bool {
     matches!(
         upper_name,
-        // Scalar functions.
-        "COALESCE" | "NULLIF" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
+        // Scalar functions. (`NULLIF` is handled by `nullif_call`, which compares
+        // case-insensitively like MySQL's default collation.)
+        "COALESCE" | "IFNULL" | "ABS" | "LOWER" | "UPPER"
         // String functions sharing both name and behaviour with the engine.
         // `LTRIM`/`RTRIM` strip leading/trailing spaces (their one-argument
         // MySQL form), like the engine's same-named functions. (`TRIM` and

@@ -28,6 +28,26 @@ SELECT NULLIF(5, 3)
 ----
 5
 
+# The equality is case-insensitive (MySQL's default collation): two strings that
+# differ only in case are equal, so NULLIF yields NULL.
+query
+SELECT NULLIF('a', 'A'), NULLIF('Hello', 'hello'), NULLIF('apple', 'apple')
+----
+NULL	NULL	NULL
+
+# Unequal strings (and the first argument's case is preserved when returned).
+query
+SELECT NULLIF('a', 'b'), NULLIF('Cat', 'dog')
+----
+a	Cat
+
+# NULL handling: NULLIF(NULL, y) is NULL, and NULLIF(x, NULL) is x (x = NULL is
+# never true).
+query
+SELECT NULLIF(NULL, 1), NULLIF('keep', NULL)
+----
+NULL	keep
+
 # IFNULL — second argument when the first is NULL.
 query
 SELECT IFNULL(NULL, 7)
