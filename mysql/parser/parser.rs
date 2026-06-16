@@ -2013,12 +2013,18 @@ impl Parser {
         // meta_key NOT LIKE '_%'`. The engine rejects a non-aggregate `HAVING`,
         // so fold such a `HAVING` into the `WHERE` clause, where its row filtering
         // is equivalent. An aggregate `HAVING` is a whole-table aggregate the
-        // engine handles, so it stays in place.
+        // engine handles, so it stays in place — including one that filters on an
+        // aggregate via its SELECT-list alias (`SELECT COUNT(*) c ... HAVING
+        // c > 3`), which must not be folded into `WHERE` (an aggregate is not
+        // allowed there).
         let (where_clause, group_by) = match group_by {
             Some(ast::GroupBy {
                 exprs,
                 having: Some(having),
-            }) if exprs.is_empty() && !expr_contains_aggregate(&having) => {
+            }) if exprs.is_empty()
+                && !expr_contains_aggregate(&having)
+                && !expr_references_name(&having, &aggregate_alias_names(&columns)) =>
+            {
                 let combined = match where_clause {
                     Some(w) => ast::Expr::binary(*w, ast::Operator::And, *having),
                     None => *having,
@@ -8448,6 +8454,78 @@ fn is_window_function(upper_name: &str) -> bool {
 /// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
 /// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
 /// descended into — an aggregate there belongs to the subquery, not this clause.
+/// The lowercased SELECT-list aliases whose defining expression is an aggregate
+/// (e.g. the `c` in `SELECT COUNT(*) c`). Used to recognize a `HAVING` that
+/// filters on an aggregate through its alias.
+fn aggregate_alias_names(columns: &[ast::ResultColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter_map(|column| match column {
+            ast::ResultColumn::Expr(expr, Some(as_)) if expr_contains_aggregate(expr) => {
+                let (ast::As::As(name)
+                | ast::As::Elided(name)
+                | ast::As::ImplicitColumnName(name)) = as_;
+                Some(name.as_str().to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `expr` references any of `names` as a bare identifier (compared
+/// case-insensitively). Mirrors [`expr_contains_aggregate`]'s traversal.
+fn expr_references_name(expr: &ast::Expr, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    match expr {
+        ast::Expr::Id(name) => names.iter().any(|n| n.eq_ignore_ascii_case(name.as_str())),
+        ast::Expr::FunctionCall { args, .. } => {
+            args.iter().any(|a| expr_references_name(a, names))
+        }
+        ast::Expr::Binary(l, _, r) => {
+            expr_references_name(l, names) || expr_references_name(r, names)
+        }
+        ast::Expr::Unary(_, e)
+        | ast::Expr::IsNull(e)
+        | ast::Expr::NotNull(e)
+        | ast::Expr::Collate(e, _)
+        | ast::Expr::Cast { expr: e, .. } => expr_references_name(e, names),
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            expr_references_name(lhs, names)
+                || expr_references_name(start, names)
+                || expr_references_name(end, names)
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            expr_references_name(lhs, names)
+                || expr_references_name(rhs, names)
+                || escape.as_deref().is_some_and(|e| expr_references_name(e, names))
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            expr_references_name(lhs, names) || rhs.iter().any(|e| expr_references_name(e, names))
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            exprs.iter().any(|e| expr_references_name(e, names))
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_deref().is_some_and(|e| expr_references_name(e, names))
+                || when_then_pairs
+                    .iter()
+                    .any(|(w, t)| expr_references_name(w, names) || expr_references_name(t, names))
+                || else_expr.as_deref().is_some_and(|e| expr_references_name(e, names))
+        }
+        _ => false,
+    }
+}
+
 fn expr_contains_aggregate(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::FunctionCallStar { .. } => true,
@@ -9636,6 +9714,39 @@ mod tests {
         };
         assert!(group_by.exprs.is_empty());
         assert!(group_by.having.is_some());
+    }
+
+    #[test]
+    fn having_on_aggregate_alias_is_kept_not_folded() {
+        // A HAVING that filters on an aggregate via its SELECT-list alias stays a
+        // standalone HAVING (an aggregate cannot move into WHERE), whereas a
+        // non-aggregate HAVING is folded into WHERE.
+        let group_by_of = |sql: &str| {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select {
+                group_by,
+                where_clause,
+                ..
+            } = select.body.select
+            else {
+                panic!("expected a plain SELECT for `{sql}`");
+            };
+            (group_by, where_clause)
+        };
+
+        // `HAVING c > 3` where `c` is `COUNT(*)`: kept as a HAVING, no WHERE.
+        let (group_by, where_clause) = group_by_of("SELECT COUNT(*) c FROM t HAVING c > 3");
+        let group_by = group_by.expect("the aggregate-alias HAVING should be kept");
+        assert!(group_by.exprs.is_empty());
+        assert!(group_by.having.is_some());
+        assert!(where_clause.is_none());
+
+        // `HAVING d > 3` where `d` is the non-aggregate `id * 2`: folded into WHERE.
+        let (group_by, where_clause) = group_by_of("SELECT id * 2 d FROM t HAVING d > 3");
+        assert!(group_by.is_none(), "a non-aggregate HAVING should fold away");
+        assert!(where_clause.is_some(), "it should become a WHERE filter");
     }
 
     #[test]

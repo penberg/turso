@@ -5,6 +5,10 @@
 # GROUP BY carrying the HAVING; the engine evaluates it the same as MySQL,
 # returning the aggregate row when the condition holds and no rows otherwise.
 #
+# The aggregate condition may reference an aggregate through its SELECT-list
+# alias (`SELECT COUNT(*) c ... HAVING c > 2`); such a HAVING must stay in place,
+# not be folded into WHERE (an aggregate is not allowed there).
+#
 # MySQL also allows a non-aggregate HAVING with no GROUP BY -- a post-WHERE row
 # filter (WordPress's custom-fields query is `SELECT DISTINCT meta_key ... HAVING
 # meta_key NOT LIKE '_%'`). The engine rejects a non-aggregate HAVING, so the
@@ -35,6 +39,28 @@ query
 SELECT SUM(n) FROM hg_demo HAVING SUM(n) > 40
 ----
 45
+
+# The condition may reference the aggregate through its SELECT-list alias.
+query
+SELECT COUNT(*) c FROM hg_demo HAVING c > 2
+----
+3
+
+query
+SELECT MAX(n) m FROM hg_demo HAVING m > 20
+----
+25
+
+# An aggregate-alias condition that fails returns no rows.
+query
+SELECT COUNT(*) c FROM hg_demo HAVING c > 5
+----
+
+# A condition over more than one aggregate alias.
+query
+SELECT MIN(n) lo, MAX(n) hi FROM hg_demo HAVING hi - lo > 10
+----
+5	25
 
 # HAVING composes with a WHERE that narrows the group first.
 query
