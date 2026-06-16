@@ -1,0 +1,28 @@
+# SHOW COLUMNS strips the display width of integer types.
+#
+# MySQL 8.0 drops the display width from integer types in SHOW COLUMNS:
+# int(11) -> int, bigint(20) unsigned -> bigint unsigned, smallint(6) ->
+# smallint, and so on, keeping any unsigned suffix. The exceptions are
+# tinyint(1) (the canonical boolean, kept) and any zerofill column (the width is
+# kept there). Non-integer sizes (varchar, decimal) are unchanged. WordPress
+# schemas declare bigint(20) unsigned / int(11), and dbDelta compares this Type.
+#
+# Rows are tab-separated with a trailing tab for the empty Extra column. Expected
+# to pass against both turso-mysql-server and a real mysqld. Uses its own table.
+
+statement ok
+CREATE TABLE IF NOT EXISTS intwidth (i11 INT(11), i11u INT(11) UNSIGNED, big BIGINT(20) UNSIGNED, sm SMALLINT(6), b1 TINYINT(1), t4 TINYINT(4), vc VARCHAR(60), dec1 DECIMAL(10,2))
+
+# int(11) -> int; the unsigned suffix is kept; tinyint(1) and the non-integer
+# sizes are preserved.
+query
+SHOW COLUMNS FROM intwidth
+----
+i11	int	YES		NULL	
+i11u	int unsigned	YES		NULL	
+big	bigint unsigned	YES		NULL	
+sm	smallint	YES		NULL	
+b1	tinyint(1)	YES		NULL	
+t4	tinyint	YES		NULL	
+vc	varchar(60)	YES		NULL	
+dec1	decimal(10,2)	YES		NULL	

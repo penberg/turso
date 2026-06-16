@@ -307,6 +307,52 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
 /// it with SQLite-isms (e.g. `PRIMARY KEY (ID AUTOINCREMENT)`) that the MySQL
 /// front-end parser rejects, and only each column's leading `name type(size)` is
 /// needed, so the rest of every definition is ignored.
+/// Normalizes a column type for `SHOW COLUMNS`, matching MySQL 8.0's display:
+/// the type is lowercased, `integer` is rendered as `int`, and the **display
+/// width** of an integer type is stripped (`int(11)` → `int`, `bigint(20)
+/// unsigned` → `bigint unsigned`) — except `tinyint(1)` (kept, the canonical
+/// boolean) and any `zerofill` column (MySQL keeps the width there). Non-integer
+/// types (`varchar(60)`, `decimal(10,2)`, …) are returned lowercased, unchanged.
+fn normalize_column_type(ty: &str) -> String {
+    let lower = ty.trim().to_ascii_lowercase();
+    let base_end = lower
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(lower.len());
+    let base = if &lower[..base_end] == "integer" {
+        "int"
+    } else {
+        &lower[..base_end]
+    };
+    if !matches!(base, "int" | "tinyint" | "smallint" | "mediumint" | "bigint") {
+        return lower;
+    }
+
+    // The remainder after the base is `[(width)] [unsigned] [zerofill]`.
+    let rest = &lower[base_end..];
+    let (width, suffix) = match (rest.find('('), rest.find(')')) {
+        (Some(open), Some(close)) if close > open => {
+            (Some(&rest[open + 1..close]), rest[close + 1..].trim())
+        }
+        _ => (None, rest.trim()),
+    };
+    let keep_width =
+        suffix.contains("zerofill") || (base == "tinyint" && width == Some("1"));
+
+    let mut out = base.to_string();
+    if keep_width {
+        if let Some(w) = width {
+            out.push('(');
+            out.push_str(w);
+            out.push(')');
+        }
+    }
+    if !suffix.is_empty() {
+        out.push(' ');
+        out.push_str(suffix);
+    }
+    out
+}
+
 /// For each column that is the leading column of a non-primary index, its MySQL
 /// `Key` flag: `UNI` when it leads a unique index, `MUL` when it leads a
 /// non-unique one (`UNI` wins if it leads both). Keyed by lowercased column name.
@@ -851,8 +897,9 @@ impl ColumnInfo {
         } else {
             None
         };
-        // MySQL lowercases the type name in this output.
-        let ty = Some(self.ty.to_ascii_lowercase());
+        // MySQL lowercases the type and strips the display width of integer
+        // types (`int(11)` → `int`), which WordPress's dbDelta compares.
+        let ty = Some(normalize_column_type(&self.ty));
         let field = Some(self.name);
         if full {
             vec![
@@ -1415,6 +1462,32 @@ mod tests {
         let p = parse_show_columns("SHOW FULL COLUMNS FROM `wptests_options`").unwrap();
         assert!(p.full);
         assert_eq!(p.table, "wptests_options");
+    }
+
+    #[test]
+    fn normalizes_integer_display_width() {
+        // Integer display widths are stripped, like MySQL 8.0.
+        assert_eq!(normalize_column_type("INT(11)"), "int");
+        assert_eq!(normalize_column_type("int(11) unsigned"), "int unsigned");
+        assert_eq!(normalize_column_type("BIGINT(20) UNSIGNED"), "bigint unsigned");
+        assert_eq!(normalize_column_type("smallint(6)"), "smallint");
+        assert_eq!(normalize_column_type("mediumint(9)"), "mediumint");
+        assert_eq!(normalize_column_type("integer"), "int");
+        assert_eq!(normalize_column_type("int"), "int");
+        assert_eq!(normalize_column_type("bigint unsigned"), "bigint unsigned");
+
+        // `tinyint(1)` (boolean) and zerofill columns keep the width.
+        assert_eq!(normalize_column_type("tinyint(1)"), "tinyint(1)");
+        assert_eq!(normalize_column_type("tinyint(4)"), "tinyint");
+        assert_eq!(
+            normalize_column_type("int(10) unsigned zerofill"),
+            "int(10) unsigned zerofill"
+        );
+
+        // Non-integer types keep their size, lowercased.
+        assert_eq!(normalize_column_type("VARCHAR(60)"), "varchar(60)");
+        assert_eq!(normalize_column_type("Decimal(10,2)"), "decimal(10,2)");
+        assert_eq!(normalize_column_type("LONGTEXT"), "longtext");
     }
 
     #[test]
