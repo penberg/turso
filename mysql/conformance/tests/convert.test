@@ -36,3 +36,30 @@ SELECT CONVERT(a, CHAR) FROM conv_demo ORDER BY a
 ----
 2
 10
+
+# CONVERT(expr, DATE/DATETIME/TIME) lowers to the same engine date()/datetime()/
+# time() reformatting as CAST(expr AS ...). Previously only CAST handled the
+# temporal targets while CONVERT rejected them ("CAST to DATE is not supported");
+# the two now share one code path.
+query
+SELECT CONVERT('2020-06-15', DATE), CONVERT('2020-06-15 10:30:45', DATETIME), CONVERT('10:30:45', TIME)
+----
+2020-06-15	2020-06-15 10:30:45	10:30:45
+
+# A DATETIME string narrowed to DATE drops the time part, as in MySQL.
+query
+SELECT CONVERT('2020-06-15 10:30:45', DATE)
+----
+2020-06-15
+
+# CONVERT(expr, DATETIME) is identical to CAST(expr AS DATETIME).
+query
+SELECT CONVERT('2020-06-15 10:30:45', DATETIME) = CAST('2020-06-15 10:30:45' AS DATETIME)
+----
+1
+
+# A NULL argument and an unparseable value both yield NULL.
+query
+SELECT CONVERT(NULL, DATE) IS NULL, CONVERT('not-a-date', DATE) IS NULL
+----
+1	1

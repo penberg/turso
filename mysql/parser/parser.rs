@@ -3804,25 +3804,7 @@ impl Parser {
         let expr = self.expr()?;
         self.expect_keyword("AS")?;
 
-        // `DATE`/`DATETIME`/`TIME` have no SQLite type affinity, so a plain
-        // `CAST` would not parse or reformat the value. Lower them to the
-        // engine's `date()`/`datetime()`/`time()` functions, which render the
-        // 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' / 'HH:MM:SS' forms MySQL returns.
-        let date_func = match self.peek() {
-            Some(Token::Word(w)) => match w.to_ascii_uppercase().as_str() {
-                "DATE" => Some("date"),
-                "DATETIME" => Some("datetime"),
-                "TIME" => Some("time"),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(func) = date_func {
-            self.advance();
-            // An optional fractional-seconds precision (`DATETIME(6)`) is dropped.
-            if self.is(&Token::LParen) {
-                let _ = self.type_size()?;
-            }
+        if let Some(func) = self.temporal_cast_func()? {
             self.expect(&Token::RParen, "`)`")?;
             return Ok(unary_fn(func, expr));
         }
@@ -3830,6 +3812,33 @@ impl Parser {
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(build_cast(expr, type_name))
+    }
+
+    /// If the next token names a MySQL temporal cast target (`DATE`, `DATETIME`,
+    /// or `TIME`), consumes it — along with an optional fractional-seconds
+    /// precision (`DATETIME(6)`), which is dropped — and returns the engine
+    /// function (`date`/`datetime`/`time`) that `CAST`/`CONVERT` lowers to.
+    /// Returns `None`, consuming nothing, for any other target (left to
+    /// [`Self::cast_type`]). These types have no SQLite affinity, so a plain
+    /// `CAST(... AS DATE)` would neither parse nor reformat the value; the engine
+    /// functions render the `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS` / `HH:MM:SS`
+    /// forms MySQL returns. Shared so `CONVERT(expr, DATE)` behaves exactly like
+    /// `CAST(expr AS DATE)`.
+    fn temporal_cast_func(&mut self) -> Result<Option<&'static str>> {
+        let func = match self.peek() {
+            Some(Token::Word(w)) => match w.to_ascii_uppercase().as_str() {
+                "DATE" => "date",
+                "DATETIME" => "datetime",
+                "TIME" => "time",
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        self.advance();
+        if self.is(&Token::LParen) {
+            let _ = self.type_size()?;
+        }
+        Ok(Some(func))
     }
 
     /// Parses `CONVERT(...)`, which has two MySQL forms:
@@ -3847,6 +3856,10 @@ impl Parser {
             return Ok(expr);
         }
         self.expect(&Token::Comma, "`,` or `USING`")?;
+        if let Some(func) = self.temporal_cast_func()? {
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(unary_fn(func, expr));
+        }
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(build_cast(expr, type_name))
@@ -14583,6 +14596,28 @@ mod tests {
             parse_expr("CONVERT(a, SIGNED)").unwrap(),
             ast::Expr::Case { .. }
         ));
+        // The temporal targets DATE/DATETIME/TIME lower to the engine's
+        // date()/datetime()/time() — exactly like CAST(expr AS ...) — rather than
+        // being rejected as they once were.
+        for (ty, func) in [("DATE", "date"), ("DATETIME", "datetime"), ("TIME", "time")] {
+            assert_eq!(
+                parse_expr(&format!("CONVERT(a, {ty})")).unwrap(),
+                parse_expr(&format!("CAST(a AS {ty})")).unwrap(),
+                "CONVERT(a, {ty}) should equal CAST(a AS {ty})"
+            );
+            let ast::Expr::FunctionCall { name, .. } =
+                parse_expr(&format!("CONVERT(a, {ty})")).unwrap()
+            else {
+                panic!("expected CONVERT(a, {ty}) to lower to a {func}() call");
+            };
+            assert_eq!(name.as_str(), func);
+        }
+        // A fractional-seconds precision on a temporal target parses and is
+        // dropped (the engine has no sub-second precision).
+        assert_eq!(
+            parse_expr("CONVERT(a, DATETIME(6))").unwrap(),
+            parse_expr("CAST(a AS DATETIME)").unwrap()
+        );
     }
 
     #[test]
