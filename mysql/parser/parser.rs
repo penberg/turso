@@ -3843,6 +3843,12 @@ impl Parser {
             return self.make_set_call();
         }
 
+        // `INET_NTOA(n)` renders a 32-bit number as a dotted-quad IPv4 address
+        // (see `inet_ntoa_call`).
+        if upper == "INET_NTOA" {
+            return self.inet_ntoa_call();
+        }
+
         // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
         // comma-separated `strlist`, or 0; synthesized from comma-wrapped
         // string surgery.
@@ -4425,6 +4431,37 @@ impl Parser {
             )],
             else_expr: Some(Box::new(joined)),
         })
+    }
+
+    /// Parses `INET_NTOA(n)` (the name and `(` are already consumed) and lowers
+    /// it to the dotted-quad IPv4 string of the 32-bit number `n`:
+    /// `((n >> 24) & 255) || '.' || ((n >> 16) & 255) || '.' || ((n >> 8) & 255)
+    /// || '.' || (n & 255)`. Each octet is the corresponding byte of `n`, and the
+    /// `||` concatenation (with the integer octets coerced to text) propagates
+    /// NULL, so `INET_NTOA(NULL)` is NULL, as in MySQL. Values outside the
+    /// 0..2^32-1 IPv4 range are not meaningful (as in MySQL). Exactly one argument
+    /// is required.
+    fn inet_ntoa_call(&mut self) -> Result<ast::Expr> {
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let num = |v: i64| ast::Expr::Literal(ast::Literal::Numeric(v.to_string()));
+        // The byte of `n` at `shift` bits (the low byte when `shift` is 0).
+        let octet = |shift: i64| {
+            let shifted = if shift == 0 {
+                n.clone()
+            } else {
+                ast::Expr::binary(n.clone(), ast::Operator::RightShift, num(shift))
+            };
+            ast::Expr::binary(shifted, ast::Operator::BitwiseAnd, num(255))
+        };
+        let dot = || ast::Expr::Literal(ast::Literal::String(requote(".")));
+        let concat = |a, b| ast::Expr::binary(a, ast::Operator::Concat, b);
+        let result = concat(octet(24), dot());
+        let result = concat(result, octet(16));
+        let result = concat(result, dot());
+        let result = concat(result, octet(8));
+        let result = concat(result, dot());
+        Ok(concat(result, octet(0)))
     }
 
     /// Parses a `FIND_IN_SET(str, strlist)` call (the name and `(` are already
@@ -11116,6 +11153,51 @@ mod tests {
             parse_expr("MAKE_SET(5)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn inet_ntoa_lowers_to_octet_concatenation() {
+        // INET_NTOA(n) -> ((n>>24)&255) || '.' || ... || (n&255): a left-nested
+        // chain of `||` whose leaves are the four masked octets and three dots.
+        let expr = parse_expr("INET_NTOA(n)").unwrap();
+        // Collect the operands of the `||` chain in order.
+        fn flatten(e: &ast::Expr, out: &mut Vec<ast::Expr>) {
+            if let ast::Expr::Binary(l, ast::Operator::Concat, r) = e {
+                flatten(l, out);
+                out.push((**r).clone());
+            } else {
+                out.push(e.clone());
+            }
+        }
+        let mut parts = Vec::new();
+        flatten(&expr, &mut parts);
+        assert_eq!(parts.len(), 7, "four octets and three dots");
+        // The dots are at the odd positions.
+        for i in [1, 3, 5] {
+            assert_eq!(
+                parts[i],
+                ast::Expr::Literal(ast::Literal::String("'.'".to_string()))
+            );
+        }
+        // Each octet is `<x> & 255`.
+        for i in [0, 2, 4, 6] {
+            let ast::Expr::Binary(_, ast::Operator::BitwiseAnd, mask) = &parts[i] else {
+                panic!("expected an octet mask at {i}");
+            };
+            assert_eq!(**mask, num("255"));
+        }
+        // The first octet shifts right by 24; the last is not shifted.
+        let ast::Expr::Binary(shifted, ast::Operator::BitwiseAnd, _) = &parts[0] else {
+            unreachable!()
+        };
+        assert!(matches!(
+            shifted.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::RightShift, _)
+        ));
+        let ast::Expr::Binary(low, ast::Operator::BitwiseAnd, _) = &parts[6] else {
+            unreachable!()
+        };
+        assert_eq!(**low, col("n"));
     }
 
     #[test]

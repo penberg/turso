@@ -1,0 +1,54 @@
+# INET_NTOA(n) conformance.
+#
+# MySQL's INET_NTOA(n) renders a 32-bit number as a dotted-quad IPv4 address.
+# The front-end lowers it to the per-octet expression
+# ((n >> 24) & 255) || '.' || ((n >> 16) & 255) || '.' || ((n >> 8) & 255) ||
+# '.' || (n & 255), concatenating the four bytes of n. The `||` concatenation
+# propagates NULL, so INET_NTOA(NULL) is NULL, as in MySQL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. This test
+# needs no tables.
+
+# Well-known addresses.
+query
+SELECT INET_NTOA(3232235777), INET_NTOA(2130706433), INET_NTOA(167772161)
+----
+192.168.1.1	127.0.0.1	10.0.0.1
+
+# The boundaries: 0 is 0.0.0.0 and 2^32-1 is 255.255.255.255.
+query
+SELECT INET_NTOA(0), INET_NTOA(4294967295)
+----
+0.0.0.0	255.255.255.255
+
+# Each octet is an independent byte: 255 fills only the low octet, 256 carries
+# into the next.
+query
+SELECT INET_NTOA(255), INET_NTOA(256), INET_NTOA(16909060)
+----
+0.0.0.255	0.0.1.0	1.2.3.4
+
+# The argument may be any integer expression.
+query
+SELECT INET_NTOA(3232235776 + 1)
+----
+192.168.1.1
+
+# NULL propagates.
+query
+SELECT INET_NTOA(NULL) IS NULL
+----
+1
+
+# Usable over a column (IPs stored as their 32-bit integer form).
+statement ok
+CREATE TABLE IF NOT EXISTS ip_demo (id INT PRIMARY KEY, addr INT UNSIGNED)
+
+statement ok
+INSERT INTO ip_demo (id, addr) VALUES (1, 3232235777), (2, 2130706433)
+
+query
+SELECT id, INET_NTOA(addr) FROM ip_demo ORDER BY id
+----
+1	192.168.1.1
+2	127.0.0.1
