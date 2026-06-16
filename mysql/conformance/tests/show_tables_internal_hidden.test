@@ -1,0 +1,36 @@
+# SHOW TABLES / SHOW TABLE STATUS hide turso's internal bookkeeping tables.
+#
+# The engine backs an AUTO_INCREMENT column with an internal sequence table named
+# `__turso_internal_seq___turso_internal_autoincrement_<table>` (and stores
+# CREATE TYPE definitions in `__turso_internal_types`). A real MySQL server has no
+# such tables, so SHOW TABLES and SHOW TABLE STATUS must not expose them — any
+# WordPress code that enumerates tables (dbDelta, Site Health, $wpdb->tables())
+# would otherwise see phantom tables. The front-end filters the
+# `__turso_internal_*` prefix, alongside SQLite's own `sqlite_%` tables.
+#
+# Uses a file-unique table name (the conformance DB is shared) and matches the
+# internal name with a `LIKE` so the result is deterministic. Expected to pass
+# against both turso-mysql-server and a real mysqld (which simply has no such
+# tables). The bug is that the leaked tables appeared in unfiltered output.
+
+statement ok
+CREATE TABLE showtbl_leak_ai (id INT AUTO_INCREMENT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO showtbl_leak_ai (v) VALUES (1)
+
+# No internal AUTO_INCREMENT/type table leaks into SHOW TABLES.
+query
+SHOW TABLES LIKE '%turso_internal%'
+----
+
+# Nor into SHOW TABLE STATUS.
+query
+SHOW TABLE STATUS LIKE '%turso_internal%'
+----
+
+# The user table itself is still listed normally.
+query
+SHOW TABLES LIKE 'showtbl_leak_%'
+----
+showtbl_leak_ai

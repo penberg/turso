@@ -568,12 +568,20 @@ struct ShowTables {
     like: Option<String>,
 }
 
+/// Selects user base tables from the engine schema for `SHOW TABLES` / `SHOW
+/// TABLE STATUS`, excluding both SQLite's internal tables (`sqlite_%`) and
+/// turso's internal bookkeeping tables — the `__turso_internal_*` AUTO_INCREMENT
+/// sequence and CREATE TYPE tables — which a real MySQL server never exposes.
+/// The `__turso_internal_*` underscores are escaped (`ESCAPE '\'`) so `LIKE`
+/// treats them literally rather than as single-character wildcards.
+const BASE_TABLES_QUERY: &str = "SELECT name FROM sqlite_schema WHERE type = 'table' \
+     AND name NOT LIKE 'sqlite_%' \
+     AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'";
+
 /// Lists base table names from the schema, optionally filtered by a `LIKE`
 /// pattern, as a MySQL `SHOW [FULL] TABLES` result set.
 fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResult, LimboError> {
-    let mut query =
-        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            .to_string();
+    let mut query = BASE_TABLES_QUERY.to_string();
     if let Some(pat) = &show.like {
         query.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
     }
@@ -1244,9 +1252,7 @@ fn build_table_status(
     conn: &Arc<Connection>,
     show: &ShowTableStatus,
 ) -> Result<ColumnsResult, LimboError> {
-    let mut query =
-        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            .to_string();
+    let mut query = BASE_TABLES_QUERY.to_string();
     if let Some((is_like, value)) = &show.name_filter {
         let escaped = value.replace('\'', "''");
         if *is_like {
@@ -1542,6 +1548,15 @@ mod tests {
         // Not SHOW TABLES, or an unhandled WHERE form.
         assert!(parse_show_tables("SHOW COLUMNS FROM t").is_none());
         assert!(parse_show_tables("SHOW TABLES WHERE 1").is_none());
+    }
+
+    #[test]
+    fn base_tables_query_excludes_internal_tables() {
+        // The shared schema query both SHOW TABLES and SHOW TABLE STATUS use must
+        // filter out SQLite's `sqlite_%` tables and turso's `__turso_internal_*`
+        // bookkeeping tables (with the underscores escaped for `LIKE`).
+        assert!(BASE_TABLES_QUERY.contains("name NOT LIKE 'sqlite_%'"));
+        assert!(BASE_TABLES_QUERY.contains(r"name NOT LIKE '\_\_turso\_internal\_%' ESCAPE '\'"));
     }
 
     #[test]
