@@ -354,7 +354,7 @@ impl Parser {
         // resolved into the engine's rowid-alias autoincrement after parsing.
         let mut columns: Vec<(ast::ColumnDefinition, bool)> = Vec::new();
         let mut constraints = Vec::new();
-        let mut inline_indexes: Vec<(Option<ast::Name>, Vec<ast::SortedColumn>)> = Vec::new();
+        let mut inline_indexes: Vec<(Option<ast::Name>, Vec<ast::SortedColumn>, bool)> = Vec::new();
         loop {
             if self.next_is_table_constraint() {
                 self.table_constraint(&mut constraints, &mut inline_indexes)?;
@@ -381,7 +381,7 @@ impl Parser {
         // Each inline secondary key becomes a deferred CREATE INDEX, emitted by
         // `statement_list` after this table (the engine has no inline form). The
         // index inherits `IF NOT EXISTS` so re-running the CREATE TABLE is safe.
-        for (idx_name, idx_columns) in inline_indexes {
+        for (idx_name, idx_columns, unique) in inline_indexes {
             let name = idx_name.unwrap_or_else(|| {
                 let first = match idx_columns.first().map(|c| c.expr.as_ref()) {
                     Some(ast::Expr::Id(n)) => n.as_str(),
@@ -390,7 +390,7 @@ impl Parser {
                 ast::Name::from_string(format!("{}_{}", tbl_name.name.as_str(), first))
             });
             self.pending_indexes.push(ast::Stmt::CreateIndex {
-                unique: false,
+                unique,
                 if_not_exists,
                 idx_name: ast::QualifiedName::single(name),
                 tbl_name: tbl_name.name.clone(),
@@ -1133,7 +1133,7 @@ impl Parser {
     fn table_constraint(
         &mut self,
         out: &mut Vec<ast::NamedTableConstraint>,
-        indexes: &mut Vec<(Option<ast::Name>, Vec<ast::SortedColumn>)>,
+        indexes: &mut Vec<(Option<ast::Name>, Vec<ast::SortedColumn>, bool)>,
     ) -> Result<()> {
         let mut name = None;
         if self.eat_keyword("CONSTRAINT") {
@@ -1160,22 +1160,32 @@ impl Parser {
             self.eat_keyword("KEY");
             self.eat_keyword("INDEX");
             // Optional index name before the column list.
-            if !self.is(&Token::LParen)
+            let idx_name = if !self.is(&Token::LParen)
                 && matches!(
                     self.peek(),
                     Some(Token::Word(_)) | Some(Token::QuotedIdent(_))
                 )
             {
-                let _ = self.name()?;
-            }
+                Some(self.name()?)
+            } else {
+                None
+            };
             let columns = self.sorted_column_list()?;
-            out.push(ast::NamedTableConstraint {
-                name,
-                constraint: ast::TableConstraint::Unique {
-                    columns,
-                    conflict_clause: None,
-                },
-            });
+            // A *named* unique key becomes a deferred `CREATE UNIQUE INDEX` so
+            // `SHOW INDEX` reports it under that name (which `dbDelta` looks up by
+            // name); the constraint symbol names it when the key itself is
+            // unnamed. An entirely unnamed `UNIQUE (cols)` stays a table
+            // constraint, whose index the engine auto-names.
+            match idx_name.or(name) {
+                Some(named) => indexes.push((Some(named), columns, true)),
+                None => out.push(ast::NamedTableConstraint {
+                    name: None,
+                    constraint: ast::TableConstraint::Unique {
+                        columns,
+                        conflict_clause: None,
+                    },
+                }),
+            }
         } else if self.eat_keyword("CHECK") {
             // A table-level CHECK, enforced by the engine like MySQL 8.0+. Pass it
             // through when translatable, else drop it (keeping the symbol name).
@@ -1218,7 +1228,7 @@ impl Parser {
             if self.eat_keyword("USING") {
                 let _ = self.name()?;
             }
-            indexes.push((idx_name, columns));
+            indexes.push((idx_name, columns, false));
         } else {
             return Err(self.unexpected("a table constraint"));
         }
@@ -13769,6 +13779,22 @@ mod tests {
             panic!("expected a CREATE INDEX for the unnamed inline INDEX");
         };
         assert_eq!(idx_name.name.as_str(), "t_b");
+
+        // A *named* inline UNIQUE KEY becomes a deferred CREATE UNIQUE INDEX
+        // keeping its name (so SHOW INDEX reports it, not an engine auto-name);
+        // an unnamed UNIQUE stays a table constraint in the CREATE TABLE.
+        let stmts =
+            parse_all("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, UNIQUE KEY ua (a), UNIQUE (b))")
+                .unwrap();
+        assert_eq!(stmts.len(), 2); // table (with the unnamed UNIQUE) + the named one
+        let ast::Stmt::CreateIndex {
+            unique, idx_name, ..
+        } = &stmts[1]
+        else {
+            panic!("expected a CREATE UNIQUE INDEX for the named UNIQUE KEY");
+        };
+        assert!(unique);
+        assert_eq!(idx_name.name.as_str(), "ua");
 
         // A table with no inline secondary key yields just the CREATE TABLE.
         let stmts = parse_all("CREATE TABLE t (id INT PRIMARY KEY, a INT)").unwrap();

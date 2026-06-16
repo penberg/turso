@@ -1,0 +1,41 @@
+# Inline named UNIQUE KEY in CREATE TABLE keeps its name.
+#
+# MySQL allows `UNIQUE KEY name (cols)` inside CREATE TABLE; SHOW INDEX reports
+# it under that name, which WordPress's dbDelta looks up. The engine would create
+# a unique constraint's index under an auto-generated name (sqlite_autoindex_*),
+# so the front-end instead defers a `CREATE UNIQUE INDEX name ON t (cols)` after
+# the table -- preserving the name while still enforcing uniqueness. An *unnamed*
+# UNIQUE (cols) stays a table constraint (its index is auto-named).
+#
+# The SHOW INDEX row is the schema-derived form (Cardinality/Sub_part NULL, see
+# show_index.test), checked with a WHERE filter. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS uqkey (id INT PRIMARY KEY, slug VARCHAR(50), UNIQUE KEY uqkey_slug (slug))
+
+# The unique index exists under its declared name (Non_unique = 0).
+query
+SHOW INDEX FROM uqkey WHERE Key_name = 'uqkey_slug'
+----
+uqkey	0	uqkey_slug	1	slug	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+
+# The Key column of SHOW COLUMNS reports the column as UNI.
+query
+SHOW COLUMNS FROM uqkey WHERE Field = 'slug'
+----
+slug	varchar(50)	YES	UNI	NULL	
+
+# Uniqueness is enforced: a duplicate value is rejected.
+statement ok
+INSERT INTO uqkey (id, slug) VALUES (1, 'alpha')
+
+statement error
+INSERT INTO uqkey (id, slug) VALUES (2, 'alpha')
+
+# A different value inserts fine.
+statement ok
+INSERT INTO uqkey (id, slug) VALUES (3, 'beta')
+
+# Re-adding the index by the same name fails (it already exists).
+statement error
+ALTER TABLE uqkey ADD UNIQUE KEY uqkey_slug (slug)
