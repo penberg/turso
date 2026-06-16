@@ -17,6 +17,13 @@ SELECT COALESCE(NULL, NULL, 5)
 ----
 5
 
+# A single-argument COALESCE returns that argument (MySQL allows it, though the
+# engine's coalesce requires two or more): it folds to the argument itself.
+query
+SELECT COALESCE(7), COALESCE('x'), COALESCE(3 + 4), COALESCE(NULL) IS NULL
+----
+7	x	7	1
+
 # NULLIF — NULL when the two arguments are equal, else the first.
 query
 SELECT NULLIF(5, 5)

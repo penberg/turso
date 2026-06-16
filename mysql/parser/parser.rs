@@ -4746,6 +4746,13 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
 
+        // MySQL's `COALESCE` accepts a single argument and returns it, but the
+        // engine's `coalesce` requires at least two and would reject it. Fold the
+        // one-argument form to the argument itself.
+        if upper == "COALESCE" && args.len() == 1 {
+            return Ok(*args.into_iter().next().expect("one argument"));
+        }
+
         // An aggregate may carry an `OVER (...)` window spec, turning it into a
         // windowed aggregate (e.g. a running total); a dedicated window function
         // like `ROW_NUMBER()` always carries one. The engine evaluates both.

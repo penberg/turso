@@ -364,7 +364,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Function                               | Status | Comment |
 |----------------------------------------|--------|---------|
-| `COALESCE`                             | ✅     |         |
+| `COALESCE`                             | ✅     | First non-NULL argument. The one-argument form (`COALESCE(x)`), which MySQL accepts and returns as-is but the engine's `coalesce` rejects, folds to the argument itself. |
 | `NULLIF`                               | 🚧     | `NULLIF(x, y)` is NULL when `x` equals `y`, else `x`, lowered to `CASE WHEN x = (y COLLATE NOCASE) THEN NULL ELSE x END`. The `COLLATE NOCASE` folds ASCII case on a string comparison so `NULLIF('a', 'A')` is NULL, matching MySQL's default collation (the engine's own `nullif` compares case-sensitively); it is ignored for a numeric operand. Like the literal-vs-literal `=` operator, a number compared to a non-numeric string is not coerced, so `NULLIF(0, '')` is `0` here vs MySQL's NULL — the same documented string/number divergence. |
 | `IFNULL`                               | ✅     |         |
 | `ISNULL`                               | ✅     | The single-argument test: lowered to the `x IS NULL` predicate, returning 1 if x is NULL else 0. Distinct from the two-argument `IFNULL(x, y)`. |
