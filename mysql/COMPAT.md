@@ -456,7 +456,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement                                       | Status | Comment |
 |-------------------------------------------------|--------|---------|
-| START TRANSACTION / BEGIN [WORK]                | ✅     | Mapped to the engine's `BEGIN` (deferred). `READ ONLY`/`READ WRITE`/`WITH CONSISTENT SNAPSHOT` characteristics are rejected. |
+| START TRANSACTION / BEGIN [WORK]                | ✅     | Mapped to the engine's `BEGIN` (deferred). `START TRANSACTION`'s comma-separated characteristics — `READ ONLY` / `READ WRITE` / `WITH CONSISTENT SNAPSHOT` — are accepted and **ignored**: the engine is a single writer with one isolation behaviour, so they have no observable effect (as with the locking-read clause). One divergence: `READ ONLY` is not enforced, so a write inside such a transaction succeeds here rather than erroring. |
 | COMMIT [WORK]                                    | ✅     | `AND CHAIN`/`RELEASE` rejected. |
 | ROLLBACK [WORK]                                  | ✅     | `AND CHAIN`/`RELEASE` rejected. |
 | SAVEPOINT name                                   | ✅     | Passed through to the engine's native savepoint. |

@@ -104,3 +104,29 @@ SELECT a, label FROM tx ORDER BY a
 2	committed
 3	via-begin
 4	auto-committed
+
+# START TRANSACTION accepts its comma-separated characteristics -- READ ONLY /
+# READ WRITE / WITH CONSISTENT SNAPSHOT -- which are advisory on a single-writer
+# engine and ignored. They open an ordinary, usable transaction.
+statement ok
+START TRANSACTION READ WRITE
+
+statement ok
+INSERT INTO tx (a, label) VALUES (6, 'read-write')
+
+statement ok
+COMMIT
+
+statement ok
+START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT
+
+statement ok
+ROLLBACK
+
+query
+SELECT a, label FROM tx ORDER BY a
+----
+2	committed
+3	via-begin
+4	auto-committed
+6	read-write

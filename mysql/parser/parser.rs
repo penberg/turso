@@ -2857,19 +2857,38 @@ impl Parser {
 
     /// Parses `START TRANSACTION` or `BEGIN [WORK]` into the engine's `BEGIN`.
     /// MySQL `START TRANSACTION` and `BEGIN` both open an explicit transaction
-    /// that the engine's deferred `BEGIN` matches. MySQL-only modifiers
-    /// (`READ ONLY`/`READ WRITE`/`WITH CONSISTENT SNAPSHOT`) change isolation in
-    /// ways the engine does not model, so they are rejected. `BEGIN`/`START` has
-    /// already been consumed.
+    /// that the engine's deferred `BEGIN` matches. `START TRANSACTION`'s
+    /// comma-separated characteristics (`READ ONLY` / `READ WRITE` /
+    /// `WITH CONSISTENT SNAPSHOT`) are accepted and ignored: the engine is a
+    /// single writer with one isolation behaviour, so they have no observable
+    /// effect (as with the locking-read clause). `BEGIN` takes no characteristics.
+    /// `BEGIN`/`START` has already been consumed.
     fn begin_transaction(&mut self, keyword: &str) -> Result<ast::Stmt> {
         if keyword == "START" {
             self.expect_keyword("TRANSACTION")?;
+            loop {
+                if self.eat_keyword("READ") {
+                    // `READ ONLY` | `READ WRITE`.
+                    if !self.eat_keyword("ONLY") && !self.eat_keyword("WRITE") {
+                        return Err(self.unexpected("`ONLY` or `WRITE` after `READ`"));
+                    }
+                } else if self.eat_keyword("WITH") {
+                    // `WITH CONSISTENT SNAPSHOT`.
+                    self.expect_keyword("CONSISTENT")?;
+                    self.expect_keyword("SNAPSHOT")?;
+                } else {
+                    break;
+                }
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
         } else {
             self.eat_keyword("WORK");
         }
         if self.has_trailing_tokens() {
             return Err(ParseError::Unsupported(
-                "transaction characteristics (READ ONLY / READ WRITE / WITH CONSISTENT SNAPSHOT) are not supported yet".to_string(),
+                "unexpected trailing tokens after START TRANSACTION / BEGIN".to_string(),
             ));
         }
         Ok(ast::Stmt::Begin {
@@ -12075,6 +12094,21 @@ mod tests {
             parse("BEGIN WORK").unwrap(),
             ast::Stmt::Begin { .. }
         ));
+        // START TRANSACTION's characteristics are accepted and ignored (the
+        // engine is a single writer with one isolation behaviour), including the
+        // comma-separated combination.
+        for sql in [
+            "START TRANSACTION READ ONLY",
+            "START TRANSACTION READ WRITE",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ WRITE",
+        ] {
+            assert!(
+                matches!(parse(sql).unwrap(), ast::Stmt::Begin { .. }),
+                "expected `{sql}` to open a transaction"
+            );
+        }
         assert!(matches!(parse("COMMIT").unwrap(), ast::Stmt::Commit { .. }));
         assert!(matches!(
             parse("COMMIT WORK").unwrap(),
@@ -12109,14 +12143,14 @@ mod tests {
 
     #[test]
     fn transaction_unsupported_variants() {
+        // A trailing token that is not a valid characteristic is still rejected,
+        // and a malformed characteristic (`READ` without `ONLY`/`WRITE`) errors.
         for sql in [
-            "START TRANSACTION READ ONLY",
-            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION GARBAGE",
+            "START TRANSACTION READ SIDEWAYS",
+            "START TRANSACTION WITH SHARED SNAPSHOT",
         ] {
-            assert!(
-                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
-                "expected `{sql}` to be unsupported"
-            );
+            assert!(parse(sql).is_err(), "expected `{sql}` to be rejected");
         }
         // RELEASE requires the SAVEPOINT keyword in MySQL, so the bare form fails.
         assert!(parse("RELEASE sp").is_err());
