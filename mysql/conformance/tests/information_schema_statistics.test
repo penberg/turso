@@ -1,0 +1,45 @@
+# information_schema.STATISTICS.
+#
+# MySQL exposes per-index-column metadata through information_schema.STATISTICS;
+# WordPress and migration tools read index information from it. The engine has no
+# such schema, so the front-end rewrites a reference to it into a derived table
+# over the engine catalog: the primary key (synthesized from the catalog's pk
+# columns, so it is named PRIMARY and covers the rowid-alias key) unioned with the
+# named secondary indexes (from pragma_index_list / pragma_index_info). NON_UNIQUE
+# is 0 for a unique/primary index and 1 otherwise; NULLABLE reflects NOT NULL.
+#
+# Limitations (not exercised here, see mysql/COMPAT.md): TABLE_SCHEMA is a
+# placeholder, so filtering on it matches nothing; CARDINALITY is 0 (no
+# statistics); and an unnamed unique constraint is not reported. The query orders
+# by COLUMN_NAME / SEQ_IN_INDEX (not the index name, whose case-sensitive ordering
+# differs from MySQL's), and uses file-unique table names.
+
+statement ok
+CREATE TABLE isstat_t (id INT PRIMARY KEY, a INT, b VARCHAR(10), UNIQUE KEY uq_a (a), KEY idx_b (b))
+
+# One row per indexed column: the unique key, the non-unique key, and the primary
+# key (NON_UNIQUE 0 for unique/primary, 1 otherwise; the primary key is named
+# PRIMARY and is not nullable).
+query
+SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE, NULLABLE, INDEX_TYPE FROM information_schema.STATISTICS WHERE TABLE_NAME = 'isstat_t' ORDER BY COLUMN_NAME
+----
+uq_a	1	a	0	YES	BTREE
+idx_b	1	b	1	YES	BTREE
+PRIMARY	1	id	0		BTREE
+
+# Counting the indexed columns of a table.
+query
+SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_NAME = 'isstat_t'
+----
+3
+
+statement ok
+CREATE TABLE isstat_c (x INT, y INT, z INT, KEY idx_xyz (x, y, z))
+
+# A composite index reports its columns with ascending SEQ_IN_INDEX.
+query
+SELECT COLUMN_NAME, SEQ_IN_INDEX FROM information_schema.STATISTICS WHERE TABLE_NAME = 'isstat_c' AND INDEX_NAME = 'idx_xyz' ORDER BY SEQ_IN_INDEX
+----
+x	1
+y	2
+z	3

@@ -2282,6 +2282,17 @@ impl Parser {
             ));
         }
 
+        // `information_schema.STATISTICS` (per-index-column metadata) is
+        // synthesized the same way (see `information_schema_statistics_select`).
+        if is_information_schema_statistics(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_statistics_select(),
+                alias,
+            ));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -9164,6 +9175,78 @@ fn information_schema_columns_select() -> ast::Select {
     }
 }
 
+/// Whether `name` refers to `information_schema.STATISTICS` (both parts compared
+/// case-insensitively, as MySQL treats them).
+fn is_information_schema_statistics(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("STATISTICS")
+}
+
+/// Builds the derived-table `SELECT` that emulates MySQL's
+/// `information_schema.STATISTICS` (one row per indexed column) from the engine
+/// catalog. It is the union of two sources: the primary key, synthesized from the
+/// `pragma_table_info` columns flagged as part of it (so it is named `PRIMARY` as
+/// in MySQL, rather than the engine's auto-index name, and covers the rowid-alias
+/// key that has no separate index), and the secondary indexes from
+/// `pragma_index_list` / `pragma_index_info` (the `origin = 'c'` rows — the named
+/// `KEY` / `UNIQUE KEY` indexes the front-end creates). `NON_UNIQUE` is `0` for a
+/// unique/primary index and `1` otherwise, and `NULLABLE` reflects the column's
+/// `NOT NULL` flag. WordPress and migration tools read index metadata from it; the
+/// `SHOW INDEX` form is also supported.
+///
+/// Parsed with the engine parser (`turso_parser`), like the `COLUMNS` emulation,
+/// because of the `pragma_*` table functions. Divergences (see `mysql/COMPAT.md`):
+/// `TABLE_SCHEMA` is the placeholder `def` (filtering on it matches nothing);
+/// `CARDINALITY` is `0` (no statistics); and an unnamed unique constraint
+/// (SQLite's `origin = 'u'` auto-index) is not reported, since its engine name is
+/// not MySQL's.
+fn information_schema_statistics_select() -> ast::Select {
+    const SQL: &[u8] = b"SELECT \
+         'def' AS TABLE_CATALOG, \
+         'def' AS TABLE_SCHEMA, \
+         m.name AS TABLE_NAME, \
+         0 AS NON_UNIQUE, \
+         'PRIMARY' AS INDEX_NAME, \
+         p.pk AS SEQ_IN_INDEX, \
+         p.name AS COLUMN_NAME, \
+         'A' AS COLLATION, \
+         0 AS CARDINALITY, \
+         '' AS NULLABLE, \
+         'BTREE' AS INDEX_TYPE \
+         FROM sqlite_schema m \
+         JOIN pragma_table_info(m.name) p \
+         WHERE m.type = 'table' AND p.pk > 0 \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_' \
+         UNION ALL \
+         SELECT \
+         'def', \
+         'def', \
+         m.name, \
+         CASE WHEN il.\"unique\" = 1 THEN 0 ELSE 1 END, \
+         il.name, \
+         ii.seqno + 1, \
+         ii.name, \
+         'A', \
+         0, \
+         CASE WHEN ti.\"notnull\" = 1 THEN '' ELSE 'YES' END, \
+         'BTREE' \
+         FROM sqlite_schema m \
+         JOIN pragma_index_list(m.name) il \
+         JOIN pragma_index_info(il.name) ii \
+         JOIN pragma_table_info(m.name) ti ON ti.name = ii.name \
+         WHERE m.type = 'table' AND il.origin = 'c' \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_'";
+    let mut parser = turso_parser::parser::Parser::new(SQL);
+    match parser.next() {
+        Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
+        _ => unreachable!("the information_schema.STATISTICS emulation parses as a SELECT"),
+    }
+}
+
 /// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
 /// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
 /// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
@@ -14546,13 +14629,20 @@ mod tests {
             base_table("SELECT 1 FROM INFORMATION_SCHEMA.columns c"),
             ast::SelectTable::Select(..)
         ));
+        // information_schema.STATISTICS rewrites too.
+        assert!(matches!(
+            base_table(
+                "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_NAME = 'x'"
+            ),
+            ast::SelectTable::Select(..)
+        ));
         // A plain table, and an unemulated information_schema table, are unchanged.
         assert!(matches!(
             base_table("SELECT id FROM wp_posts"),
             ast::SelectTable::Table(..)
         ));
         assert!(matches!(
-            base_table("SELECT 1 FROM information_schema.STATISTICS"),
+            base_table("SELECT 1 FROM information_schema.KEY_COLUMN_USAGE"),
             ast::SelectTable::Table(..)
         ));
     }
