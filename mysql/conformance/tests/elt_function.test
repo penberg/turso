@@ -2,8 +2,11 @@
 #
 # ELT returns the n-th string argument (1-based), or NULL if n is less than 1,
 # greater than the number of strings, or NULL. It is the inverse of FIELD, and
-# the front-end lowers it to `CASE n WHEN 1 THEN str1 WHEN 2 THEN str2 ... END`
-# (no ELSE), so an out-of-range or NULL index matches no branch and yields NULL.
+# the front-end lowers it to `CASE <int n> WHEN 1 THEN str1 WHEN 2 THEN str2 ...
+# END` (no ELSE), so an out-of-range or NULL index matches no branch and yields
+# NULL. MySQL coerces n to an integer index the way CAST(n AS SIGNED) does — a
+# numeric value rounds, a string parses its leading integer — so the index is
+# rounded/parsed before matching.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -25,6 +28,18 @@ query
 SELECT ELT(NULL, 'a', 'b')
 ----
 NULL
+
+# A numeric index is rounded to choose the arm (1.9 -> 2, 1.4 -> 1, 2.5 -> 3).
+query
+SELECT ELT(1.9, 'a', 'b', 'c'), ELT(1.4, 'a', 'b', 'c'), ELT(2.5, 'a', 'b', 'c')
+----
+b	a	c
+
+# A string index parses its leading integer ('2' -> 2, '2.9' -> 2, 'abc' -> 0).
+query
+SELECT ELT('2', 'a', 'b', 'c'), ELT('2.9', 'a', 'b', 'c'), ELT('abc', 'a', 'b')
+----
+b	b	NULL
 
 # The selected element is returned verbatim, including a NULL element, and
 # numeric arguments work too.

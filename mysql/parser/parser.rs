@@ -4943,11 +4943,13 @@ impl Parser {
     }
 
     /// Parses an `ELT(n, a, b, ...)` call (the name and `(` are already consumed)
-    /// and lowers it to `CASE n WHEN 1 THEN a WHEN 2 THEN b ... END` — the `n`-th
-    /// string argument (1-based), which the engine evaluates the same way MySQL's
-    /// `ELT` does. The `CASE` has no `ELSE`, so an out-of-range or NULL `n` (which
-    /// matches no `WHEN`) yields NULL, matching MySQL. At least two arguments (the
-    /// index and one string) are required.
+    /// and lowers it to `CASE <int n> WHEN 1 THEN a WHEN 2 THEN b ... END` — the
+    /// `n`-th string argument (1-based). MySQL coerces `n` to an integer index the
+    /// way `CAST(n AS SIGNED)` does (a numeric `1.9` rounds to `2`, a string `'2'`
+    /// parses to `2`), so the index is wrapped in [`build_cast`] to an integer;
+    /// otherwise a non-integer `n` would match no `WHEN`. The `CASE` has no `ELSE`,
+    /// so an out-of-range or NULL `n` (matching no `WHEN`) yields NULL, as in
+    /// MySQL. At least two arguments (the index and one string) are required.
     fn elt_call(&mut self) -> Result<ast::Expr> {
         let index = self.expr()?;
         let mut strings = Vec::new();
@@ -4968,8 +4970,18 @@ impl Parser {
                 (Box::new(idx), Box::new(value))
             })
             .collect();
+        // MySQL rounds/parses `n` to an integer index, so coerce it the same way a
+        // `CAST(n AS SIGNED)` would before matching the `WHEN` arms.
+        let int_index = build_cast(
+            index,
+            ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            },
+        );
         Ok(ast::Expr::Case {
-            base: Some(Box::new(index)),
+            base: Some(Box::new(int_index)),
             when_then_pairs,
             else_expr: None,
         })
@@ -13546,7 +13558,9 @@ mod tests {
 
     #[test]
     fn elt_lowers_to_case_without_else() {
-        // ELT(n, a, b, c) -> CASE n WHEN 1 THEN a WHEN 2 THEN b WHEN 3 THEN c END.
+        // ELT(n, a, b, c) -> CASE <int n> WHEN 1 THEN a WHEN 2 THEN b WHEN 3 THEN c
+        // END, where <int n> is the index coerced to an integer like CAST(n AS
+        // SIGNED) (so a numeric/string index selects the right arm).
         let ast::Expr::Case {
             base,
             when_then_pairs,
@@ -13555,7 +13569,9 @@ mod tests {
         else {
             panic!("expected ELT to lower to a CASE");
         };
-        assert_eq!(base.as_deref(), Some(&col("n")));
+        // The base is the integer-coerced index: the same `typeof`-guarded CASE
+        // `CAST(n AS SIGNED)` produces.
+        assert_eq!(base.as_deref(), Some(&parse_expr("CAST(n AS SIGNED)").unwrap()));
         assert_eq!(when_then_pairs.len(), 3);
         // The WHEN labels are the 1-based indices.
         for (i, (when, _)) in when_then_pairs.iter().enumerate() {
