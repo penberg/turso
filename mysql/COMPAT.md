@@ -246,7 +246,7 @@ incomplete.
 | DROP TABLESPACE                        | ❌     |         |
 | DROP TRIGGER                           | ❌     |         |
 | DROP VIEW                              | ❌     |         |
-| RENAME TABLE                           | ❌     |         |
+| RENAME TABLE                           | 🚧     | `RENAME TABLE old TO new` lowers to the engine's `ALTER TABLE old RENAME TO new`. The multi-table form `RENAME TABLE a TO b, c TO d, …` is expanded into one such rename per pair, applied left to right — so the atomic-swap idiom `RENAME TABLE current TO old, staged TO current` swaps the tables, as in MySQL. Unlike MySQL the pairs are not renamed atomically with one another (a failure midway leaves the earlier renames applied), the same divergence as multi-table `DROP TABLE`. |
 | TRUNCATE TABLE                         | 🚧     | Translated to an unfiltered `DELETE FROM tbl` (same empty-table result). `TRUNCATE`'s implicit commit, `AUTO_INCREMENT` reset, and zero affected-row count are not reproduced. |
 | DO *expr* [, *expr*]...                | 🚧     | Accepted and replied to with OK and no result set, matching MySQL. The expressions are parsed for validation but **not evaluated** -- MySQL's usual `DO` targets (locking functions, `SLEEP`, user-variable assignments) have no engine equivalent, so there is nothing to run. Not observable through the OK response. |
 

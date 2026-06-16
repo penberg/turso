@@ -1,0 +1,78 @@
+# Multi-table RENAME TABLE.
+#
+# MySQL's `RENAME TABLE a TO b, c TO d, ...` renames several tables in one
+# statement, applying the pairs left to right -- the idiom for an atomic table
+# swap, `RENAME TABLE current TO old, staged TO current`. The engine has no
+# multi-table rename, so the front-end expands the list into one `ALTER TABLE ...
+# RENAME TO` per pair, run in sequence; only the single-table form was accepted
+# before (the comma form was rejected). The renames are not atomic with each
+# other (a divergence shared with multi-table `DROP TABLE`), but the left-to-right
+# order matches MySQL, so a swap produces the same result.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS rt_current (id INT PRIMARY KEY, label VARCHAR(10))
+
+statement ok
+CREATE TABLE IF NOT EXISTS rt_staged (id INT PRIMARY KEY, label VARCHAR(10))
+
+statement ok
+INSERT INTO rt_current VALUES (1, 'old')
+
+statement ok
+INSERT INTO rt_staged VALUES (2, 'new')
+
+# The atomic-swap idiom: current's data ends up under rt_retired, staged's under
+# rt_current.
+statement ok
+RENAME TABLE rt_current TO rt_retired, rt_staged TO rt_current
+
+query
+SELECT id, label FROM rt_current
+----
+2	new
+
+query
+SELECT id, label FROM rt_retired
+----
+1	old
+
+# A plain multi-table rename of independent tables.
+statement ok
+CREATE TABLE IF NOT EXISTS rt_a (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE IF NOT EXISTS rt_b (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO rt_a VALUES (10)
+
+statement ok
+INSERT INTO rt_b VALUES (20)
+
+statement ok
+RENAME TABLE rt_a TO rt_a2, rt_b TO rt_b2
+
+query
+SELECT (SELECT id FROM rt_a2), (SELECT id FROM rt_b2)
+----
+10	20
+
+# A three-table cyclic swap via a temporary name.
+statement ok
+RENAME TABLE rt_a2 TO rt_tmp, rt_b2 TO rt_a2, rt_tmp TO rt_b2
+
+query
+SELECT (SELECT id FROM rt_a2), (SELECT id FROM rt_b2)
+----
+20	10
+
+# The single-table form still works.
+statement ok
+RENAME TABLE rt_retired TO rt_archive
+
+query
+SELECT id FROM rt_archive
+----
+1

@@ -841,14 +841,27 @@ impl Parser {
                 "only RENAME TABLE is supported yet".to_string(),
             ));
         }
+        // `RENAME TABLE old1 TO new1, old2 TO new2, ...` renames each table. The
+        // engine has no multi-table rename, so expand the list into one `ALTER
+        // TABLE ... RENAME TO` per pair (the first returned, the rest deferred to
+        // `pending_statements`), run in sequence. MySQL applies the renames
+        // left-to-right — so `RENAME TABLE cur TO old, new TO cur` swaps `cur` and
+        // `new` — which the sequential expansion reproduces, though not atomically
+        // (a documented divergence shared with multi-table `DROP TABLE`).
+        let first = self.rename_one()?;
+        while self.eat(&Token::Comma) {
+            let next = self.rename_one()?;
+            self.pending_statements.push(next);
+        }
+        Ok(first)
+    }
+
+    /// Parses one `old TO new` pair of a `RENAME TABLE` list into the engine's
+    /// `ALTER TABLE old RENAME TO new`.
+    fn rename_one(&mut self) -> Result<ast::Stmt> {
         let old = self.qualified_name()?;
         self.expect_keyword("TO")?;
         let new = self.qualified_name()?;
-        if self.is(&Token::Comma) {
-            return Err(ParseError::Unsupported(
-                "RENAME TABLE with multiple tables is not supported yet".to_string(),
-            ));
-        }
         Ok(ast::Stmt::AlterTable(ast::AlterTable {
             name: old,
             body: ast::AlterTableBody::RenameTo(new.name),
@@ -13110,13 +13123,35 @@ mod tests {
         };
         assert_eq!(new.as_str(), "new_t");
 
-        // The multi-table form and non-TABLE renames are rejected.
-        for sql in ["RENAME TABLE a TO b, c TO d", "RENAME USER u1 TO u2"] {
-            assert!(
-                matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
-                "expected `{sql}` to be unsupported"
-            );
-        }
+        // The multi-table form expands into one `ALTER TABLE ... RENAME TO` per
+        // pair, in order (so a swap like `cur TO old, new TO cur` works).
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+        let stmts = parse_all("RENAME TABLE cur TO old, new TO cur").unwrap();
+        let pairs: Vec<(String, String)> = stmts
+            .iter()
+            .map(|s| {
+                let ast::Stmt::AlterTable(a) = s else {
+                    panic!("expected ALTER TABLE");
+                };
+                let ast::AlterTableBody::RenameTo(new) = &a.body else {
+                    panic!("expected RENAME TO");
+                };
+                (a.name.name.as_str().to_string(), new.as_str().to_string())
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("cur".to_string(), "old".to_string()),
+                ("new".to_string(), "cur".to_string()),
+            ]
+        );
+
+        // A non-TABLE rename (`RENAME USER`) is still rejected.
+        assert!(matches!(
+            parse("RENAME USER u1 TO u2").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]
