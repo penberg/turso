@@ -3128,6 +3128,23 @@ impl Parser {
             self.advance();
             return self.collate_expr();
         }
+        // Unary minus / plus on an expression (`-a`, `-ABS(x)`, `-(a + 1)`, `+a`).
+        // A signed *numeric literal* (`-5`) is folded into the literal by
+        // `primary_expr`, so only a non-numeric operand is negated here — at this
+        // tight precedence (tighter than `*`/`+`), so `-a * b` is `(-a) * b`.
+        if matches!(self.peek(), Some(Token::Minus) | Some(Token::Plus))
+            && !matches!(self.peek_nth(1), Some(Token::Num(_)))
+        {
+            let negative = self.is(&Token::Minus);
+            self.advance();
+            let inner = self.collate_expr()?;
+            let op = if negative {
+                ast::UnaryOperator::Negative
+            } else {
+                ast::UnaryOperator::Positive
+            };
+            return Ok(ast::Expr::unary(op, inner));
+        }
         let mut expr = self.primary_expr()?;
         loop {
             // `doc -> path` / `doc ->> path` — MySQL's JSON extract operators,
@@ -7874,6 +7891,43 @@ mod tests {
         assert!(matches!(
             parse_expr("id IN (1, 2, 3)").unwrap(),
             ast::Expr::InList { .. }
+        ));
+    }
+
+    #[test]
+    fn unary_minus_on_expression() {
+        // `-a` (non-literal) is a unary Negative operator.
+        assert!(matches!(
+            parse_expr("-a").unwrap(),
+            ast::Expr::Unary(ast::UnaryOperator::Negative, _)
+        ));
+        // `+a` is a unary Positive operator.
+        assert!(matches!(
+            parse_expr("+a").unwrap(),
+            ast::Expr::Unary(ast::UnaryOperator::Positive, _)
+        ));
+        // Negating a function call and a parenthesized expression.
+        assert!(matches!(
+            parse_expr("-ABS(a)").unwrap(),
+            ast::Expr::Unary(ast::UnaryOperator::Negative, _)
+        ));
+        assert!(matches!(
+            parse_expr("-(a + 1)").unwrap(),
+            ast::Expr::Unary(ast::UnaryOperator::Negative, _)
+        ));
+        // A signed numeric literal is still folded into the literal, not a Unary.
+        assert!(matches!(
+            parse_expr("-5").unwrap(),
+            ast::Expr::Literal(ast::Literal::Numeric(ref n)) if n == "-5"
+        ));
+        // Unary minus binds tighter than `*`: `-a * b` is `(-a) * b`.
+        let ast::Expr::Binary(lhs, ast::Operator::Multiply, _) = parse_expr("-a * b").unwrap()
+        else {
+            panic!("expected a multiplication at the top");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            ast::Expr::Unary(ast::UnaryOperator::Negative, _)
         ));
     }
 

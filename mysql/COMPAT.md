@@ -330,7 +330,7 @@ diverge are deliberately excluded.
 | `XOR` (logical)                         | 🚧     | Lowered to `(a <> 0) <> (b <> 0)` — 1 when exactly one operand is truthy, NULL if either is NULL; between `OR` and `AND` in precedence. Matches MySQL for numeric / boolean operands; a non-numeric string's truthiness diverges (the engine does not coerce it to 0). |
 | `!` (logical NOT prefix)                | ✅     | The high-precedence prefix form of NOT (binds tighter than the comparison operators, unlike the `NOT` keyword). Maps to the engine's unary `NOT`, whose truthiness matches MySQL (`!0`=1, non-zero→0, `!NULL`=NULL). `!=` is unaffected. |
 | `IS [NOT] NULL`                        | ✅     |         |
-| Arithmetic `+` `-` `*`                 | ✅     |         |
+| Arithmetic `+` `-` `*`                 | ✅     | The binary operators, plus **unary** `-` / `+` on any expression (`-a`, `-ABS(x)`, `-(a + 1)`, `ABS(-a)`, `ORDER BY -a`). Unary minus binds tightly (`-a * b` is `(-a) * b`); a signed numeric literal (`-5`) is folded into the literal. |
 | `[NOT] IN (value list)`                | ✅     | Includes the empty list: `x IN ()` folds to `0` and `x NOT IN ()` to `1` (MySQL semantics), since the engine has no empty-list `IN`. |
 | `[NOT] BETWEEN a AND b`                | ✅     |         |
 | `[NOT] LIKE` (ASCII patterns)          | ✅     | Backslash is the default escape character (so `\%` / `\_` match literally), as in MySQL — the front-end supplies `ESCAPE '\'` when the query gives no explicit `ESCAPE` clause. An explicit `LIKE ... ESCAPE 'c'` is honored. This is what `$wpdb->esc_like()` relies on. |
