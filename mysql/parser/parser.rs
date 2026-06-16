@@ -3857,6 +3857,12 @@ impl Parser {
             return self.from_days_call();
         }
 
+        // `TO_SECONDS(d)` is the seconds since year 0 — `TO_DAYS(d) * 86400`
+        // plus the time-of-day seconds.
+        if upper == "TO_SECONDS" {
+            return self.to_seconds_call();
+        }
+
         // `TIMESTAMPDIFF(unit, a, b)` is `b - a` in whole `unit`s. The
         // fixed-duration units lower to integer division of the epoch-second
         // difference.
@@ -5390,18 +5396,28 @@ impl Parser {
     fn to_days_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        let julian = ast::Expr::Cast {
-            expr: Box::new(unary_fn("julianday", unary_fn("date", arg))),
-            type_name: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-                array_dimensions: 0,
-            }),
-        };
+        Ok(to_days_expr(arg))
+    }
+
+    /// Lowers `TO_SECONDS(d)` (the name and `(` are already consumed) to the
+    /// seconds from year 0 to `d`: `TO_DAYS(d) * 86400 + TIME_TO_SEC(d)`. It
+    /// reuses the day-number and time-of-day lowerings, so it carries their
+    /// divergences (only modern Gregorian dates and a normal time-of-day range
+    /// are meaningful). NULL propagates through both terms. Exactly one argument
+    /// is required.
+    #[allow(clippy::wrong_self_convention)]
+    fn to_seconds_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let days = ast::Expr::binary(
+            to_days_expr(arg.clone()),
+            ast::Operator::Multiply,
+            ast::Expr::Literal(ast::Literal::Numeric("86400".to_string())),
+        );
         Ok(ast::Expr::binary(
-            julian,
-            ast::Operator::Subtract,
-            ast::Expr::Literal(ast::Literal::Numeric("1721059".to_string())),
+            days,
+            ast::Operator::Add,
+            time_to_sec_expr(arg),
         ))
     }
 
@@ -5432,19 +5448,7 @@ impl Parser {
     fn time_to_sec_call(&mut self) -> Result<ast::Expr> {
         let t = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        let hours = ast::Expr::binary(
-            cast_strftime_int("%H", t.clone()),
-            ast::Operator::Multiply,
-            ast::Expr::Literal(ast::Literal::Numeric("3600".to_string())),
-        );
-        let minutes = ast::Expr::binary(
-            cast_strftime_int("%M", t.clone()),
-            ast::Operator::Multiply,
-            ast::Expr::Literal(ast::Literal::Numeric("60".to_string())),
-        );
-        let seconds = cast_strftime_int("%S", t);
-        let hm = ast::Expr::binary(hours, ast::Operator::Add, minutes);
-        Ok(ast::Expr::binary(hm, ast::Operator::Add, seconds))
+        Ok(time_to_sec_expr(t))
     }
 
     /// Lowers `SEC_TO_TIME(s)` (the name and `(` are already consumed) to
@@ -6921,6 +6925,46 @@ fn timestampdiff_months(a: ast::Expr, b: ast::Expr, divisor: i64) -> ast::Expr {
             ast::Expr::Literal(ast::Literal::Numeric(divisor.to_string())),
         )
     }
+}
+
+/// Builds `TO_DAYS(d)`: the MySQL day number (days since year 0), as
+/// `CAST(julianday(date(d)) AS INTEGER) - 1721059`. The `date()` wrapper drops
+/// any time part; the offset shifts the engine's Julian day onto MySQL's
+/// proleptic-Gregorian day count. NULL propagates. Shared by `TO_DAYS` and the
+/// day component of `TO_SECONDS`.
+fn to_days_expr(arg: ast::Expr) -> ast::Expr {
+    let julian = ast::Expr::Cast {
+        expr: Box::new(unary_fn("julianday", unary_fn("date", arg))),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    ast::Expr::binary(
+        julian,
+        ast::Operator::Subtract,
+        ast::Expr::Literal(ast::Literal::Numeric("1721059".to_string())),
+    )
+}
+
+/// Builds `TIME_TO_SEC(t)`: the seconds since midnight of `t`'s time part,
+/// `H*3600 + M*60 + S` (each `CAST(strftime(code, t) AS INTEGER)`). NULL
+/// propagates. Shared by `TIME_TO_SEC` and the time component of `TO_SECONDS`.
+fn time_to_sec_expr(t: ast::Expr) -> ast::Expr {
+    let hours = ast::Expr::binary(
+        cast_strftime_int("%H", t.clone()),
+        ast::Operator::Multiply,
+        ast::Expr::Literal(ast::Literal::Numeric("3600".to_string())),
+    );
+    let minutes = ast::Expr::binary(
+        cast_strftime_int("%M", t.clone()),
+        ast::Operator::Multiply,
+        ast::Expr::Literal(ast::Literal::Numeric("60".to_string())),
+    );
+    let seconds = cast_strftime_int("%S", t);
+    let hm = ast::Expr::binary(hours, ast::Operator::Add, minutes);
+    ast::Expr::binary(hm, ast::Operator::Add, seconds)
 }
 
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
@@ -10470,6 +10514,24 @@ mod tests {
         assert!(
             matches!(off.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1721059.5")
         );
+    }
+
+    #[test]
+    fn to_seconds_lowers_to_days_times_86400_plus_time() {
+        // TO_SECONDS(d) -> TO_DAYS(d) * 86400 + TIME_TO_SEC(d).
+        let ast::Expr::Binary(days_term, ast::Operator::Add, time_term) =
+            parse_expr("TO_SECONDS(d)").unwrap()
+        else {
+            panic!("expected TO_SECONDS to lower to an addition");
+        };
+        // The left term is the day number scaled by 86400.
+        let ast::Expr::Binary(to_days, ast::Operator::Multiply, scale) = days_term.as_ref() else {
+            panic!("expected `TO_DAYS(d) * 86400`");
+        };
+        assert_eq!(**to_days, parse_expr("TO_DAYS(d)").unwrap());
+        assert!(matches!(scale.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "86400"));
+        // The right term is the time-of-day seconds.
+        assert_eq!(*time_term, parse_expr("TIME_TO_SEC(d)").unwrap());
     }
 
     #[test]

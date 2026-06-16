@@ -1,0 +1,60 @@
+# TO_SECONDS(d) conformance.
+#
+# MySQL's TO_SECONDS(d) returns the number of seconds from year 0 to the
+# date/time d. The front-end lowers it to TO_DAYS(d) * 86400 + TIME_TO_SEC(d),
+# reusing the day-number and time-of-day lowerings: the day part is
+# (CAST(julianday(date(d)) AS INTEGER) - 1721059) * 86400 and the time part is
+# H*3600 + M*60 + S. NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (values
+# from MySQL 8.4). Uses its own table name.
+
+# A bare date has no time-of-day, so the result is a whole number of days.
+query
+SELECT TO_SECONDS('2009-11-29'), TO_SECONDS('2000-01-01')
+----
+63426672000	63113904000
+
+# The time part adds the seconds since midnight.
+query
+SELECT TO_SECONDS('2009-11-29 13:00:00'), TO_SECONDS('2026-06-16 23:59:59')
+----
+63426718800	63948873599
+
+# A leap day with a time, and the Unix epoch.
+query
+SELECT TO_SECONDS('2020-02-29 12:34:56'), TO_SECONDS('1970-01-01 00:00:00')
+----
+63750198896	62167219200
+
+# TO_SECONDS of a bare date equals TO_DAYS(d) * 86400, and the seconds between
+# two instants is their TO_SECONDS difference.
+query
+SELECT TO_SECONDS('2020-06-15') = TO_DAYS('2020-06-15') * 86400,
+       TO_SECONDS('2020-01-01 00:01:00') - TO_SECONDS('2020-01-01 00:00:00')
+----
+1	60
+
+# NULL propagates.
+query
+SELECT TO_SECONDS(NULL) IS NULL
+----
+1
+
+# Usable over a column and in a predicate.
+statement ok
+CREATE TABLE IF NOT EXISTS tsec_demo (id INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO tsec_demo (id, d) VALUES (1, '2020-01-01 00:00:00'), (2, '2020-01-01 01:00:00')
+
+query
+SELECT id, TO_SECONDS(d) FROM tsec_demo ORDER BY id
+----
+1	63745056000
+2	63745059600
+
+query
+SELECT id FROM tsec_demo WHERE TO_SECONDS(d) > 63745056000 ORDER BY id
+----
+2
