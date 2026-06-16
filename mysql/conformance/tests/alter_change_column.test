@@ -5,8 +5,10 @@
 # front-end lowers a CHANGE that renames (old != new) to the engine's
 # RENAME COLUMN old TO new, parsing and discarding the trailing column
 # definition. Since the engine's columns are affinity-typed, the redeclared type
-# is advisory. A same-name CHANGE and the MODIFY form (a pure in-place type
-# change) are rejected.
+# is advisory. A same-name CHANGE and the MODIFY form have no rename and only an
+# advisory retype, so they are accepted no-ops (nothing is executed) -- which is
+# what dbDelta() relies on. (A fundamental affinity change is therefore not
+# applied, a documented limitation.)
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -51,10 +53,19 @@ SELECT id, label FROM chgcol_demo ORDER BY id
 statement error
 SELECT old_name FROM chgcol_demo
 
-# A same-name CHANGE is a pure type change and is rejected.
-statement error
-ALTER TABLE chgcol_demo CHANGE COLUMN id id BIGINT
+# A same-name CHANGE redeclares the column's (advisory) type with no rename, so
+# it succeeds as a no-op and leaves the rows untouched.
+statement ok
+ALTER TABLE chgcol_demo CHANGE COLUMN id id BIGINT NOT NULL
 
-# MODIFY (a pure in-place type change) is rejected.
-statement error
-ALTER TABLE chgcol_demo MODIFY COLUMN id BIGINT
+# MODIFY likewise succeeds as a no-op.
+statement ok
+ALTER TABLE chgcol_demo MODIFY COLUMN label VARCHAR(255)
+
+# Both no-ops left the data and column names intact.
+query
+SELECT id, label FROM chgcol_demo ORDER BY id
+----
+1	alpha
+2	beta
+3	gamma
