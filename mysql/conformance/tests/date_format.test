@@ -12,9 +12,9 @@
 # mode lowering zero-padded to two digits, the 12-hour clock (%l no-pad, %h/%I
 # padded, %r = hh:mm:ss AM/PM), meridiem (%p), the two-digit year (%y), and the
 # day-with-ordinal-suffix %D to CASE / strftime expressions, concatenating the
-# pieces. Literal characters pass through. The format must be a string literal;
-# specifiers without any of these forms (%X and microseconds %f) are rejected.
-# See mysql/COMPAT.md.
+# pieces. The Sunday-first week-year %X (the %V companion) lowers to a CASE.
+# Literal characters pass through. The format must be a string literal;
+# microseconds %f (no sub-second precision) is rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -98,6 +98,21 @@ query
 SELECT DATE_FORMAT('2021-01-01', '%x'), DATE_FORMAT('2023-01-01', '%x'), DATE_FORMAT('2026-06-15', '%x-W%v')
 ----
 2020	2022	2026-W25
+
+# %X is the year of the Sunday-first %V week (the %V companion). A January date in
+# the prior year's last week carries that year: 2026-01-01 is in %V week 52 of
+# 2025, so %X = 2025; 2021-01-01 is week 52 of 2020. A mid-year date keeps its own
+# year, and a December date stays in the high weeks (never week 1), so it keeps
+# its year too. It pairs with %V to form a Sunday-first year-week.
+query
+SELECT DATE_FORMAT('2026-01-01', '%X'), DATE_FORMAT('2021-01-01', '%X'), DATE_FORMAT('2026-06-15', '%X'), DATE_FORMAT('2024-12-31', '%X')
+----
+2025	2020	2026	2024
+
+query
+SELECT DATE_FORMAT('2026-01-01', '%X-W%V'), DATE_FORMAT(NULL, '%X')
+----
+2025-W52	NULL
 
 # %u is the Monday-first week, mode 1 (00..53) -- like WEEK(d, 1) -- zero-padded
 # to two digits, and %V is the Sunday-first week, mode 2 (01..53), like

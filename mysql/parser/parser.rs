@@ -8647,6 +8647,39 @@ fn week_mode1_expr(arg: ast::Expr) -> ast::Expr {
     }
 }
 
+/// Builds MySQL's `%X` — the year of the Sunday-first `%V` week (mode 2), the
+/// companion to the `%V` week number. It is the calendar year except for a date
+/// in the year's leading partial week, which `%V` numbers as the *previous*
+/// year's last week (52 or 53); such a date is necessarily in January, so it
+/// carries the previous year. (Unlike the ISO `%v`/`%x` pair, mode 2 never
+/// numbers a December date as week 1, so there is no next-year case — verified
+/// against MySQL 8.4 for every year boundary of 2000–2040.) Reuses the `%V`
+/// lowering ([`week_push_zero`]) to detect the leading week. NULL propagates.
+fn week_year_sunday_expr(arg: ast::Expr) -> ast::Expr {
+    // A January date whose `%V` week is 52 or 53 belongs to the previous year.
+    let in_january = ast::Expr::binary(
+        strftime_int("%m", arg.clone()),
+        ast::Operator::Equals,
+        *numeric_expr("1"),
+    );
+    let leading_week = ast::Expr::binary(
+        week_push_zero(arg.clone(), "%U"),
+        ast::Operator::GreaterEquals,
+        *numeric_expr("52"),
+    );
+    let prev_year = ast::Expr::binary(in_january, ast::Operator::And, leading_week);
+    let year_before = ast::Expr::binary(
+        strftime_int("%Y", arg.clone()),
+        ast::Operator::Subtract,
+        *numeric_expr("1"),
+    );
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(prev_year), Box::new(year_before))],
+        else_expr: Some(Box::new(strftime_int("%Y", arg))),
+    }
+}
+
 /// Zero-pads an integer expression to two digits — the form MySQL's
 /// `DATE_FORMAT` week specifiers render (`00`..`53`). Built as
 /// `substr('0' || n, -2, 2)`, which keeps the last two characters of the
@@ -9735,9 +9768,11 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
 /// so the whole result is NULL, as in MySQL. The ISO week-year `%x` maps to
 /// strftime's `%G` (pairing with `%v`→`%V`). The week numbers with no single
 /// strftime code — `%u` (mode 1) and `%V` (mode 2) — reuse the `WEEK()` mode
-/// lowering, zero-padded to two digits. Only `%X` (the year of the Sunday-first
-/// `%V` week) and microseconds (`%f`, no sub-second precision) are rejected
-/// rather than silently mistranslated.
+/// lowering, zero-padded to two digits. The two week-year specifiers map to the
+/// matching week scheme: `%x` (Monday-first ISO) to strftime's `%G`, and `%X`
+/// (Sunday-first, the `%V` companion) to a `CASE` (see `week_year_sunday_expr`).
+/// Only microseconds (`%f`, no sub-second precision) are rejected rather than
+/// silently mistranslated.
 fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
     // A piece is a strftime format run, a name lookup, or an integer extraction
     // (a strftime code cast to an integer, which renders without leading zeros).
@@ -9752,6 +9787,8 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         // A `WEEK(d, mode)` number zero-padded to two digits (`%u` mode 1,
         // `%V` mode 2), for the week schemes with no single strftime code.
         Week(i64),
+        // `%X`, the year of the Sunday-first `%V` week (mode 2).
+        WeekYearSunday,
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut run = String::new();
@@ -9799,9 +9836,14 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
             // late-December date in week 1 of the next year, or an early-January
             // date in week 52/53 of the previous one, carries the ISO year. That
             // is exactly strftime's `%G` (ISO 8601 year), which pairs with `%V`.
-            // MySQL `%X` (the year of the Sunday-first `%V` week) has no strftime
-            // form and stays rejected.
             Some('x') => run.push_str("%G"),
+            // `%X` is the year of the Sunday-first `%V` week (mode 2). It has no
+            // strftime form, so it reuses the `%V` lowering to detect a leading
+            // partial week (see `week_year_sunday_expr`).
+            Some('X') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::WeekYearSunday);
+            }
             // `%T` is the 24-hour `HH:MM:SS` time, i.e. `%H:%i:%s`.
             Some('T') => run.push_str("%H:%M:%S"),
             Some('%') => run.push_str("%%"),
@@ -9897,6 +9939,7 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
             // two digits, as MySQL renders them.
             Piece::Week(1) => pad2(week_mode1_expr(target.clone())),
             Piece::Week(_) => pad2(week_push_zero(target.clone(), "%U")),
+            Piece::WeekYearSunday => week_year_sunday_expr(target.clone()),
         })
         .collect();
     // An empty format renders strftime('', target) — the empty string for a
@@ -13344,18 +13387,17 @@ mod tests {
                 "mode {mode} week should be a CASE for {fmt}"
             );
         }
-        // Specifiers still without a lowering are rejected (microseconds `%f`,
-        // and `%X`, the year of the Sunday-first `%V` week, which has no strftime
-        // form — unlike the now-supported `%x`).
-        for fmt in [
-            "DATE_FORMAT(d, '%f')",
-            "DATE_FORMAT(d, '%X')",
-        ] {
-            assert!(matches!(
-                parse_expr(fmt).unwrap_err(),
-                ParseError::Unsupported(_)
-            ));
-        }
+        // Microseconds `%f` (no sub-second precision) still has no lowering.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%f')").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+        // `%X` (the year of the Sunday-first `%V` week) lowers to a CASE that
+        // subtracts a year for a January date in the previous year's last week.
+        assert!(matches!(
+            parse_expr("DATE_FORMAT(d, '%X')").unwrap(),
+            ast::Expr::Case { .. }
+        ));
         // A non-literal format is rejected.
         assert!(parse_expr("DATE_FORMAT(d, f)").is_err());
 
