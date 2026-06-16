@@ -1,0 +1,52 @@
+# information_schema.TABLES.
+#
+# MySQL exposes table metadata through information_schema.TABLES; WordPress's
+# upgrade routine queries it to find MyISAM tables to convert, and Site Health
+# reads table sizes. The engine has no such schema, so the front-end rewrites a
+# reference to information_schema.TABLES into a derived table over the engine
+# catalog, exposing TABLE_NAME, ENGINE (the fixed 'InnoDB'), TABLE_TYPE, and the
+# (zeroed) TABLE_ROWS / DATA_LENGTH / INDEX_LENGTH columns.
+#
+# Two limitations (not exercised here): the engine keeps no statistics, so the
+# row-count and size columns are 0; and TABLE_SCHEMA is a placeholder, so a query
+# that filters on it matches nothing (the front-end does not track the database
+# name) -- see mysql/COMPAT.md. The columns tested below match MySQL 8.4. Filters
+# by TABLE_NAME (not TABLE_SCHEMA) so the result is the same on both engines. Uses
+# file-unique table names.
+
+statement ok
+CREATE TABLE ischema_a (id INT AUTO_INCREMENT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE ischema_b (id INT PRIMARY KEY)
+
+# A table is reported with the fixed InnoDB engine and BASE TABLE type.
+query
+SELECT TABLE_NAME, ENGINE, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_NAME = 'ischema_a'
+----
+ischema_a	InnoDB	BASE TABLE
+
+# An IN-list over TABLE_NAME, as WordPress builds.
+query
+SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_NAME IN ('ischema_a', 'ischema_b') ORDER BY TABLE_NAME
+----
+ischema_a	InnoDB
+ischema_b	InnoDB
+
+# WordPress's upgrade check for MyISAM tables: none exist, so the result is empty
+# (every table reports InnoDB).
+query
+SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_NAME = 'ischema_a' AND ENGINE = 'MyISAM'
+----
+
+# A case-insensitive reference with a table alias and qualified columns.
+query
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES t WHERE t.TABLE_NAME = 'ischema_b' AND t.ENGINE = 'InnoDB'
+----
+1
+
+# The internal AUTO_INCREMENT bookkeeping table for ischema_a is not exposed.
+query
+SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_NAME LIKE '%turso_internal%'
+----
+0

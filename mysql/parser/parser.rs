@@ -2256,6 +2256,20 @@ impl Parser {
             return Ok(ast::SelectTable::Select(select, alias));
         }
         let tbl_name = self.qualified_name()?;
+
+        // `information_schema.TABLES` has no engine equivalent; rewrite a reference
+        // to it into a derived table synthesized from the engine catalog (see
+        // `information_schema_tables_select`). WordPress's upgrade and Site Health
+        // routines query it. Other `information_schema` tables stay unsupported.
+        if is_information_schema_tables(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_tables_select()?,
+                alias,
+            ));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -8601,6 +8615,43 @@ fn is_window_function(upper_name: &str) -> bool {
     matches!(upper_name, "ROW_NUMBER")
 }
 
+/// Whether a qualified name refers to `information_schema.TABLES`
+/// (case-insensitive on both the schema and the table).
+fn is_information_schema_tables(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("TABLES")
+}
+
+/// Builds the derived-table `SELECT` that emulates MySQL's
+/// `information_schema.TABLES` from the engine catalog (`sqlite_schema`), exposing
+/// the columns WordPress's upgrade and Site Health routines read. The engine keeps
+/// no table statistics, so the row-count and size columns are `0` and `ENGINE` is
+/// the fixed `InnoDB`. `TABLE_SCHEMA` is a placeholder (the front-end does not
+/// track the connection's database name), so a query that filters on it matches
+/// nothing — a documented limitation in `mysql/COMPAT.md`. SQLite's `sqlite_%` and
+/// turso's `__turso_internal_*` bookkeeping tables are excluded, as in `SHOW
+/// TABLES`.
+fn information_schema_tables_select() -> Result<ast::Select> {
+    const SQL: &str = "SELECT \
+         name AS TABLE_NAME, \
+         'def' AS TABLE_SCHEMA, \
+         'InnoDB' AS ENGINE, \
+         'BASE TABLE' AS TABLE_TYPE, \
+         0 AS TABLE_ROWS, \
+         0 AS DATA_LENGTH, \
+         0 AS INDEX_LENGTH \
+         FROM sqlite_schema \
+         WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite_%' \
+         AND substr(name, 1, 17) <> '__turso_internal_'";
+    match Parser::new(SQL.as_bytes())?.parse_statement()? {
+        ast::Stmt::Select(select) => Ok(select),
+        _ => unreachable!("the information_schema.TABLES emulation parses as a SELECT"),
+    }
+}
+
 /// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
 /// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
 /// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
@@ -13708,6 +13759,42 @@ mod tests {
         // rejected.
         assert!(parse_expr("SHA2(s, 224)").is_err());
         assert!(parse_expr("SHA2(s, n)").is_err());
+    }
+
+    #[test]
+    fn information_schema_tables_rewrites_to_derived_table() {
+        // A reference to information_schema.TABLES becomes a derived (sub-)SELECT
+        // over the catalog; a normal table stays a plain table reference.
+        let base_table = |sql: &str| {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select {
+                from: Some(from), ..
+            } = select.body.select
+            else {
+                panic!("expected a FROM clause for `{sql}`");
+            };
+            *from.select
+        };
+        assert!(matches!(
+            base_table("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_NAME = 'x'"),
+            ast::SelectTable::Select(..)
+        ));
+        // Case-insensitive on both parts.
+        assert!(matches!(
+            base_table("SELECT 1 FROM INFORMATION_SCHEMA.tables"),
+            ast::SelectTable::Select(..)
+        ));
+        // A plain table, and a different information_schema table, are unchanged.
+        assert!(matches!(
+            base_table("SELECT id FROM wp_posts"),
+            ast::SelectTable::Table(..)
+        ));
+        assert!(matches!(
+            base_table("SELECT 1 FROM information_schema.COLUMNS"),
+            ast::SelectTable::Table(..)
+        ));
     }
 
     #[test]
