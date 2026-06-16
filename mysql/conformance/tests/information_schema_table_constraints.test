@@ -1,0 +1,40 @@
+# information_schema.TABLE_CONSTRAINTS.
+#
+# MySQL exposes a table's key/unique constraints through
+# information_schema.TABLE_CONSTRAINTS; migration and introspection tools read it.
+# The engine has no such schema, so the front-end rewrites a reference to it into
+# a derived table over the engine catalog: the primary key (one DISTINCT PRIMARY /
+# PRIMARY KEY row per table) unioned with the named unique indexes (UNIQUE). A
+# non-unique KEY is not a constraint and is excluded.
+#
+# Limitations (not exercised here, see mysql/COMPAT.md): TABLE_SCHEMA is a
+# placeholder, so filtering on it matches nothing; and FOREIGN KEY / CHECK
+# constraints and unnamed unique constraints are not reported. The query orders by
+# CONSTRAINT_TYPE / CONSTRAINT_NAME (not a case-sensitive index name) and uses
+# file-unique table names.
+
+statement ok
+CREATE TABLE isconstr_t (id INT PRIMARY KEY, a INT, b INT, UNIQUE KEY uq_isconstr (a), KEY idx_isconstr (b))
+
+# The primary key and the unique key are reported (ENFORCED); the non-unique KEY
+# idx_isconstr is not a constraint and is absent.
+query
+SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE, ENFORCED FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_NAME = 'isconstr_t' ORDER BY CONSTRAINT_TYPE, CONSTRAINT_NAME
+----
+PRIMARY	PRIMARY KEY	YES
+uq_isconstr	UNIQUE	YES
+
+# Exactly two constraints (the non-unique key is excluded).
+query
+SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_NAME = 'isconstr_t'
+----
+2
+
+statement ok
+CREATE TABLE isconstr_c (x INT, y INT, PRIMARY KEY (x, y))
+
+# A composite primary key is a single PRIMARY constraint row.
+query
+SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_NAME = 'isconstr_c'
+----
+PRIMARY	PRIMARY KEY

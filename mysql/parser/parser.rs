@@ -2293,6 +2293,18 @@ impl Parser {
             ));
         }
 
+        // `information_schema.TABLE_CONSTRAINTS` (one row per primary-key / unique
+        // constraint) is synthesized the same way (see
+        // `information_schema_table_constraints_select`).
+        if is_information_schema_table_constraints(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_table_constraints_select(),
+                alias,
+            ));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -9247,6 +9259,65 @@ fn information_schema_statistics_select() -> ast::Select {
     }
 }
 
+/// Whether `name` refers to `information_schema.TABLE_CONSTRAINTS` (both parts
+/// compared case-insensitively, as MySQL treats them).
+fn is_information_schema_table_constraints(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("TABLE_CONSTRAINTS")
+}
+
+/// Builds the derived-table `SELECT` that emulates MySQL's
+/// `information_schema.TABLE_CONSTRAINTS` (one row per primary-key or unique
+/// constraint) from the engine catalog. It is the union of the primary key
+/// (`PRIMARY` / `PRIMARY KEY`, a `DISTINCT` row per table that has one, so a
+/// composite key still yields a single row) and the named unique indexes
+/// (`UNIQUE`, from `pragma_index_list` rows that are unique and `origin = 'c'`).
+/// Constraints are `ENFORCED`. Non-unique keys are not constraints and are
+/// excluded.
+///
+/// Parsed with the engine parser (`turso_parser`), like the other
+/// `information_schema` emulations, because of the `pragma_*` table functions.
+/// Divergences (see `mysql/COMPAT.md`): `TABLE_SCHEMA` / `CONSTRAINT_SCHEMA` are
+/// the placeholder `def` (filtering on them matches nothing); and `FOREIGN KEY` /
+/// `CHECK` constraints and unnamed unique constraints are not reported (the engine
+/// does not enforce or name them as MySQL does).
+fn information_schema_table_constraints_select() -> ast::Select {
+    const SQL: &[u8] = b"SELECT DISTINCT \
+         'def' AS CONSTRAINT_CATALOG, \
+         'def' AS CONSTRAINT_SCHEMA, \
+         'PRIMARY' AS CONSTRAINT_NAME, \
+         'def' AS TABLE_SCHEMA, \
+         m.name AS TABLE_NAME, \
+         'PRIMARY KEY' AS CONSTRAINT_TYPE, \
+         'YES' AS ENFORCED \
+         FROM sqlite_schema m \
+         JOIN pragma_table_info(m.name) p \
+         WHERE m.type = 'table' AND p.pk >= 1 \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_' \
+         UNION ALL \
+         SELECT \
+         'def', \
+         'def', \
+         il.name, \
+         'def', \
+         m.name, \
+         'UNIQUE', \
+         'YES' \
+         FROM sqlite_schema m \
+         JOIN pragma_index_list(m.name) il \
+         WHERE m.type = 'table' AND il.origin = 'c' AND il.\"unique\" = 1 \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_'";
+    let mut parser = turso_parser::parser::Parser::new(SQL);
+    match parser.next() {
+        Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
+        _ => unreachable!("the information_schema.TABLE_CONSTRAINTS emulation parses as a SELECT"),
+    }
+}
+
 /// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
 /// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
 /// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
@@ -14629,10 +14700,16 @@ mod tests {
             base_table("SELECT 1 FROM INFORMATION_SCHEMA.columns c"),
             ast::SelectTable::Select(..)
         ));
-        // information_schema.STATISTICS rewrites too.
+        // information_schema.STATISTICS and TABLE_CONSTRAINTS rewrite too.
         assert!(matches!(
             base_table(
                 "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_NAME = 'x'"
+            ),
+            ast::SelectTable::Select(..)
+        ));
+        assert!(matches!(
+            base_table(
+                "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_NAME = 'x'"
             ),
             ast::SelectTable::Select(..)
         ));
