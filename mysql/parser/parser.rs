@@ -4056,6 +4056,15 @@ impl Parser {
             return self.timestampadd_call();
         }
 
+        // `ADDTIME(expr, t)` / `SUBTIME(expr, t)` add/subtract a time of day to a
+        // datetime or time (see `time_add_call`).
+        if upper == "ADDTIME" {
+            return self.time_add_call(false);
+        }
+        if upper == "SUBTIME" {
+            return self.time_add_call(true);
+        }
+
         // `TIME_TO_SEC(t)` is the seconds since midnight of the time part;
         // `SEC_TO_TIME(s)` is the inverse.
         if upper == "TIME_TO_SEC" {
@@ -6365,6 +6374,50 @@ impl Parser {
                 filter_clause: None,
                 over_clause: None,
             },
+        })
+    }
+
+    /// Lowers `ADDTIME(expr, t)` / `SUBTIME(expr, t)` (`subtract` for SUBTIME; the
+    /// name and `(` are already consumed) — `expr` plus or minus the time-of-day
+    /// `t`. The engine's `datetime`/`time` accept a `'HH:MM:SS'` argument as a
+    /// signed time offset, so the shift is `datetime(expr, t)` when `expr` is a
+    /// datetime and `time(expr, t)` when it is a bare time; SUBTIME prepends `-`
+    /// to `t`. The two are told apart at runtime by whether `expr` contains a `-`
+    /// (a date has one, a time of day does not), so the result keeps `expr`'s
+    /// type as MySQL does. NULL propagates.
+    ///
+    /// Edges that diverge (documented in COMPAT.md): a time-of-day result past
+    /// `24:00:00` wraps in the engine (MySQL's `TIME` runs to 838 h), a negative
+    /// `TIME` `expr` (which contains `-`) takes the datetime branch, and a bare
+    /// `DATE` `expr` is treated as midnight rather than MySQL's odd time coercion.
+    fn time_add_call(&mut self, subtract: bool) -> Result<ast::Expr> {
+        let expr = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let amount = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        let modifier = if subtract {
+            ast::Expr::binary(
+                ast::Expr::Literal(ast::Literal::String(requote("-"))),
+                ast::Operator::Concat,
+                amount,
+            )
+        } else {
+            amount
+        };
+        let is_datetime = ast::Expr::like(
+            expr.clone(),
+            false,
+            ast::LikeOperator::Like,
+            ast::Expr::Literal(ast::Literal::String(requote("%-%"))),
+            None,
+        );
+        let as_datetime = call_fn("datetime", vec![expr.clone(), modifier.clone()]);
+        let as_time = call_fn("time", vec![expr, modifier]);
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(Box::new(is_datetime), Box::new(as_datetime))],
+            else_expr: Some(Box::new(as_time)),
         })
     }
 
@@ -11223,6 +11276,49 @@ mod tests {
         // A unit without an engine modifier and a non-literal amount are rejected.
         assert!(parse_expr("TIMESTAMPADD(MICROSECOND, 1, d)").is_err());
         assert!(parse_expr("TIMESTAMPADD(DAY, x, d)").is_err());
+    }
+
+    #[test]
+    fn addtime_subtime_lower_to_typed_time_shift() {
+        // ADDTIME(e, t) -> CASE WHEN e LIKE '%-%' THEN datetime(e, t)
+        //                       ELSE time(e, t) END.
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("ADDTIME(e, t)").unwrap()
+        else {
+            panic!("expected ADDTIME to lower to a CASE");
+        };
+        // The guard is a LIKE on the first argument.
+        let ast::Expr::Like { op, .. } = when_then_pairs[0].0.as_ref() else {
+            panic!("expected a LIKE guard");
+        };
+        assert_eq!(*op, ast::LikeOperator::Like);
+        // THEN is datetime(e, t); ELSE is time(e, t), both with the bare amount.
+        let ast::Expr::FunctionCall { name, args, .. } = when_then_pairs[0].1.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(name.as_str(), "datetime");
+        assert_eq!(*args[1], col("t"));
+        let else_branch = else_expr.unwrap();
+        let ast::Expr::FunctionCall { name, .. } = else_branch.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(name.as_str(), "time");
+
+        // SUBTIME negates the amount: the datetime/time modifier is `'-' || t`.
+        let ast::Expr::Case { when_then_pairs, .. } = parse_expr("SUBTIME(e, t)").unwrap() else {
+            unreachable!()
+        };
+        let ast::Expr::FunctionCall { args, .. } = when_then_pairs[0].1.as_ref() else {
+            unreachable!()
+        };
+        let ast::Expr::Binary(minus, ast::Operator::Concat, amt) = args[1].as_ref() else {
+            panic!("expected `'-' || t` modifier");
+        };
+        assert!(matches!(minus.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'-'"));
+        assert_eq!(**amt, col("t"));
     }
 
     #[test]

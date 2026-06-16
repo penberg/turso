@@ -1,0 +1,65 @@
+# ADDTIME(expr, t) / SUBTIME(expr, t) conformance.
+#
+# MySQL's ADDTIME/SUBTIME add or subtract a time-of-day t to/from a datetime or
+# time expr, keeping expr's type. The front-end uses the engine's datetime/time,
+# which accept a 'HH:MM:SS' argument as a signed time offset: datetime(expr, t)
+# when expr is a datetime, time(expr, t) when it is a bare time, told apart at
+# runtime by whether expr contains a '-' (a date has one). SUBTIME prepends '-'.
+# NULL propagates.
+#
+# Scope: only normal in-range times are asserted. A time-of-day result past
+# 24:00:00 wraps in the engine (MySQL's TIME runs to 838 h) and a t argument
+# beyond 24 h yields NULL here -- documented in COMPAT.md, not tested against a
+# real mysqld.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Adding a time to a DATETIME keeps the date and rolls over midnight.
+query
+SELECT ADDTIME('2020-01-01 08:00:00', '02:30:00'), ADDTIME('2020-01-01 23:00:00', '02:00:00')
+----
+2020-01-01 10:30:00	2020-01-02 01:00:00
+
+# Adding to a bare TIME stays a time.
+query
+SELECT ADDTIME('10:00:00', '02:30:00'), ADDTIME('10:00:00', '00:00:30')
+----
+12:30:00	10:00:30
+
+# Subtracting a time, including across midnight (into the previous day).
+query
+SELECT SUBTIME('2020-01-01 08:00:00', '02:30:00'), SUBTIME('2020-01-01 01:00:00', '02:00:00')
+----
+2020-01-01 05:30:00	2019-12-31 23:00:00
+
+# Subtracting from a bare TIME stays a time.
+query
+SELECT SUBTIME('10:00:00', '02:30:00')
+----
+07:30:00
+
+# ADDTIME and SUBTIME are inverses for an in-range shift.
+query
+SELECT SUBTIME(ADDTIME('2020-06-15 12:00:00', '03:15:00'), '03:15:00')
+----
+2020-06-15 12:00:00
+
+# NULL in either argument yields NULL.
+query
+SELECT ADDTIME(NULL, '01:00:00') IS NULL, ADDTIME('2020-01-01 08:00:00', NULL) IS NULL, SUBTIME(NULL, '01:00:00') IS NULL
+----
+1	1	1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS at_demo (id INT PRIMARY KEY, ts DATETIME)
+
+statement ok
+INSERT INTO at_demo (id, ts) VALUES (1, '2026-06-15 09:00:00'), (2, '2026-06-15 22:30:00')
+
+query
+SELECT id, ADDTIME(ts, '01:45:00') FROM at_demo ORDER BY id
+----
+1	2026-06-15 10:45:00
+2	2026-06-16 00:15:00
