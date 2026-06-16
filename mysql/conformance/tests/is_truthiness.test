@@ -51,6 +51,27 @@ SELECT (3 > 1) IS TRUE, (3 < 1) IS TRUE
 ----
 1	0
 
+# IS binds looser than the comparison operators, so a comparison need not be
+# parenthesized: `1 = 1 IS TRUE` is `(1 = 1) IS TRUE`. This holds for `=`, `IN`,
+# `BETWEEN`, `LIKE`, and the other comparisons.
+query
+SELECT 1 = 1 IS TRUE, 1 = 2 IS FALSE, 5 > 3 IS TRUE, 5 BETWEEN 1 AND 9 IS TRUE
+----
+1	1	1	1
+
+query
+SELECT 'x' IN ('a', 'b') IS FALSE, 2 IN (1, 2) IS NOT FALSE, 'a' LIKE 'a' IS TRUE
+----
+1	1	1
+
+# A comparison whose result is NULL is UNKNOWN / IS NULL, and the IS tests chain
+# left-to-right: `NULL = 1 IS NULL` is `(NULL = 1) IS NULL`, and `NULL IS NULL IS
+# TRUE` is `(NULL IS NULL) IS TRUE`.
+query
+SELECT NULL = 1 IS NULL, NULL = 1 IS UNKNOWN, NULL IS NULL IS TRUE
+----
+1	1	1
+
 # In a WHERE predicate over a column with a NULL.
 statement ok
 CREATE TABLE IF NOT EXISTS tr_demo (id INT PRIMARY KEY, flag INT)

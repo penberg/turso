@@ -3224,39 +3224,55 @@ impl Parser {
 
     fn comparison_expr(&mut self) -> Result<ast::Expr> {
         let lhs = self.bitor_expr()?;
+        let cmp = self.comparison_ops(lhs)?;
+        // A trailing `IS [NOT] {NULL | UNKNOWN | TRUE | FALSE}` applies to the whole
+        // comparison and may chain — `1 = 1 IS TRUE`, `x IN (...) IS FALSE`,
+        // `a IS NULL IS TRUE` — at the comparison precedence MySQL gives `IS` (it is
+        // *not* a postfix only on the left primary).
+        self.is_postfix_chain(cmp)
+    }
 
-        // `IS [NOT] {NULL | UNKNOWN | TRUE | FALSE}`. `UNKNOWN` is a synonym for
-        // `NULL`. The boolean tests never yield NULL in MySQL, so `IS TRUE`
-        // lowers to `coalesce(x <> 0, 0)` and `IS FALSE` to `coalesce(x = 0, 0)`
-        // (their `IS NOT` forms flip the comparison and default to 1).
-        if self.eat_keyword("IS") {
+    /// Applies any trailing `IS [NOT] {NULL | UNKNOWN | TRUE | FALSE}` postfix(es)
+    /// to `expr`, left-associative. `UNKNOWN` is a synonym for `NULL`. The boolean
+    /// tests never yield NULL in MySQL, so `IS TRUE` lowers to
+    /// `coalesce(x <> 0, 0)` and `IS FALSE` to `coalesce(x = 0, 0)` (their `IS NOT`
+    /// forms flip the comparison and default to 1).
+    fn is_postfix_chain(&mut self, mut expr: ast::Expr) -> Result<ast::Expr> {
+        while self.eat_keyword("IS") {
             let not = self.eat_keyword("NOT");
             if self.eat_keyword("NULL") || self.eat_keyword("UNKNOWN") {
-                return Ok(if not {
-                    ast::Expr::not_null(lhs)
+                expr = if not {
+                    ast::Expr::not_null(expr)
                 } else {
-                    ast::Expr::is_null(lhs)
-                });
-            }
-            if self.eat_keyword("TRUE") {
+                    ast::Expr::is_null(expr)
+                };
+            } else if self.eat_keyword("TRUE") {
                 let (op, default) = if not {
                     (ast::Operator::Equals, "1")
                 } else {
                     (ast::Operator::NotEquals, "0")
                 };
-                return Ok(coalesce_truthiness(lhs, op, default));
-            }
-            if self.eat_keyword("FALSE") {
+                expr = coalesce_truthiness(expr, op, default);
+            } else if self.eat_keyword("FALSE") {
                 let (op, default) = if not {
                     (ast::Operator::NotEquals, "1")
                 } else {
                     (ast::Operator::Equals, "0")
                 };
-                return Ok(coalesce_truthiness(lhs, op, default));
+                expr = coalesce_truthiness(expr, op, default);
+            } else {
+                return Err(self.unexpected("`NULL`, `UNKNOWN`, `TRUE`, or `FALSE`"));
             }
-            return Err(self.unexpected("`NULL`, `UNKNOWN`, `TRUE`, or `FALSE`"));
         }
+        Ok(expr)
+    }
 
+    /// Parses the comparison operators applied to an already-parsed `lhs` — the
+    /// infix `[NOT] IN`/`BETWEEN`/`LIKE`/`REGEXP`, `<=>`, and `= <> < <= > >=`
+    /// (with their `ANY`/`SOME`/`ALL` quantified forms) — returning the comparison,
+    /// or `lhs` unchanged when none follows. The `IS` postfix is applied by the
+    /// caller, at the same precedence.
+    fn comparison_ops(&mut self, lhs: ast::Expr) -> Result<ast::Expr> {
         // Infix `[NOT] IN / BETWEEN / LIKE`. At this point any prefix `NOT` has
         // already been consumed by `not_expr`, so a `NOT` here is infix.
         let not = self.eat_keyword("NOT");
