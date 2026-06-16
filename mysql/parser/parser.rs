@@ -8499,10 +8499,13 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
 /// strftime form, so each becomes a `CASE`-over-`strftime` name lookup (see
 /// [`name_from_date`]). The no-leading-zero numeric specifiers `%e` (day), `%c`
 /// (month), and `%k` (hour) become the corresponding strftime code cast to an
-/// integer (which drops the zero padding). The pieces are concatenated with
-/// `||`. A NULL `target` makes every piece NULL, so the whole result is NULL, as
-/// in MySQL. Any other specifier (`%h`, `%p`, `%D`, the `%u`/`%V` week modes, …)
-/// is rejected rather than silently mistranslated.
+/// integer (which drops the zero padding). The 12-hour clock (`%h`/`%I`/`%l`
+/// hour, `%p` meridiem, `%r` = `hh:mm:ss AM/PM`), the ordinal day `%D` (1st,
+/// 2nd…), and the two-digit year `%y` are each a `strftime`/`CASE` expression.
+/// The pieces are concatenated with `||`. A NULL `target` makes every piece NULL,
+/// so the whole result is NULL, as in MySQL. The week-of-year modes with no
+/// matching strftime form (`%u`, `%V`, `%X`, `%x`) and microseconds (`%f`, no
+/// sub-second precision) are rejected rather than silently mistranslated.
 fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
     // A piece is a strftime format run, a name lookup, or an integer extraction
     // (a strftime code cast to an integer, which renders without leading zeros).
@@ -8513,6 +8516,7 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Meridiem,
         Hour12 { padded: bool },
         OrdinalDay,
+        YearTwoDigit,
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut run = String::new();
@@ -8600,6 +8604,18 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
                 flush(&mut run, &mut pieces);
                 pieces.push(Piece::OrdinalDay);
             }
+            // `%y` is the two-digit year (the last two digits of `%Y`).
+            Some('y') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::YearTwoDigit);
+            }
+            // `%r` is the 12-hour `hh:mm:ss AM/PM` time: `%h:%i:%s %p`.
+            Some('r') => {
+                flush(&mut run, &mut pieces);
+                pieces.push(Piece::Hour12 { padded: true });
+                pieces.push(Piece::Fmt(":%M:%S ".to_string()));
+                pieces.push(Piece::Meridiem);
+            }
             Some(other) => {
                 return Err(ParseError::Unsupported(format!(
                     "DATE_FORMAT specifier %{other} is not supported yet"
@@ -8621,6 +8637,7 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         Piece::Meridiem => meridiem_expr(target.clone()),
         Piece::Hour12 { padded } => hour12_expr(target.clone(), padded),
         Piece::OrdinalDay => ordinal_day_expr(target.clone()),
+        Piece::YearTwoDigit => year_two_digit_expr(target.clone()),
     });
     // An empty format renders strftime('', target) — the empty string for a
     // valid target, NULL for a NULL one, matching MySQL.
@@ -8631,6 +8648,20 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
     }
     Ok(acc)
+}
+
+/// Builds the two-digit year (`%y`) — `substr(strftime('%Y', arg), 3, 2)`, the
+/// last two digits of the engine's four-digit zero-padded year. NULL propagates
+/// through `strftime`/`substr`.
+fn year_two_digit_expr(arg: ast::Expr) -> ast::Expr {
+    call_fn(
+        "substr",
+        vec![
+            strftime_text("%Y", arg),
+            *numeric_expr("3"),
+            *numeric_expr("2"),
+        ],
+    )
 }
 
 /// Builds `strftime(fmt, arg)` (the text form, not cast to an integer).

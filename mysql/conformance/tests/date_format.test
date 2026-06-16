@@ -7,11 +7,11 @@
 # and expands the name specifiers (%M month name, %b abbreviated month, %W
 # weekday name, %a abbreviated weekday) to CASE lookups, and the no-leading-zero
 # numeric specifiers (%e day, %c month, %k hour) to integer casts, the 12-hour
-# clock (%l no-pad, %h/%I padded), meridiem (%p), and the day-with-ordinal-suffix
-# %D to CASE expressions, concatenating the pieces. Literal characters pass
-# through. The format must be a string literal; specifiers without any of these
-# forms (e.g. %r 12-hour time, %f microseconds, %X week-year) are rejected. See
-# mysql/COMPAT.md.
+# clock (%l no-pad, %h/%I padded, %r = hh:mm:ss AM/PM), meridiem (%p), the
+# two-digit year (%y), and the day-with-ordinal-suffix %D to CASE / strftime
+# expressions, concatenating the pieces. Literal characters pass through. The
+# format must be a string literal; specifiers without any of these forms (the
+# week modes %u/%V/%X/%x and microseconds %f) are rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -178,3 +178,31 @@ query
 SELECT DATE_FORMAT(NULL, '%D')
 ----
 NULL
+
+# %y is the two-digit year (the last two digits, zero-padded).
+query
+SELECT DATE_FORMAT(d, '%y') FROM df_demo
+----
+20
+
+query
+SELECT DATE_FORMAT('2005-01-09', '%y'), DATE_FORMAT('1999-12-31', '%y'), DATE_FORMAT('2026-06-15', '%d/%m/%y')
+----
+05	99	15/06/26
+
+# %r is the 12-hour hh:mm:ss AM/PM time. Midnight is 12 AM and noon is 12 PM.
+query
+SELECT DATE_FORMAT(d, '%r') FROM df_demo
+----
+09:07:42 AM
+
+query
+SELECT DATE_FORMAT('2026-06-15 14:05:09', '%r'), DATE_FORMAT('2026-06-15 00:30:00', '%r'), DATE_FORMAT('2026-06-15 12:00:00', '%r')
+----
+02:05:09 PM	12:30:00 AM	12:00:00 PM
+
+# %y and %r compose with other specifiers and pass NULL through.
+query
+SELECT DATE_FORMAT('2026-06-15 14:05:09', '%M %D, %y at %r'), DATE_FORMAT(NULL, '%y %r')
+----
+June 15th, 26 at 02:05:09 PM	NULL
