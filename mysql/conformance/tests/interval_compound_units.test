@@ -1,0 +1,60 @@
+# DATE_ADD / DATE_SUB with a compound INTERVAL unit.
+#
+# MySQL's compound interval units take a multi-field string: INTERVAL '1:30'
+# HOUR_MINUTE adds 1 hour 30 minutes, INTERVAL '2-3' YEAR_MONTH adds 2 years
+# 3 months, and so on. WordPress core's GMT-offset upgrade issues
+# `DATE_ADD(post_date, INTERVAL '<h>:<m>' HOUR_MINUTE)` (wp-admin/upgrade.php).
+# The front-end splits the string into one field per engine unit and lowers it
+# to a multi-modifier datetime(...). A leading `-` (and DATE_SUB) negates every
+# field. Values verified against MySQL 8.4.
+#
+# DATETIME inputs are used throughout so the engine's result keeps the time part
+# the same way a real mysqld does. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+# HOUR_MINUTE: the WordPress form, plus a negated string and DATE_SUB.
+query
+SELECT DATE_ADD('2020-01-01 10:00:00', INTERVAL '5:30' HOUR_MINUTE),
+       DATE_ADD('2020-01-01 10:00:00', INTERVAL '-5:30' HOUR_MINUTE),
+       DATE_SUB('2020-01-01 10:00:00', INTERVAL '5:30' HOUR_MINUTE)
+----
+2020-01-01 15:30:00	2020-01-01 04:30:00	2020-01-01 04:30:00
+
+# A field that overflows its range carries into the next (90 minutes).
+query
+SELECT DATE_ADD('2020-01-01 10:00:00', INTERVAL '1:90' HOUR_MINUTE)
+----
+2020-01-01 12:30:00
+
+# Three-field HOUR_SECOND and MINUTE_SECOND.
+query
+SELECT DATE_ADD('2020-01-01 10:00:00', INTERVAL '1:2:3' HOUR_SECOND),
+       DATE_ADD('2020-01-01 10:00:00', INTERVAL '5:6' MINUTE_SECOND)
+----
+2020-01-01 11:02:03	2020-01-01 10:05:06
+
+# DAY_HOUR (space separator) and DAY_SECOND (four fields).
+query
+SELECT DATE_ADD('2020-01-01 00:00:00', INTERVAL '1 5' DAY_HOUR),
+       DATE_ADD('2020-01-01 00:00:00', INTERVAL '1 2:3:4' DAY_SECOND)
+----
+2020-01-02 05:00:00	2020-01-02 02:03:04
+
+# YEAR_MONTH uses `-` as its field separator.
+query
+SELECT DATE_ADD('2020-01-01 00:00:00', INTERVAL '2-3' YEAR_MONTH)
+----
+2022-04-01 00:00:00
+
+# Over a column, as WordPress's upgrade path uses it.
+statement ok
+CREATE TABLE IF NOT EXISTS ivc (id INT PRIMARY KEY, post_date DATETIME)
+
+statement ok
+INSERT INTO ivc (id, post_date) VALUES (1, '2020-06-15 08:00:00'), (2, '2020-06-15 23:45:00')
+
+query
+SELECT id, DATE_ADD(post_date, INTERVAL '1:30' HOUR_MINUTE) FROM ivc ORDER BY id
+----
+1	2020-06-15 09:30:00
+2	2020-06-16 01:15:00

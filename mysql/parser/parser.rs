@@ -4894,14 +4894,12 @@ impl Parser {
     fn apply_interval(&mut self, target: ast::Expr, subtract: bool) -> Result<ast::Expr> {
         let negative = self.eat(&Token::Minus);
         // MySQL takes the interval amount either as a number or as a quoted
-        // numeric string and coerces the string to an integer; accept both.
+        // string; a simple unit coerces it to an integer, a compound unit splits
+        // it into fields (see below).
         let raw = match self.peek() {
             Some(Token::Num(n) | Token::Str(n)) => n.clone(),
             _ => return Err(self.unexpected("an integer interval value")),
         };
-        let value: i64 = raw.trim().parse().map_err(|_| {
-            ParseError::Unsupported("INTERVAL value must be an integer literal".to_string())
-        })?;
         self.advance();
 
         let Some(Token::Word(u)) = self.peek() else {
@@ -4910,6 +4908,16 @@ impl Parser {
         let unit = u.to_ascii_uppercase();
         self.advance();
 
+        // A compound unit (`HOUR_MINUTE`, `DAY_SECOND`, ...) takes a multi-field
+        // string like `'1:30'`; WordPress's GMT-offset upgrade uses
+        // `INTERVAL '<h>:<m>' HOUR_MINUTE`.
+        if let Some(fields) = compound_interval_units(&unit) {
+            return build_compound_interval(target, &raw, &unit, fields, negative ^ subtract);
+        }
+
+        let value: i64 = raw.trim().parse().map_err(|_| {
+            ParseError::Unsupported("INTERVAL value must be an integer literal".to_string())
+        })?;
         // Map the MySQL unit onto the engine's modifier unit (`WEEK`/`QUARTER`
         // are expanded to days/months).
         let (engine_unit, multiplier) = interval_unit_modifier(&unit).ok_or_else(|| {
@@ -5808,6 +5816,75 @@ fn interval_unit_modifier(unit: &str) -> Option<(&'static str, i64)> {
         "MINUTE" => ("minutes", 1),
         "SECOND" => ("seconds", 1),
         _ => return None,
+    })
+}
+
+/// The ordered engine modifier units of a MySQL compound interval unit (e.g.
+/// `HOUR_MINUTE` → hours then minutes), or `None` if `unit` is not compound. The
+/// interval value is a string with one numeric field per returned unit.
+fn compound_interval_units(unit: &str) -> Option<&'static [&'static str]> {
+    Some(match unit {
+        "YEAR_MONTH" => &["years", "months"],
+        "DAY_HOUR" => &["days", "hours"],
+        "DAY_MINUTE" => &["days", "hours", "minutes"],
+        "DAY_SECOND" => &["days", "hours", "minutes", "seconds"],
+        "HOUR_MINUTE" => &["hours", "minutes"],
+        "HOUR_SECOND" => &["hours", "minutes", "seconds"],
+        "MINUTE_SECOND" => &["minutes", "seconds"],
+        _ => return None,
+    })
+}
+
+/// Lowers a compound `INTERVAL '<fields>' UNIT` (e.g. `'1:30' HOUR_MINUTE`) to a
+/// multi-modifier `datetime(target, '±h hours', '±m minutes')`. The value string
+/// is split into one numeric field per engine unit (on any non-digit run, so
+/// `:`, space, and `-` all separate). A leading `-` on the whole string negates
+/// every field; `net_negate` folds in that the caller is `DATE_SUB` or had a
+/// `-` token before the literal. Verified against MySQL 8.4.
+fn build_compound_interval(
+    target: ast::Expr,
+    raw: &str,
+    unit: &str,
+    fields: &[&str],
+    net_negate: bool,
+) -> Result<ast::Expr> {
+    let s = raw.trim();
+    let (s, leading_neg) = match s.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (s.strip_prefix('+').unwrap_or(s), false),
+    };
+    let parts: Vec<&str> = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() != fields.len() {
+        return Err(ParseError::Unsupported(format!(
+            "INTERVAL '{raw}' {unit} expects {} numeric field(s)",
+            fields.len()
+        )));
+    }
+    let negate = net_negate ^ leading_neg;
+
+    let mut args = vec![Box::new(target)];
+    for (part, field) in parts.iter().zip(fields) {
+        let value: i64 = part.parse().map_err(|_| {
+            ParseError::Unsupported(format!("INTERVAL '{raw}' {unit} has a non-integer field"))
+        })?;
+        let signed = if negate { -value } else { value };
+        args.push(Box::new(ast::Expr::Literal(ast::Literal::String(requote(
+            &format!("{signed:+} {field}"),
+        )))));
+    }
+    Ok(ast::Expr::FunctionCall {
+        name: ast::Name::from_string("datetime"),
+        distinctness: None,
+        args,
+        order_by: Vec::new(),
+        within_group: Vec::new(),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
     })
 }
 
@@ -8989,6 +9066,56 @@ mod tests {
         // A non-literal interval value, or a non-numeric string, is rejected.
         assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
         assert!(parse_expr("DATE_ADD(d, INTERVAL 'abc' DAY)").is_err());
+    }
+
+    #[test]
+    fn compound_interval_lowers_to_multi_modifier_datetime() {
+        // `INTERVAL 'h:m' HOUR_MINUTE` -> datetime(d, '+h hours', '+m minutes').
+        let datetime_mods = |sql: &str| -> Vec<String> {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a datetime() call");
+            };
+            assert_eq!(name.as_str(), "datetime");
+            args[1..]
+                .iter()
+                .map(|a| match a.as_ref() {
+                    ast::Expr::Literal(ast::Literal::String(s)) => s.clone(),
+                    other => panic!("expected a string modifier, got {other:?}"),
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            datetime_mods("DATE_ADD(d, INTERVAL '5:30' HOUR_MINUTE)"),
+            ["'+5 hours'", "'+30 minutes'"]
+        );
+        // A leading `-` on the string negates every field.
+        assert_eq!(
+            datetime_mods("DATE_ADD(d, INTERVAL '-5:30' HOUR_MINUTE)"),
+            ["'-5 hours'", "'-30 minutes'"]
+        );
+        // DATE_SUB also negates every field.
+        assert_eq!(
+            datetime_mods("DATE_SUB(d, INTERVAL '5:30' HOUR_MINUTE)"),
+            ["'-5 hours'", "'-30 minutes'"]
+        );
+        // Three- and four-field units, and `-`/space separators.
+        assert_eq!(
+            datetime_mods("DATE_ADD(d, INTERVAL '1:2:3' HOUR_SECOND)"),
+            ["'+1 hours'", "'+2 minutes'", "'+3 seconds'"]
+        );
+        assert_eq!(
+            datetime_mods("DATE_ADD(d, INTERVAL '2-3' YEAR_MONTH)"),
+            ["'+2 years'", "'+3 months'"]
+        );
+        assert_eq!(
+            datetime_mods("DATE_ADD(d, INTERVAL '1 2:3:4' DAY_SECOND)"),
+            ["'+1 days'", "'+2 hours'", "'+3 minutes'", "'+4 seconds'"]
+        );
+
+        // The wrong number of fields for the unit is rejected.
+        assert!(parse_expr("DATE_ADD(d, INTERVAL '5' HOUR_MINUTE)").is_err());
+        assert!(parse_expr("DATE_ADD(d, INTERVAL '1:2:3' HOUR_MINUTE)").is_err());
     }
 
     #[test]
