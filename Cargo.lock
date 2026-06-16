@@ -6737,6 +6737,7 @@ version = "0.7.0-pre.6"
 dependencies = [
  "anyhow",
  "clap",
+ "limbo_crypto",
  "tokio",
  "tracing",
  "tracing-subscriber",

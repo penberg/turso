@@ -17,6 +17,7 @@ path = "main.rs"
 turso-mysql-protocol = { workspace = true }
 turso-mysql-parser = { workspace = true }
 turso_core = { workspace = true, default-features = true }
+limbo_crypto = { workspace = true, features = ["static"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",

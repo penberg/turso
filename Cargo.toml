@@ -105,6 +105,7 @@ turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.6" }
 turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.6" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.6" }
 limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.6" }
+limbo_crypto = { path = "extensions/crypto", version = "0.7.0-pre.6" }
 turso_core = { path = "core", version = "0.7.0-pre.6" }
 turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.6" }
 turso_ext = { path = "extensions/core", version = "0.7.0-pre.6" }

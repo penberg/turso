@@ -124,6 +124,14 @@ impl StatementStore {
 pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> anyhow::Result<()> {
     let mut wire = Wire::new(stream);
     let conn = server.db.connect()?;
+    // Register the crypto extension so MySQL's MD5/SHA1/SHA2 (which the front-end
+    // lowers to `crypto_md5`/`crypto_sha1`/`crypto_sha256`, …) resolve. The engine
+    // does not bundle hashing as a builtin.
+    unsafe {
+        let mut ext_api = conn._build_turso_ext();
+        let _ = limbo_crypto::register_extension_static(&mut ext_api);
+        conn._free_extension_ctx(ext_api);
+    }
     let mut statements = StatementStore::default();
     // The unlimited row count remembered from the last `SQL_CALC_FOUND_ROWS`
     // query, answered by a subsequent `SELECT FOUND_ROWS()`.

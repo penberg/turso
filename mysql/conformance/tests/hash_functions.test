@@ -1,0 +1,70 @@
+# MD5 / SHA1 / SHA / SHA2 hashing.
+#
+# MySQL's MD5, SHA1 (and its SHA alias), and SHA2 hash a string and return the
+# lowercase hex digest. The engine has no builtin hashing, so the server loads
+# the crypto extension and the front-end lowers these to its crypto_md5 /
+# crypto_sha1 / crypto_sha256 / crypto_sha384 / crypto_sha512 functions, wrapped
+# as lower(hex(...)) — the argument is cast to text first, so a numeric argument
+# is hashed as its string form (MD5(123) is MD5('123')), and NULL propagates.
+# WordPress hashes heavily (cache and transient keys, $wpdb placeholders).
+#
+# Verified against MySQL 8.4. Uses a file-unique table name.
+
+# MD5 is a 32-character lowercase hex digest.
+query
+SELECT MD5('hello'), MD5('')
+----
+5d41402abc4b2a76b9719d911017c592	d41d8cd98f00b204e9800998ecf8427e
+
+# SHA1 (and the SHA alias) are 40-character digests.
+query
+SELECT SHA1('hello'), SHA('abc')
+----
+aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d	a9993e364706816aba3e25717850c26c9cd0d89d
+
+# SHA2 selects the variant by bit length; 0 is an alias for 256.
+query
+SELECT SHA2('hello', 256), SHA2('hello', 0)
+----
+2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824	2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+
+# SHA2 384 and 512.
+query
+SELECT SHA2('hello', 384)
+----
+59e1748777448c69de6b800d7a33bbfb9ff1b463e44354c3553bcdb9c666fa90125a3c79f90397bdf5f6a13de828684f
+
+query
+SELECT SHA2('hello', 512)
+----
+9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043
+
+# Digest lengths.
+query
+SELECT LENGTH(MD5('x')), LENGTH(SHA1('x')), LENGTH(SHA2('x', 256))
+----
+32	40	64
+
+# A numeric argument is hashed as its string form.
+query
+SELECT MD5(123) = MD5('123')
+----
+1
+
+# NULL propagates through every variant.
+query
+SELECT MD5(NULL), SHA1(NULL), SHA2(NULL, 256)
+----
+NULL	NULL	NULL
+
+# Usable over a column and in a WHERE predicate.
+statement ok
+CREATE TABLE hashfn (id INT PRIMARY KEY, k VARCHAR(50))
+
+statement ok
+INSERT INTO hashfn VALUES (1, 'alpha'), (2, 'beta')
+
+query
+SELECT id FROM hashfn WHERE MD5(k) = MD5('beta')
+----
+2

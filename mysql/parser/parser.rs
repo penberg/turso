@@ -3909,6 +3909,20 @@ impl Parser {
             return self.strcmp_call();
         }
 
+        // `MD5(s)` / `SHA1(s)` (and its `SHA` alias) / `SHA2(s, n)` hash a string
+        // and return its lowercase hex digest, mapped onto the crypto extension
+        // (see `crypto_hash_call` / `sha2_call`). WordPress hashes heavily (cache
+        // and transient keys, `$wpdb` placeholders).
+        if upper == "MD5" {
+            return self.crypto_hash_call("crypto_md5");
+        }
+        if upper == "SHA1" || upper == "SHA" {
+            return self.crypto_hash_call("crypto_sha1");
+        }
+        if upper == "SHA2" {
+            return self.sha2_call();
+        }
+
         // `HEX(x)` is overloaded: the uppercase hex of a number, or the hex of a
         // string's bytes (see `hex_call`).
         if upper == "HEX" {
@@ -5274,6 +5288,46 @@ impl Parser {
             ],
             else_expr: Some(numeric_expr("0")),
         })
+    }
+
+    /// Parses a single-argument hash function (`MD5`, `SHA1`/`SHA`) — the name
+    /// and `(` already consumed — and lowers it to the lowercase hex digest of
+    /// the crypto extension's `engine_fn` (see [`crypto_hex_digest`]).
+    fn crypto_hash_call(&mut self, engine_fn: &str) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(crypto_hex_digest(engine_fn, arg))
+    }
+
+    /// Parses `SHA2(s, n)` (the name and `(` already consumed), where `n` selects
+    /// the SHA-2 variant — 256, 384, or 512 (`0` is MySQL's alias for 256). It
+    /// lowers to the lowercase hex digest of the matching crypto hash. `n` must
+    /// be an integer literal; 224 has no engine hash and is rejected.
+    fn sha2_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let bits = match self.expr()? {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<i64>().map_err(|_| {
+                ParseError::Unsupported("SHA2() length must be an integer literal".to_string())
+            })?,
+            _ => {
+                return Err(ParseError::Unsupported(
+                    "SHA2() length must be an integer literal".to_string(),
+                ))
+            }
+        };
+        self.expect(&Token::RParen, "`)`")?;
+        let engine_fn = match bits {
+            0 | 256 => "crypto_sha256",
+            384 => "crypto_sha384",
+            512 => "crypto_sha512",
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "SHA2() length {other} is not supported yet (only 256, 384, and 512)"
+                )))
+            }
+        };
+        Ok(crypto_hex_digest(engine_fn, arg))
     }
 
     /// Parses MySQL `OCT(n)` (the name and `(` are already consumed): the octal
@@ -7291,6 +7345,33 @@ fn repeat_expr(s: ast::Expr, n: ast::Expr) -> ast::Expr {
             Box::new(ast::Expr::Literal(ast::Literal::Null)),
         )],
         else_expr: Some(Box::new(repeated)),
+    }
+}
+
+/// Builds `CASE WHEN s IS NULL THEN NULL ELSE lower(hex(<engine_fn>(CAST(s AS
+/// TEXT)))) END` — the lowercase hex digest MySQL's hash functions
+/// (`MD5`/`SHA1`/`SHA2`) return. MySQL hashes the *string* form of its argument,
+/// so a numeric `s` is cast to text first (`MD5(123)` is `MD5('123')`). The
+/// crypto extension's hash returns the raw digest *bytes*, so `hex` renders them
+/// and `lower` matches MySQL's lowercase output; the guard propagates a NULL
+/// argument as MySQL does.
+fn crypto_hex_digest(engine_fn: &str, arg: ast::Expr) -> ast::Expr {
+    let text = ast::Expr::Cast {
+        expr: Box::new(arg.clone()),
+        type_name: Some(ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    let digest = unary_fn("lower", unary_fn("hex", call_fn(engine_fn, vec![text])));
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(ast::Expr::is_null(arg)),
+            Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        )],
+        else_expr: Some(Box::new(digest)),
     }
 }
 
@@ -13517,6 +13598,46 @@ mod tests {
             matches!(lhs.as_ref(), ast::Expr::Collate(_, name) if name.as_str() == "NOCASE"),
             "expected the left operand to carry COLLATE NOCASE"
         );
+    }
+
+    #[test]
+    fn hash_functions_lower_to_crypto_hex_digest() {
+        // MD5/SHA1/SHA/SHA2 -> CASE WHEN s IS NULL THEN NULL ELSE
+        // lower(hex(<crypto fn>(CAST(s AS TEXT)))) END.
+        let crypto_fn = |sql: &str| -> String {
+            let ast::Expr::Case { else_expr, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone()
+            else {
+                panic!("expected the else branch to be lower(...) for `{sql}`");
+            };
+            assert_eq!(name.as_str(), "lower");
+            let ast::Expr::FunctionCall { name, args, .. } = args[0].as_ref() else {
+                panic!("expected hex(...) inside lower for `{sql}`");
+            };
+            assert_eq!(name.as_str(), "hex");
+            let ast::Expr::FunctionCall { name, args, .. } = args[0].as_ref() else {
+                panic!("expected the crypto call inside hex for `{sql}`");
+            };
+            // Its argument is a CAST(... AS TEXT) so numeric inputs hash as text.
+            assert!(matches!(
+                args[0].as_ref(),
+                ast::Expr::Cast { type_name: Some(t), .. } if t.name == "TEXT"
+            ));
+            name.as_str().to_string()
+        };
+        assert_eq!(crypto_fn("MD5(s)"), "crypto_md5");
+        assert_eq!(crypto_fn("SHA1(s)"), "crypto_sha1");
+        assert_eq!(crypto_fn("SHA(s)"), "crypto_sha1");
+        assert_eq!(crypto_fn("SHA2(s, 256)"), "crypto_sha256");
+        assert_eq!(crypto_fn("SHA2(s, 0)"), "crypto_sha256");
+        assert_eq!(crypto_fn("SHA2(s, 384)"), "crypto_sha384");
+        assert_eq!(crypto_fn("SHA2(s, 512)"), "crypto_sha512");
+        // An unsupported SHA2 length (e.g. 224) and a non-literal length are
+        // rejected.
+        assert!(parse_expr("SHA2(s, 224)").is_err());
+        assert!(parse_expr("SHA2(s, n)").is_err());
     }
 
     #[test]
