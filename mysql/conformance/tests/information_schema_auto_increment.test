@@ -1,0 +1,51 @@
+# information_schema.TABLES AUTO_INCREMENT column.
+#
+# MySQL exposes a table's next AUTO_INCREMENT value in information_schema.TABLES.
+# WordPress reads it to obtain an id that does not exist yet -- the
+# Tests_User_CountUserPosts suite does `SELECT auto_increment FROM
+# INFORMATION_SCHEMA.TABLES WHERE table_name = '$wpdb->users'`. The synthesized
+# TABLES view did not expose the column, so the reference errored.
+#
+# The column now reports the next value from the engine's sqlite_sequence
+# bookkeeping (seq + 1) for a table declared AUTO_INCREMENT, and NULL for a table
+# without an auto-increment column -- matching MySQL right after the rows are
+# inserted. (MySQL caches this value in its data dictionary and only refreshes it
+# on stats expiry, so after further inserts a real server can report a stale
+# value where the front-end reports the live one -- a divergence noted in
+# mysql/COMPAT.md. The queries below read the value once, right after the insert,
+# where both agree.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ai_meta_demo (id INT PRIMARY KEY AUTO_INCREMENT, v INT)
+
+statement ok
+INSERT INTO ai_meta_demo (v) VALUES (10), (20), (30)
+
+# Three auto-generated ids (1, 2, 3) were used, so the next value is 4.
+query
+SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_NAME = 'ai_meta_demo'
+----
+4
+
+# The exact backtick-quoted, schema-unqualified form the WordPress test issues.
+query
+SELECT `auto_increment` FROM INFORMATION_SCHEMA.TABLES WHERE table_name = 'ai_meta_demo'
+----
+4
+
+# A table with no AUTO_INCREMENT column reports NULL, as in MySQL.
+statement ok
+CREATE TABLE IF NOT EXISTS plain_meta_demo (id INT PRIMARY KEY, v INT)
+
+query
+SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_NAME = 'plain_meta_demo'
+----
+NULL
+
+# The other TABLES columns are unaffected and still resolve alongside it.
+query
+SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'ai_meta_demo'
+----
+ai_meta_demo	InnoDB

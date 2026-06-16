@@ -68,6 +68,20 @@ fn open_database(path: &str) -> anyhow::Result<Arc<Database>> {
     let opts = DatabaseOpts::new().with_attach(true);
     let (_io, db) = Database::open_new(path, None::<&str>, OpenFlags::default(), opts, None)
         .with_context(|| format!("opening database {path}"))?;
+    // Materialize the engine's `sqlite_sequence` bookkeeping table — which the
+    // engine creates only once some `AUTOINCREMENT` table exists — by creating
+    // and immediately dropping a throwaway one. `sqlite_sequence` persists after
+    // the drop (empty), so the `information_schema.TABLES` emulation can always
+    // reference it for the `AUTO_INCREMENT` column, even in a database that has
+    // no auto-increment tables of its own. Best-effort: if it fails, only that
+    // column degrades (to an error) for such a database.
+    if let Ok(conn) = db.connect() {
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS __mysql_autoincrement_seq_init \
+             (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+        );
+        let _ = conn.execute("DROP TABLE IF EXISTS __mysql_autoincrement_seq_init");
+    }
     Ok(db)
 }
 

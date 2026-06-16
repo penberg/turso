@@ -10380,7 +10380,11 @@ fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Sel
          'BASE TABLE' AS TABLE_TYPE, \
          0 AS TABLE_ROWS, \
          0 AS DATA_LENGTH, \
-         0 AS INDEX_LENGTH \
+         0 AS INDEX_LENGTH, \
+         CASE WHEN sqlite_schema.sql LIKE '%AUTOINCREMENT%' \
+              THEN (SELECT seq + 1 FROM sqlite_sequence \
+                    WHERE sqlite_sequence.name = sqlite_schema.name) \
+              ELSE NULL END AS AUTO_INCREMENT \
          FROM sqlite_schema \
          WHERE type = 'table' \
          AND name NOT LIKE 'sqlite_%' \
