@@ -266,7 +266,8 @@ incomplete.
 | DELETE FROM tbl [WHERE] (single table) | ✅     |         |
 | DELETE `t1[, t2, ...] FROM <refs> [WHERE]` (multi-table) | ✅ | Lowered to `DELETE FROM <table> WHERE rowid IN (SELECT t1.rowid FROM <refs> [WHERE] [UNION SELECT t2.rowid ...])`. The `rowid` subquery (including the `UNION` over every target) is materialized before any row is deleted, so it matches MySQL without a two-phase delete. Targets may be table names or `FROM` aliases; the join may be comma or `JOIN ... ON`. **All targets must resolve to the same table** (e.g. WordPress's transient-cleanup self-join); targets on different tables are rejected. |
 | DELETE `... LIMIT n` (single table)    | ✅     | The count-only `LIMIT` caps the rows deleted (no `OFFSET`). Without an `ORDER BY` the affected rows are unspecified on both MySQL and the engine, so they match. |
-| DELETE (`... USING` / `ORDER BY`)      | ❌     | **Not supported** — `ORDER BY` because the engine cannot order a `DELETE`. |
+| DELETE `... ORDER BY ... LIMIT n` (single table) | ✅ | The engine cannot order a `DELETE` in place, so the ordering and row cap are folded into a `WHERE rowid IN (SELECT rowid FROM tbl [WHERE ...] ORDER BY ... LIMIT n)` subquery, which selects exactly the rows MySQL would delete (the subquery is materialized first). |
+| DELETE `... USING`                     | ❌     | **Not supported.** |
 | DO                                     | ❌     |         |
 | EXCEPT clause                          | ❌     |         |
 | HANDLER                                | ❌     |         |
@@ -304,7 +305,8 @@ incomplete.
 | TABLE statement                        | ❌     |         |
 | UPDATE tbl SET ... [WHERE] (single table) | ✅  |         |
 | UPDATE `... LIMIT n` (single table)    | ✅     | The count-only `LIMIT` caps the rows updated (no `OFFSET`); the affected rows are unspecified without an `ORDER BY`, matching MySQL. |
-| UPDATE (multi-table / ORDER BY)        | ❌     | **Not supported** — `ORDER BY` because the engine cannot order an `UPDATE`. |
+| UPDATE `... ORDER BY ... LIMIT n` (single table) | ✅ | Rewritten the same way as the `DELETE` form: `... WHERE rowid IN (SELECT rowid FROM tbl [WHERE ...] ORDER BY ... LIMIT n)`, so the n rows updated are the ones MySQL would pick by sort order. |
+| UPDATE (multi-table)                   | ❌     | **Not supported.** |
 | VALUES statement                       | ❌     |         |
 | WITH (Common Table Expressions)        | ❌     |         |
 

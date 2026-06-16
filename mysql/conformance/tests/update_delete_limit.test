@@ -1,10 +1,11 @@
 # UPDATE / DELETE ... LIMIT conformance.
 #
 # MySQL allows a row-count LIMIT on UPDATE and DELETE: it caps the number of
-# affected rows. Without an ORDER BY (which the engine cannot honor on
-# UPDATE/DELETE, so it stays rejected) the affected rows are unspecified on both
-# MySQL and the engine, so the tests assert only counts -- never which specific
-# rows -- which is deterministic. The count-only form is required (no OFFSET).
+# affected rows. Without an ORDER BY the affected rows are unspecified on both
+# MySQL and the engine, so those tests assert only counts -- never which
+# specific rows. With an ORDER BY ... LIMIT the affected rows are determined by
+# sort order (see dml_order_by_limit.test for that rewrite). The count-only
+# LIMIT form is required (no OFFSET).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table names.
@@ -63,12 +64,32 @@ SELECT COUNT(*) FROM udl_d
 ----
 0
 
-# ORDER BY on UPDATE/DELETE is rejected (the engine cannot honor it).
-statement error
-DELETE FROM udl_u ORDER BY id LIMIT 1
+# ORDER BY ... LIMIT on UPDATE/DELETE is rewritten through a rowid subquery, so
+# it picks specific rows by sort order (deterministic). udl_u holds ids 1-5, all
+# flag = 1.
+statement ok
+DELETE FROM udl_u ORDER BY id ASC LIMIT 1
 
-statement error
-UPDATE udl_u SET flag = 0 ORDER BY id LIMIT 1
+# The smallest id (1) was deleted.
+query
+SELECT id FROM udl_u ORDER BY id
+----
+2
+3
+4
+5
+
+statement ok
+UPDATE udl_u SET flag = 0 ORDER BY id DESC LIMIT 1
+
+# The largest id (5) was flipped to 0.
+query
+SELECT id, flag FROM udl_u ORDER BY id
+----
+2	1
+3	1
+4	1
+5	0
 
 # An OFFSET on the row-count LIMIT is rejected (MySQL does not allow it here).
 statement error

@@ -2184,9 +2184,56 @@ impl Parser {
 
     // === UPDATE ===
 
-    /// Parses `UPDATE tbl SET col = expr [, ...] [WHERE expr]`. Multi-table
-    /// updates, `ORDER BY`/`LIMIT`, and the `LOW_PRIORITY`/`IGNORE` modifiers are
-    /// rejected as unsupported.
+    /// Builds the `rowid IN (SELECT rowid FROM tbl [WHERE cond] ORDER BY ord
+    /// LIMIT n)` predicate used to rewrite a single-table `DELETE`/`UPDATE ...
+    /// ORDER BY ... LIMIT`. The engine cannot order a `DELETE`/`UPDATE` in place,
+    /// so the ordering and row cap are folded into a subquery that selects
+    /// exactly the rows MySQL would touch (by rowid), and the outer statement's
+    /// `WHERE` becomes a membership test against them. `tbl_name` is the single
+    /// target table; `where_clause`/`order_by`/`limit` are the parsed outer
+    /// clauses, moved into the subquery.
+    fn rowid_in_ordered_subquery(
+        &self,
+        tbl_name: &ast::QualifiedName,
+        where_clause: Option<Box<ast::Expr>>,
+        order_by: Vec<ast::SortedColumn>,
+        limit: Option<ast::Limit>,
+    ) -> ast::Expr {
+        let select = ast::OneSelect::Select {
+            distinctness: None,
+            columns: vec![ast::ResultColumn::Expr(
+                Box::new(ast::Expr::Id(ast::Name::from_string("rowid"))),
+                None,
+            )],
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Table(tbl_name.clone(), None, None)),
+                joins: Vec::new(),
+            }),
+            where_clause,
+            group_by: None,
+            window_clause: Vec::new(),
+        };
+        let subquery = ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select,
+                compounds: Vec::new(),
+            },
+            order_by,
+            limit,
+        };
+        ast::Expr::InSelect {
+            lhs: Box::new(ast::Expr::Id(ast::Name::from_string("rowid"))),
+            not: false,
+            rhs: subquery,
+        }
+    }
+
+    /// Parses `UPDATE tbl SET col = expr [, ...] [WHERE expr] [ORDER BY ...]
+    /// [LIMIT n]`. A bare `LIMIT n` caps the affected-row count directly; an
+    /// `ORDER BY` (with or without `LIMIT`) is rewritten through a `rowid`
+    /// subquery (see [`Self::rowid_in_ordered_subquery`]). Multi-table updates
+    /// and the `LOW_PRIORITY` modifier are not translated.
     fn update(&mut self) -> Result<ast::Stmt> {
         // `UPDATE` has already been consumed. `LOW_PRIORITY` is a locking hint
         // with no result effect; consume it. `UPDATE IGNORE` skips a row whose
@@ -2228,14 +2275,28 @@ impl Parser {
             None
         };
 
-        // `ORDER BY` is rejected — the engine cannot order an UPDATE — but the
-        // count-only `LIMIT` is honored.
-        if self.is_keyword("ORDER") {
-            return Err(ParseError::Unsupported(
-                "ORDER BY on UPDATE is not supported yet".to_string(),
-            ));
-        }
+        // `ORDER BY ... LIMIT n` picks the n rows to update by sort order. The
+        // engine cannot order an UPDATE, so fold the ordering and cap into a
+        // `rowid` subquery; a bare `LIMIT n` is passed through (the engine caps
+        // the affected-row count directly).
+        let order_by = self.order_by()?;
         let limit = self.row_limit()?;
+        if !order_by.is_empty() {
+            let where_clause =
+                self.rowid_in_ordered_subquery(&tbl_name, where_clause, order_by, limit);
+            return Ok(ast::Stmt::Update(ast::Update {
+                with: None,
+                or_conflict,
+                tbl_name,
+                indexed: None,
+                sets,
+                from: None,
+                where_clause: Some(Box::new(where_clause)),
+                returning: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+            }));
+        }
 
         Ok(ast::Stmt::Update(ast::Update {
             with: None,
@@ -2381,14 +2442,25 @@ impl Parser {
             None
         };
 
-        // `ORDER BY` is rejected — the engine cannot order a DELETE — but the
-        // count-only `LIMIT` is honored.
-        if self.is_keyword("ORDER") {
-            return Err(ParseError::Unsupported(
-                "ORDER BY on DELETE is not supported yet".to_string(),
-            ));
-        }
+        // `ORDER BY ... LIMIT n` deletes the n rows that sort first. The engine
+        // cannot order a DELETE, so fold the ordering and cap into a `rowid`
+        // subquery; a bare `LIMIT n` is passed through (the engine caps the
+        // affected-row count directly).
+        let order_by = self.order_by()?;
         let limit = self.row_limit()?;
+        if !order_by.is_empty() {
+            let where_clause =
+                self.rowid_in_ordered_subquery(&tbl_name, where_clause, order_by, limit);
+            return Ok(ast::Stmt::Delete {
+                with: None,
+                tbl_name,
+                indexed: None,
+                where_clause: Some(Box::new(where_clause)),
+                returning: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+            });
+        }
 
         Ok(ast::Stmt::Delete {
             with: None,
@@ -10737,9 +10809,7 @@ mod tests {
     fn update_unsupported_variants() {
         for sql in [
             "UPDATE a, b SET a.x = 1",
-            // ORDER BY (the engine cannot order an UPDATE) and a LIMIT with an
-            // offset stay rejected.
-            "UPDATE t SET a = 1 ORDER BY a",
+            // A LIMIT with an offset stays rejected (MySQL allows only a count).
             "UPDATE t SET a = 1 LIMIT 1, 2",
         ] {
             assert!(
@@ -10754,6 +10824,28 @@ mod tests {
             panic!("expected an Update");
         };
         assert!(update.limit.is_some());
+    }
+
+    #[test]
+    fn update_order_by_limit_rewrites_to_rowid_subquery() {
+        // `UPDATE ... ORDER BY ... LIMIT n` becomes
+        // `UPDATE ... WHERE rowid IN (SELECT rowid FROM t WHERE ... ORDER BY ... LIMIT n)`.
+        let ast::Stmt::Update(update) =
+            parse("UPDATE t SET a = 1 WHERE b = 2 ORDER BY a DESC LIMIT 5").unwrap()
+        else {
+            panic!("expected an Update");
+        };
+        // The outer ORDER BY / LIMIT are folded away.
+        assert!(update.order_by.is_empty());
+        assert!(update.limit.is_none());
+        // The WHERE is now `rowid IN (SELECT rowid FROM t ... ORDER BY ... LIMIT 5)`.
+        let ast::Expr::InSelect { lhs, not, rhs } = update.where_clause.as_deref().unwrap() else {
+            panic!("expected a rowid IN (subquery) WHERE");
+        };
+        assert!(!not);
+        assert!(matches!(lhs.as_ref(), ast::Expr::Id(n) if n.as_str() == "rowid"));
+        assert_eq!(rhs.order_by.len(), 1);
+        assert!(rhs.limit.is_some());
     }
 
     #[test]
@@ -10814,8 +10906,7 @@ mod tests {
             "DELETE t1, t2 FROM t1, t2 WHERE t1.id = t2.id", // multiple target tables
             "DELETE FROM a, b",
             "DELETE FROM t USING u",
-            // ORDER BY (unorderable) and an offset on the LIMIT stay rejected.
-            "DELETE FROM t ORDER BY a",
+            // An offset on the LIMIT stays rejected (MySQL allows only a count).
             "DELETE FROM t LIMIT 1, 2",
         ] {
             assert!(
@@ -10830,6 +10921,34 @@ mod tests {
             panic!("expected a Delete");
         };
         assert!(limit.is_some());
+    }
+
+    #[test]
+    fn delete_order_by_limit_rewrites_to_rowid_subquery() {
+        // `DELETE ... ORDER BY ... LIMIT n` becomes
+        // `DELETE ... WHERE rowid IN (SELECT rowid FROM t WHERE ... ORDER BY ... LIMIT n)`.
+        let ast::Stmt::Delete {
+            where_clause,
+            order_by,
+            limit,
+            ..
+        } = parse("DELETE FROM t WHERE a > 0 ORDER BY a LIMIT 2").unwrap()
+        else {
+            panic!("expected a Delete");
+        };
+        assert!(order_by.is_empty());
+        assert!(limit.is_none());
+        let ast::Expr::InSelect { lhs, rhs, .. } = where_clause.as_deref().unwrap() else {
+            panic!("expected a rowid IN (subquery) WHERE");
+        };
+        assert!(matches!(lhs.as_ref(), ast::Expr::Id(n) if n.as_str() == "rowid"));
+        assert_eq!(rhs.order_by.len(), 1);
+        assert!(rhs.limit.is_some());
+        // The original WHERE moved into the subquery.
+        let ast::OneSelect::Select { where_clause, .. } = &rhs.body.select else {
+            panic!("expected a SELECT subquery");
+        };
+        assert!(where_clause.is_some());
     }
 
     #[test]
