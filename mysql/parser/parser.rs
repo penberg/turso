@@ -4153,9 +4153,10 @@ impl Parser {
         self.expect(&Token::RParen, "`)`")?;
 
         // An aggregate may carry an `OVER (...)` window spec, turning it into a
-        // windowed aggregate (e.g. a running total); the engine evaluates these.
-        // Scalar functions take no window.
-        let over_clause = if is_aggregate_function(&upper) {
+        // windowed aggregate (e.g. a running total); a dedicated window function
+        // like `ROW_NUMBER()` always carries one. The engine evaluates both.
+        // Plain scalar functions take no window.
+        let over_clause = if is_aggregate_function(&upper) || is_window_function(&upper) {
             self.parse_over_clause()?
         } else {
             None
@@ -7571,6 +7572,11 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Aggregate functions. `AVG` (the mean, ignoring NULLs — and `AVG(DISTINCT
         // x)`) maps to the engine's `avg`, which behaves identically.
         | "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+        // Window function. `ROW_NUMBER()` (always with an `OVER` clause) maps to
+        // the engine's `row_number`, which numbers the rows of each partition in
+        // the window's order, identically to MySQL. The other MySQL window
+        // functions (`RANK`, `LAG`, `NTILE`, …) have no engine equivalent yet.
+        | "ROW_NUMBER"
     )
 }
 
@@ -7787,6 +7793,13 @@ fn current_time_function(upper_name: &str) -> Option<&'static str> {
 /// quantifier. `upper_name` must already be uppercased.
 fn is_aggregate_function(upper_name: &str) -> bool {
     matches!(upper_name, "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
+}
+
+/// The dedicated window functions, which always carry an `OVER` clause (and so
+/// must parse one) but are not aggregates. Only `ROW_NUMBER` is supported — the
+/// one the engine implements. `upper_name` must already be uppercased.
+fn is_window_function(upper_name: &str) -> bool {
+    matches!(upper_name, "ROW_NUMBER")
 }
 
 /// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
@@ -9243,6 +9256,21 @@ mod tests {
         // A scalar function does not take a window (the OVER is left unparsed).
         let mut p = Parser::new(b"ABS(x) OVER ()").unwrap();
         assert!(!(p.expr().is_ok() && p.peek().is_none()));
+
+        // ROW_NUMBER() is a window function: it parses its (required) OVER clause
+        // and keeps its name for the engine.
+        let ast::Expr::FunctionCall { name, args, filter_over, .. } =
+            parse_expr("ROW_NUMBER() OVER (PARTITION BY g ORDER BY v)").unwrap()
+        else {
+            panic!("expected ROW_NUMBER to parse as a function call");
+        };
+        assert_eq!(name.as_str().to_ascii_lowercase(), "row_number");
+        assert!(args.is_empty());
+        let Some(ast::Over::Window(w)) = filter_over.over_clause else {
+            panic!("expected an OVER window clause on ROW_NUMBER");
+        };
+        assert_eq!(w.partition_by.len(), 1);
+        assert_eq!(w.order_by.len(), 1);
     }
 
     #[test]
