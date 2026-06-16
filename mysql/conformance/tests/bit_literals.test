@@ -1,0 +1,52 @@
+# MySQL bit-value literals: 0b101 and b'101' / B'101'.
+#
+# In MySQL a bit literal is a binary string -- its bits packed into bytes, left-
+# padded to a whole number of bytes: b'1000001' is the byte 0x41 ('A'). The
+# front-end lexes both the `0b..` and `b'..'` forms into the engine's blob
+# literal (the same blob the matching hex literal produces), so they evaluate as
+# the bytes they encode.
+#
+# In a *string* context this matches MySQL exactly; in a numeric / bitwise
+# context MySQL coerces a bit literal to its integer value while the engine's
+# blob coerces to 0 -- a documented divergence (shared with hex literals), so
+# this file stays in the string domain. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+# The bits of a literal spell out their byte value.
+query
+SELECT b'1000001', 0b1000001, b'0110000101100010'
+----
+A	A	ab
+
+# HEX() shows the byte representation; LENGTH() counts the bytes. Nine bits span
+# two bytes (left-padded), and 0b101 / b'1111' are single bytes.
+query
+SELECT HEX(0b101), HEX(b'1111'), HEX(b'101000001'), LENGTH(b'101000001')
+----
+05	0F	0141	2
+
+# The 0b and b'' spellings produce the same blob, and a bit literal equals the
+# hex literal with the same bytes.
+query
+SELECT 0b101 = b'101', 0b1000001 = 0x41
+----
+1	1
+
+# An empty b'' is a valid empty blob (equal to X'').
+query
+SELECT b'' = X'', LENGTH(b'')
+----
+1	0
+
+# Usable as a column value, stored and read back as its bytes.
+statement ok
+CREATE TABLE IF NOT EXISTS bitlit_demo (id INT PRIMARY KEY, b BLOB)
+
+statement ok
+INSERT INTO bitlit_demo (id, b) VALUES (1, b'0100100001101001'), (2, 0b0100111101001011)
+
+query
+SELECT id, b, HEX(b) FROM bitlit_demo ORDER BY id
+----
+1	Hi	4869
+2	OK	4F4B

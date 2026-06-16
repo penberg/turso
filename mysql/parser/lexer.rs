@@ -96,6 +96,9 @@ impl<'a> Lexer<'a> {
             // MySQL hex-string literal `X'41'` / `x'41'` — checked before the
             // identifier path, which `x` would otherwise take.
             b'x' | b'X' if self.peek_at(1) == Some(b'\'') => self.read_hex_string()?,
+            // MySQL bit-value literal `b'101'` / `B'101'`, checked before the
+            // word rule so the `b` is not read as an identifier.
+            b'b' | b'B' if self.peek_at(1) == Some(b'\'') => self.read_bit_string()?,
             c if c.is_ascii_digit() => self.read_number(),
             c if is_ident_start(c) => self.read_word(),
             other => self.single(Token::Other(other as char)),
@@ -188,6 +191,20 @@ impl<'a> Lexer<'a> {
             }
             return Token::Blob(hex);
         }
+        // MySQL bit-value literal `0b101` — a binary string like the hex `0x41`.
+        // Requires at least one binary digit after `0b`.
+        if self.peek() == Some(b'0')
+            && matches!(self.peek_at(1), Some(b'b') | Some(b'B'))
+            && matches!(self.peek_at(2), Some(b'0') | Some(b'1'))
+        {
+            self.pos += 2; // `0b`
+            let bits_start = self.pos;
+            while matches!(self.peek(), Some(b'0') | Some(b'1')) {
+                self.pos += 1;
+            }
+            let bits = String::from_utf8_lossy(&self.input[bits_start..self.pos]);
+            return Token::Blob(binary_to_hex(&bits));
+        }
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.pos += 1;
         }
@@ -235,6 +252,29 @@ impl<'a> Lexer<'a> {
             )));
         }
         Ok(Token::Blob(hex))
+    }
+
+    /// Reads a MySQL bit-value literal `b'101'` / `B'101'` (the `b`/`B` and the
+    /// opening quote are at the cursor). The binary digits are converted to
+    /// MySQL's byte representation — the same blob the `0b101` form produces — so
+    /// `b'1000001'` is the byte `0x41` (`'A'`). An empty `b''` is a valid empty
+    /// blob.
+    fn read_bit_string(&mut self) -> Result<Token> {
+        let start = self.pos;
+        self.pos += 2; // `b` and the opening `'`
+        let bits_start = self.pos;
+        while matches!(self.peek(), Some(b'0') | Some(b'1')) {
+            self.pos += 1;
+        }
+        let bits = String::from_utf8_lossy(&self.input[bits_start..self.pos]).into_owned();
+        if self.peek() != Some(b'\'') {
+            return Err(ParseError::Unterminated {
+                offset: start,
+                kind: "bit literal",
+            });
+        }
+        self.pos += 1; // closing `'`
+        Ok(Token::Blob(binary_to_hex(&bits)))
     }
 
     /// Reads a backtick-delimited identifier. The delimiter is escaped by
@@ -333,6 +373,32 @@ impl<'a> Lexer<'a> {
             }
         }
     }
+}
+
+/// Converts the digits of a MySQL bit-value literal (`0b101` / `b'101'`) to the
+/// hex digits of its byte representation, the form a [`Token::Blob`] holds.
+/// MySQL left-pads the bits to a whole number of bytes, so `101` becomes one
+/// byte `05` and `101000001` (9 bits) becomes two bytes `0141`. An empty
+/// bit string yields an empty (zero-byte) blob.
+fn binary_to_hex(bits: &str) -> String {
+    if bits.is_empty() {
+        return String::new();
+    }
+    // Left-pad with `0` to a multiple of 8 bits (a whole number of bytes).
+    let pad = (8 - bits.len() % 8) % 8;
+    let mut padded = "0".repeat(pad);
+    padded.push_str(bits);
+    // Each 4-bit nibble is one hex digit.
+    padded
+        .as_bytes()
+        .chunks(4)
+        .map(|nibble| {
+            let value = nibble.iter().fold(0u8, |acc, &b| (acc << 1) | (b - b'0'));
+            char::from_digit(value as u32, 16)
+                .unwrap()
+                .to_ascii_uppercase()
+        })
+        .collect()
 }
 
 /// Decodes accumulated string-literal bytes as UTF-8, replacing any invalid
@@ -434,6 +500,26 @@ mod tests {
         assert_eq!(tokens("x '41'"), vec![word("x"), Token::Str("41".into())]);
         // An odd-length `X'..'` is rejected.
         assert!(Lexer::new(b"X'4'").tokenize().is_err());
+    }
+
+    #[test]
+    fn bit_literals_lex_to_byte_blob() {
+        // `0b..` and `b'..'` / `B'..'` are bit-value literals, lexed to the blob
+        // of their byte representation (left-padded to whole bytes like MySQL).
+        assert_eq!(tokens("0b101"), vec![Token::Blob("05".into())]);
+        assert_eq!(tokens("b'1111'"), vec![Token::Blob("0F".into())]);
+        assert_eq!(tokens("B'1000001'"), vec![Token::Blob("41".into())]); // 'A'
+        // Nine bits span two bytes.
+        assert_eq!(tokens("0b101000001"), vec![Token::Blob("0141".into())]);
+        // An empty `b''` is a valid empty blob.
+        assert_eq!(tokens("b''"), vec![Token::Blob(String::new())]);
+        // `0b` with no binary digit is a plain `0` followed by an identifier, and
+        // a `b` not adjacent to a quote stays an identifier.
+        assert_eq!(tokens("0b2"), vec![Token::Num("0".into()), word("b2")]);
+        assert_eq!(tokens("b '101'"), vec![word("b"), Token::Str("101".into())]);
+        assert_eq!(tokens("bar"), vec![word("bar")]);
+        // A non-binary digit inside `b'..'` breaks the literal (unterminated).
+        assert!(Lexer::new(b"b'102'").tokenize().is_err());
     }
 
     #[test]
