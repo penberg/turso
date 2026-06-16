@@ -1,0 +1,48 @@
+# IN (...) and BETWEEN fold ASCII case, like MySQL's default collation.
+#
+# MySQL compares the operand of `expr IN (...)` / `expr BETWEEN a AND b` to the
+# list members / bounds under its default (case-insensitive) collation. The
+# engine compares case-sensitively, so the front-end wraps the operand in
+# COLLATE NOCASE. This matters for a string-literal or computed operand; a
+# column operand already folds case via its column collation (see
+# collation_case_insensitive.test). The fold is inert for a numeric operand.
+#
+# Verified against MySQL 8.4. Uses a file-unique table name.
+
+# A string-literal operand matches an IN list member regardless of case.
+query
+SELECT 'B' IN ('a', 'b', 'c'), 'apple' IN ('APPLE', 'pear'), 'x' IN ('y', 'z')
+----
+1	1	0
+
+# NOT IN is the negation under the same case-insensitive match.
+query
+SELECT 'X' NOT IN ('x', 'y'), 'q' NOT IN ('a', 'b')
+----
+0	1
+
+# BETWEEN folds case too: 'M' (and 'm') both fall in 'a'..'z'.
+query
+SELECT 'M' BETWEEN 'a' AND 'z', 'm' BETWEEN 'A' AND 'Z', 'b' NOT BETWEEN 'A' AND 'C'
+----
+1	1	0
+
+# A numeric operand is unaffected by the fold and compares numerically.
+query
+SELECT 5 IN (1, 5, 9), 7 IN (1, 2, 3), 5 BETWEEN 1 AND 10, 20 BETWEEN 1 AND 10
+----
+1	0	1	0
+
+# NULL handling is unchanged: a NULL operand yields NULL.
+query
+SELECT 'a' IN ('A', 'b'), CASE WHEN NULL IN ('a') THEN 'y' ELSE 'n' END
+----
+1	n
+
+# The case-insensitive IN drives a WHERE filter over a derived (non-column)
+# value, where there is no column collation to rely on.
+query
+SELECT n FROM (SELECT 1 n, 'Publish' s UNION SELECT 2, 'Draft' UNION SELECT 3, 'Trash') t WHERE s IN ('publish', 'TRASH') ORDER BY n
+----
+1
+3

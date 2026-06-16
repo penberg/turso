@@ -3442,6 +3442,12 @@ impl Parser {
     /// (an uncorrelated subquery — evaluated identically on both engines).
     fn in_list(&mut self, lhs: ast::Expr, not: bool) -> Result<ast::Expr> {
         self.expect(&Token::LParen, "`(`")?;
+        // MySQL compares the operand to each list member under the default
+        // (case-insensitive) collation, but the engine compares the bare operand
+        // case-sensitively, so `'B' IN ('a', 'b')` would miss. Wrap the operand
+        // in `COLLATE NOCASE` so a string comparison folds ASCII case as MySQL
+        // does (inert for a numeric operand); it is evaluated once.
+        let lhs = nocase_collate(lhs);
         if self.eat_keyword("SELECT") {
             let rhs = self.parse_select()?;
             self.expect(&Token::RParen, "`)`")?;
@@ -3482,8 +3488,11 @@ impl Parser {
         let start = self.additive_expr()?;
         self.expect_keyword("AND")?;
         let end = self.additive_expr()?;
+        // As with `IN`, MySQL's range comparison uses the default case-insensitive
+        // collation; wrap the operand in `COLLATE NOCASE` so a string `BETWEEN`
+        // folds ASCII case (`'M' BETWEEN 'a' AND 'z'` is true), inert for numbers.
         Ok(ast::Expr::Between {
-            lhs: Box::new(lhs),
+            lhs: Box::new(nocase_collate(lhs)),
             not,
             start: Box::new(start),
             end: Box::new(end),
@@ -4018,10 +4027,7 @@ impl Parser {
         let base = if self.is_keyword("WHEN") {
             None
         } else {
-            Some(Box::new(ast::Expr::collate(
-                self.expr()?,
-                ast::Name::from_string("NOCASE"),
-            )))
+            Some(Box::new(nocase_collate(self.expr()?)))
         };
 
         let mut when_then_pairs = Vec::new();
@@ -8413,6 +8419,21 @@ fn call_fn(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             over_clause: None,
         },
     }
+}
+
+/// Wraps `expr` in `COLLATE NOCASE`, so a string comparison involving it folds
+/// ASCII case the way MySQL's default (case-insensitive) collation does. The
+/// collation is inert for a non-string operand, and the operand is still
+/// evaluated once. Used to give a comparison context (`IN`, `BETWEEN`, a simple
+/// `CASE`, …) MySQL's default case-insensitivity.
+///
+/// A row-value tuple (`(a, b)`) is returned unchanged: it is not a scalar, so it
+/// cannot carry a `COLLATE`, and a row comparison is element-wise anyway.
+fn nocase_collate(expr: ast::Expr) -> ast::Expr {
+    if matches!(&expr, ast::Expr::Parenthesized(exprs) if exprs.len() > 1) {
+        return expr;
+    }
+    ast::Expr::collate(expr, ast::Name::from_string("NOCASE"))
 }
 
 /// Concatenates `pieces` with a *balanced* `||` tree, so the AST stays shallow
@@ -16245,7 +16266,8 @@ mod tests {
         let ast::Expr::InList { lhs, not, rhs } = expr else {
             panic!("expected InList");
         };
-        assert_eq!(*lhs, col("id"));
+        // The operand is wrapped in COLLATE NOCASE so a string `IN` folds case.
+        assert_eq!(*lhs, nocase_collate(col("id")));
         assert!(!not);
         assert_eq!(rhs.len(), 3);
 
@@ -16254,6 +16276,12 @@ mod tests {
             panic!("expected InList");
         };
         assert!(not);
+
+        // The subquery form wraps the operand too.
+        let ast::Expr::InSelect { lhs, .. } = parse_expr("id IN (SELECT x FROM t)").unwrap() else {
+            panic!("expected InSelect");
+        };
+        assert_eq!(*lhs, nocase_collate(col("id")));
     }
 
     #[test]
@@ -16282,12 +16310,15 @@ mod tests {
         assert!(matches!(rhs.as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
 
         // `(a, b) IN ((1, 2), (3, 4))` keeps the scalar-IN list of two tuples.
-        let ast::Expr::InList { rhs, .. } = parse_expr("(a, b) IN ((1, 2), (3, 4))").unwrap()
+        let ast::Expr::InList { lhs, rhs, .. } = parse_expr("(a, b) IN ((1, 2), (3, 4))").unwrap()
         else {
             panic!("expected InList");
         };
         assert_eq!(rhs.len(), 2);
         assert!(matches!(rhs[0].as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
+        // A row-value operand is *not* COLLATE-wrapped (a tuple is not a scalar),
+        // so it stays a Parenthesized — unlike a scalar `IN` operand.
+        assert!(matches!(lhs.as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
     }
 
     #[test]
@@ -16302,7 +16333,8 @@ mod tests {
         else {
             panic!("expected Between");
         };
-        assert_eq!(*lhs, col("age"));
+        // The operand is wrapped in COLLATE NOCASE so a string range folds case.
+        assert_eq!(*lhs, nocase_collate(col("age")));
         assert!(!not);
         assert_eq!(*start, num("18"));
         assert_eq!(*end, num("65"));
