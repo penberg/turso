@@ -3975,8 +3975,13 @@ impl Parser {
 
         // `DATE_FORMAT(x, fmt)` lowers to the engine's `strftime()` with the
         // format specifiers translated from MySQL to strftime spelling.
+        // `TIME_FORMAT(x, fmt)` shares the lowering — for a time-only format it
+        // matches MySQL, since those specifiers read just the time part.
         if upper == "DATE_FORMAT" {
-            return self.date_format_call();
+            return self.format_call("DATE_FORMAT");
+        }
+        if upper == "TIME_FORMAT" {
+            return self.format_call("TIME_FORMAT");
         }
 
         // `DATEDIFF(a, b)` is the whole-day difference `a - b`, ignoring the time
@@ -5496,16 +5501,23 @@ impl Parser {
         })
     }
 
-    /// Parses `DATE_FORMAT(x, 'fmt')` (the name and `(` are already consumed) and
-    /// lowers it via [`date_format_expr`] — a `strftime` over `x` for the
-    /// directly-translatable specifiers, with month/weekday name specifiers
-    /// expanded to `CASE` lookups and concatenated. The format must be a string
-    /// literal so it can be translated at parse time.
-    fn date_format_call(&mut self) -> Result<ast::Expr> {
+    /// Parses `DATE_FORMAT(x, 'fmt')` / `TIME_FORMAT(x, 'fmt')` (the name in
+    /// `fn_name`, and the name and `(` already consumed) and lowers it via
+    /// [`date_format_expr`] — a `strftime` over `x` for the directly-translatable
+    /// specifiers, with month/weekday name specifiers expanded to `CASE` lookups
+    /// and concatenated. The format must be a string literal so it can be
+    /// translated at parse time.
+    ///
+    /// `TIME_FORMAT` shares this lowering: for a time-only format (`%H %i %s %h
+    /// %p %k %T` …) it produces exactly MySQL's result, since those specifiers
+    /// read only the time part. (MySQL's `TIME_FORMAT` returns NULL for a *date*
+    /// specifier whereas this evaluates it — an invalid-usage edge documented in
+    /// `mysql/COMPAT.md`.)
+    fn format_call(&mut self, fn_name: &str) -> Result<ast::Expr> {
         let target = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
         let Some(Token::Str(fmt)) = self.peek() else {
-            return Err(self.unexpected("a string-literal DATE_FORMAT format"));
+            return Err(self.unexpected(&format!("a string-literal {fn_name} format")));
         };
         let fmt = fmt.clone();
         self.advance();
@@ -10247,6 +10259,19 @@ mod tests {
         }
         // A non-literal format is rejected.
         assert!(parse_expr("DATE_FORMAT(d, f)").is_err());
+
+        // TIME_FORMAT shares the DATE_FORMAT lowering exactly, so the same
+        // format produces an identical expression.
+        assert_eq!(
+            parse_expr("TIME_FORMAT(d, '%H:%i:%s')").unwrap(),
+            parse_expr("DATE_FORMAT(d, '%H:%i:%s')").unwrap()
+        );
+        assert_eq!(
+            parse_expr("TIME_FORMAT(d, '%h:%i %p')").unwrap(),
+            parse_expr("DATE_FORMAT(d, '%h:%i %p')").unwrap()
+        );
+        // A non-literal TIME_FORMAT format is likewise rejected.
+        assert!(parse_expr("TIME_FORMAT(d, f)").is_err());
     }
 
     #[test]

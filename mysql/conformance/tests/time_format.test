@@ -1,0 +1,65 @@
+# TIME_FORMAT(t, fmt) conformance.
+#
+# MySQL's TIME_FORMAT formats the time part of t using the same specifiers as
+# DATE_FORMAT, but only the time-related ones (%H %i %s %h %p %k %T ...). The
+# front-end reuses the DATE_FORMAT lowering (a strftime over the value with the
+# 12-hour/meridiem specifiers expanded to CASE), which produces exactly MySQL's
+# result for those specifiers since they read only the time part. NULL
+# propagates.
+#
+# Scope: only time specifiers are asserted. A *date* specifier in TIME_FORMAT
+# returns NULL on a real mysqld but is evaluated here (an invalid-usage edge
+# noted in COMPAT.md), so it is not tested against mysqld. TIME values outside
+# 00:00:00..23:59:59 (MySQL allows up to 838 hours) are likewise out of scope.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The 24-hour clock specifiers.
+query
+SELECT TIME_FORMAT('14:05:09', '%H:%i:%s'), TIME_FORMAT('14:05:09', '%H:%i'), TIME_FORMAT('23:59:59', '%k')
+----
+14:05:09	14:05	23
+
+# The 12-hour clock with AM/PM, on either side of noon.
+query
+SELECT TIME_FORMAT('14:05:09', '%h:%i %p'), TIME_FORMAT('09:30:00', '%h:%i %p'), TIME_FORMAT('00:00:00', '%h:%i %p')
+----
+02:05 PM	09:30 AM	12:00 AM
+
+# %T is the full 24-hour time; literal characters in the format pass through.
+query
+SELECT TIME_FORMAT('08:07:06', '%T'), TIME_FORMAT('14:05:09', 'at %H')
+----
+08:07:06	at 14
+
+# A DATETIME argument formats only its time part.
+query
+SELECT TIME_FORMAT('2026-06-16 14:05:09', '%H:%i:%s')
+----
+14:05:09
+
+# It agrees with DATE_FORMAT for a time-only format.
+query
+SELECT TIME_FORMAT('14:05:09', '%h:%i %p') = DATE_FORMAT('14:05:09', '%h:%i %p')
+----
+1
+
+# NULL propagates.
+query
+SELECT TIME_FORMAT(NULL, '%H:%i') IS NULL
+----
+1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS tf_demo (id INT PRIMARY KEY, t TIME)
+
+statement ok
+INSERT INTO tf_demo (id, t) VALUES (1, '08:15:00'), (2, '20:45:30')
+
+query
+SELECT id, TIME_FORMAT(t, '%h:%i %p') FROM tf_demo ORDER BY id
+----
+1	08:15 AM
+2	08:45 PM
