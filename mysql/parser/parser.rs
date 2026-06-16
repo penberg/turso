@@ -2844,6 +2844,50 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.advance();
+
+        // `op {ANY | SOME | ALL} (subquery)` — a quantified comparison. Only the
+        // two forms exactly equivalent to `IN` / `NOT IN` are modeled: `= ANY`
+        // (and its synonym `= SOME`) is `IN (subquery)`, and `<> ALL` / `!= ALL`
+        // is `NOT IN (subquery)`. The other operator/quantifier pairs need
+        // MIN/MAX or EXISTS rewrites with subtle NULL and empty-set semantics, so
+        // they are rejected rather than mistranslated. The quantifier is only
+        // recognized immediately before `(`, so a column named `any` is not
+        // misread.
+        let quantifier_is_all = match (self.peek(), self.peek_nth(1)) {
+            (Some(Token::Word(w)), Some(Token::LParen))
+                if w.eq_ignore_ascii_case("ANY") || w.eq_ignore_ascii_case("SOME") =>
+            {
+                Some(false)
+            }
+            (Some(Token::Word(w)), Some(Token::LParen)) if w.eq_ignore_ascii_case("ALL") => {
+                Some(true)
+            }
+            _ => None,
+        };
+        if let Some(all) = quantifier_is_all {
+            self.advance(); // the quantifier keyword
+            self.expect(&Token::LParen, "`(`")?;
+            self.expect_keyword("SELECT")?;
+            let rhs = self.parse_select()?;
+            self.expect(&Token::RParen, "`)`")?;
+            let not = match (op, all) {
+                (ast::Operator::Equals, false) => false,  // `= ANY` / `= SOME` → IN
+                (ast::Operator::NotEquals, true) => true, // `<> ALL` / `!= ALL` → NOT IN
+                _ => {
+                    return Err(ParseError::Unsupported(
+                        "only the `= ANY` / `= SOME` (as IN) and `<> ALL` (as NOT IN) \
+                         quantified comparisons are supported yet"
+                            .to_string(),
+                    ))
+                }
+            };
+            return Ok(ast::Expr::InSelect {
+                lhs: Box::new(lhs),
+                not,
+                rhs,
+            });
+        }
+
         let rhs = self.bitor_expr()?;
         Ok(ast::Expr::binary(lhs, op, rhs))
     }
@@ -7723,6 +7767,35 @@ mod tests {
         assert!(matches!(
             parse_expr("id IN (1, 2, 3)").unwrap(),
             ast::Expr::InList { .. }
+        ));
+    }
+
+    #[test]
+    fn quantified_comparison_lowers_to_in() {
+        // `= ANY` / `= SOME` is IN; `<> ALL` / `!= ALL` is NOT IN.
+        for sql in ["a = ANY (SELECT b FROM s)", "a = SOME (SELECT b FROM s)"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::InSelect { not: false, .. }),
+                "expected `{sql}` to lower to IN (subquery)"
+            );
+        }
+        for sql in ["a <> ALL (SELECT b FROM s)", "a != ALL (SELECT b FROM s)"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::InSelect { not: true, .. }),
+                "expected `{sql}` to lower to NOT IN (subquery)"
+            );
+        }
+
+        // Other operator/quantifier pairs are rejected (no clean IN equivalent).
+        assert!(parse_expr("a > ALL (SELECT b FROM s)").is_err());
+        assert!(parse_expr("a = ALL (SELECT b FROM s)").is_err());
+        assert!(parse_expr("a <> ANY (SELECT b FROM s)").is_err());
+
+        // `ANY` only quantifies immediately before `(`, so a column named `any`
+        // is still an ordinary reference.
+        assert!(matches!(
+            parse_expr("a = any").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Equals, _)
         ));
     }
 

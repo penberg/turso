@@ -1,0 +1,66 @@
+# Quantified subquery comparisons: = ANY / = SOME and <> ALL.
+#
+# MySQL's `x = ANY (subquery)` (and its synonym `= SOME`) is exactly `x IN
+# (subquery)`, and `x <> ALL (subquery)` (and `!= ALL`) is exactly `x NOT IN
+# (subquery)`. The front-end rejected these (parsing `ANY` as a function); it now
+# lowers the two IN-equivalent forms to IN / NOT IN. Other operator/quantifier
+# pairs stay unsupported.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS qc_main (id INT PRIMARY KEY, a INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS qc_sub (b INT)
+
+statement ok
+INSERT INTO qc_main (id, a) VALUES (1, 5), (2, 12), (3, 9)
+
+statement ok
+INSERT INTO qc_sub (b) VALUES (5), (9)
+
+# `= ANY` keeps the rows whose a is in the subquery.
+query
+SELECT id FROM qc_main WHERE a = ANY (SELECT b FROM qc_sub) ORDER BY id
+----
+1
+3
+
+# `= SOME` is a synonym for `= ANY`.
+query
+SELECT id FROM qc_main WHERE a = SOME (SELECT b FROM qc_sub) ORDER BY id
+----
+1
+3
+
+# `<> ALL` keeps the rows whose a is in none of the subquery values.
+query
+SELECT id FROM qc_main WHERE a <> ALL (SELECT b FROM qc_sub) ORDER BY id
+----
+2
+
+# `!= ALL` is the same as `<> ALL`.
+query
+SELECT id FROM qc_main WHERE a != ALL (SELECT b FROM qc_sub) ORDER BY id
+----
+2
+
+# The subquery may carry its own WHERE.
+query
+SELECT id FROM qc_main WHERE a = ANY (SELECT b FROM qc_sub WHERE b > 6) ORDER BY id
+----
+3
+
+# An empty subquery: `= ANY ()` matches nothing, `<> ALL ()` matches everything.
+query
+SELECT id FROM qc_main WHERE a = ANY (SELECT b FROM qc_sub WHERE b > 100) ORDER BY id
+----
+
+query
+SELECT id FROM qc_main WHERE a <> ALL (SELECT b FROM qc_sub WHERE b > 100) ORDER BY id
+----
+1
+2
+3
