@@ -1,0 +1,52 @@
+# WEEK(d, mode) for every mode the engine can express.
+#
+# MySQL's WEEK() takes an optional mode 0–7 selecting among eight week-numbering
+# schemes (Sunday- vs Monday-first, 0–53 vs 1–53 range, and "first day in year"
+# vs "4 or more days" week-1 rules). WordPress's WP_Date_Query week filter emits
+# WEEK(col, 7 - start_of_week), so a non-default start_of_week produces modes 2,
+# 4, and 5. The front-end previously only mapped modes 0, 1, 3, and 5; this adds
+# modes 2, 4, and 7. Only mode 6 (the Sunday-first 1–53 "4 or more days" rule)
+# has no engine equivalent and stays rejected (covered by a parser unit test, as
+# real MySQL accepts it).
+#
+# Each row is mode 0, 1, 2, 3, 4, 5, 7 for one date. Verified against MySQL 8.4
+# (every mode matches for all 656 year-boundary weeks of 2000–2040).
+
+# A Thursday year-start: the leading partial week is week 0 under the Sunday/
+# Monday "first day" rules (modes 0, 4, 5) and the previous year's last week
+# under the 1–53 rules (modes 2, 7); the ISO/4-day rules (1, 3) make it week 1.
+query
+SELECT WEEK('2026-01-01',0), WEEK('2026-01-01',1), WEEK('2026-01-01',2), WEEK('2026-01-01',3), WEEK('2026-01-01',4), WEEK('2026-01-01',5), WEEK('2026-01-01',7)
+----
+0	1	52	1	0	0	52
+
+# Mid-year, the mode only shifts the number by the Sunday-vs-Monday boundary.
+query
+SELECT WEEK('2026-06-15',0), WEEK('2026-06-15',1), WEEK('2026-06-15',2), WEEK('2026-06-15',3), WEEK('2026-06-15',4), WEEK('2026-06-15',5), WEEK('2026-06-15',7)
+----
+24	25	24	25	24	24	24
+
+# Year end.
+query
+SELECT WEEK('2026-12-31',0), WEEK('2026-12-31',1), WEEK('2026-12-31',2), WEEK('2026-12-31',3), WEEK('2026-12-31',4), WEEK('2026-12-31',5), WEEK('2026-12-31',7)
+----
+52	53	52	53	52	52	52
+
+# 2004 also starts on a Thursday; mode 4 ("4 or more days") keeps the partial
+# week at 0 here, where it would be 1 if Jan 1 fell on Mon/Tue/Wed.
+query
+SELECT WEEK('2004-01-01',2), WEEK('2004-01-01',4), WEEK('2004-01-01',7)
+----
+52	0	52
+
+# A Sunday year-start (2012): mode 4 makes the first full week week 1.
+query
+SELECT WEEK('2012-01-01',2), WEEK('2012-01-01',4), WEEK('2012-01-01',7)
+----
+1	1	52
+
+# A NULL date propagates through every mode.
+query
+SELECT WEEK(NULL,2), WEEK(NULL,4), WEEK(NULL,7)
+----
+NULL	NULL	NULL

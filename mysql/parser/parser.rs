@@ -5714,9 +5714,11 @@ impl Parser {
     /// `%Y`) is week 53. This identity was verified against MySQL 8.4 for every
     /// day from 2016 to 2031.
     ///
-    /// The remaining modes (2/4/6/7) have no clean strftime equivalent (their
-    /// 1–53 / Sunday-based year-boundary numbering depends on the adjacent year's
-    /// last week) and are rejected. The `mode` must be an integer literal.
+    /// Modes 2, 4, and 7 are built from those codes with adjustments (see the
+    /// inline comments and [`week_push_zero`]): 2 and 7 are the 1–53 siblings of
+    /// 0 and 5, and 4 is the Sunday-first "4 or more days" rule. Only mode 6 (the
+    /// Sunday-first 1–53 "4 or more days" rule) has no engine equivalent and is
+    /// rejected. The `mode` must be an integer literal.
     fn week_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         let mode = if self.eat(&Token::Comma) {
@@ -5758,6 +5760,54 @@ impl Parser {
             });
         }
 
+        // Modes 2 and 7 are the 1–53 ("week year") siblings of modes 0 (`%U`,
+        // Sunday-first) and 5 (`%W`, Monday-first): identical except a date in the
+        // year's leading partial week — which the 0–53 mode numbers 0 — is instead
+        // numbered as the previous year's last week (see `week_push_zero`).
+        if mode == 2 {
+            return Ok(week_push_zero(arg, "%U"));
+        }
+        if mode == 7 {
+            return Ok(week_push_zero(arg, "%W"));
+        }
+
+        // Mode 4 is Sunday-first, 0–53, with MySQL's "4 or more days" rule for week
+        // 1 (the week whose Wednesday — its fourth day — falls in this year), rather
+        // than `%U`'s "first week with a Sunday". The two number Sunday-weeks
+        // identically apart from a constant per-year offset: when January 1 is a
+        // Monday, Tuesday, or Wednesday, that week's Wednesday is already in the
+        // year, so the leading partial week is week 1 (not `%U`'s week 0) and every
+        // week shifts up by one. Verified against MySQL 8.4 for every day of
+        // 2018–2027 and every year-boundary week of 2000–2040.
+        if mode == 4 {
+            let jan1_wday = strftime_int(
+                "%w",
+                call_fn(
+                    "date",
+                    vec![
+                        arg.clone(),
+                        ast::Expr::Literal(ast::Literal::String(requote("start of year"))),
+                    ],
+                ),
+            );
+            // 1 when January 1 is Mon/Tue/Wed (`%w` 1..=3), else 0.
+            let leads_year = ast::Expr::binary(
+                ast::Expr::binary(jan1_wday.clone(), ast::Operator::Greater, *numeric_expr("0")),
+                ast::Operator::And,
+                ast::Expr::binary(jan1_wday, ast::Operator::Less, *numeric_expr("4")),
+            );
+            let offset = ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(Box::new(leads_year), numeric_expr("1"))],
+                else_expr: Some(numeric_expr("0")),
+            };
+            return Ok(ast::Expr::binary(
+                strftime_int("%U", arg),
+                ast::Operator::Add,
+                offset,
+            ));
+        }
+
         let fmt = match mode {
             0 => "%U",
             3 => "%V",
@@ -5765,7 +5815,8 @@ impl Parser {
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "WEEK() mode {other} is not supported yet \
-                     (only modes 0, 1, 3, and 5 map to an engine week number)"
+                     (only modes 0–5 and 7 map to an engine week number; mode 6 \
+                     has no engine equivalent)"
                 )))
             }
         };
@@ -7204,6 +7255,33 @@ fn strftime_int(fmt: &str, arg: ast::Expr) -> ast::Expr {
             size: None,
             array_dimensions: 0,
         }),
+    }
+}
+
+/// Builds the `WEEK(d, mode)` lowering for the 1–53 "week year" modes 2 (`%U`,
+/// Sunday-first) and 7 (`%W`, Monday-first). These match their 0–53 siblings
+/// (modes 0 and 5) except that a date in the year's leading partial week — which
+/// the strftime code numbers `0` — is instead numbered as the previous year's
+/// last week. That number is the same code applied to the last day of the
+/// previous year (`date(d, 'start of year', '-1 day')`), which always lies in
+/// that final week. Verified against MySQL 8.4 for every year-boundary week of
+/// 2000–2040.
+fn week_push_zero(arg: ast::Expr, code: &str) -> ast::Expr {
+    let prev_year_end = call_fn(
+        "date",
+        vec![
+            arg.clone(),
+            ast::Expr::Literal(ast::Literal::String(requote("start of year"))),
+            ast::Expr::Literal(ast::Literal::String(requote("-1 day"))),
+        ],
+    );
+    let prev_week = strftime_int(code, prev_year_end);
+    let is_week_zero =
+        ast::Expr::binary(strftime_int(code, arg.clone()), ast::Operator::Equals, *numeric_expr("0"));
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(is_week_zero), Box::new(prev_week))],
+        else_expr: Some(Box::new(strftime_int(code, arg))),
     }
 }
 
@@ -11263,13 +11341,77 @@ mod tests {
                 "wrong format code for `{sql}`"
             );
         }
-        // Modes with no clean engine equivalent are rejected.
-        for mode in [2, 4, 6, 7] {
+        // Only mode 6 has no clean engine equivalent and is rejected.
+        assert!(
+            parse_expr("WEEK(d, 6)").is_err(),
+            "WEEK mode 6 should be unsupported"
+        );
+        // Modes 2, 4, and 7 are supported (they lower to a CASE / arithmetic
+        // expression rather than a bare CAST, so they parse without error).
+        for mode in [2, 4, 7] {
             assert!(
-                parse_expr(&format!("WEEK(d, {mode})")).is_err(),
-                "WEEK mode {mode} should be unsupported"
+                parse_expr(&format!("WEEK(d, {mode})")).is_ok(),
+                "WEEK mode {mode} should be supported"
             );
         }
+    }
+
+    #[test]
+    fn week_mode_2_and_7_push_week_zero_to_previous_year() {
+        // WEEK(d, 2) / WEEK(d, 7) -> CASE WHEN <code>(d) = 0 THEN <code>(prev year
+        // end) ELSE <code>(d) END, where <code> is %U (mode 2) / %W (mode 7).
+        for (sql, fmt) in [("WEEK(d, 2)", "'%U'"), ("WEEK(d, 7)", "'%W'")] {
+            let ast::Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } = parse_expr(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            assert!(base.is_none());
+            assert_eq!(when_then_pairs.len(), 1);
+            // Guard: <code>(d) = 0.
+            let ast::Expr::Binary(_, ast::Operator::Equals, zero) = when_then_pairs[0].0.as_ref()
+            else {
+                panic!("expected an equality guard for `{sql}`");
+            };
+            assert!(matches!(zero.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0"));
+            // The else branch is CAST(strftime(<fmt>, d) AS INTEGER).
+            let ast::Expr::Cast { expr, .. } = else_expr.unwrap().as_ref().clone() else {
+                panic!("expected a CAST else branch for `{sql}`");
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+                panic!("expected a strftime call for `{sql}`");
+            };
+            assert_eq!(name.as_str(), "strftime");
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == fmt),
+                "wrong format code for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn week_mode_4_adds_year_start_offset_to_sunday_week() {
+        // WEEK(d, 4) -> CAST(strftime('%U', d) AS INTEGER) + CASE ... offset.
+        let ast::Expr::Binary(lhs, ast::Operator::Add, rhs) = parse_expr("WEEK(d, 4)").unwrap()
+        else {
+            panic!("expected WEEK(d, 4) to lower to an addition");
+        };
+        // Left side is the Sunday-first week number, CAST(strftime('%U', d) ...).
+        let ast::Expr::Cast { expr, .. } = lhs.as_ref() else {
+            panic!("expected a CAST on the left of the addition");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+            panic!("expected a strftime call");
+        };
+        assert_eq!(name.as_str(), "strftime");
+        assert!(
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%U'")
+        );
+        // Right side is a CASE yielding the 0/1 per-year offset.
+        assert!(matches!(rhs.as_ref(), ast::Expr::Case { .. }));
     }
 
     #[test]
