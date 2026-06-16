@@ -6,10 +6,11 @@
 # left of the decimal point (TRUNCATE(1234.5678, -2) = 1200), and NULL in either
 # argument propagates.
 #
-# Results are asserted via comparisons: the engine renders the result as a plain
-# double where MySQL prints a fixed-scale DECIMAL, but the value is equal on both
-# targets. Passes against both turso-mysql-server and a real mysqld. Uses its own
-# table name.
+# A whole-number result (a literal d <= 0) is typed as an integer like MySQL
+# (cast to INTEGER, so it prints `3` not `3.0`); a positive d keeps the fractional
+# part as a real (where the engine prints a plain double and MySQL a fixed-scale
+# DECIMAL, but the value is equal). Passes against both turso-mysql-server and a
+# real mysqld. Uses its own table name.
 
 # Positive, zero, and negative decimal places; truncation is toward zero (not
 # rounding -- 3.14159 truncated to 2 places is 3.14, and 3.99 is 3.9).
@@ -29,6 +30,18 @@ query
 SELECT TRUNCATE(3.99, 0) = 3, ROUND(3.99, 0) = 4
 ----
 1	1
+
+# A literal d <= 0 yields a bare integer (no `.0`), and it composes in
+# arithmetic; a positive d keeps decimals.
+query
+SELECT TRUNCATE(3.7, 0), TRUNCATE(-3.99, 0), TRUNCATE(1234.5, -2), TRUNCATE(3.78, 1)
+----
+3	-3	1200	3.7
+
+query
+SELECT TRUNCATE(2.9, 0) + 1, TRUNCATE(5.5, 0) * 2
+----
+3	10
 
 # NULL in either argument propagates.
 query

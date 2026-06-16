@@ -5327,11 +5327,23 @@ impl Parser {
         self.expect(&Token::Comma, "`,`")?;
         let d = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
+        // With a literal `d <= 0` the result is a whole number, which MySQL types
+        // as an integer (`TRUNCATE(3.7, 0)` is `3`, `TRUNCATE(1234.5, -2)` is
+        // `1200`); the engine's `trunc` is a real, so cast it like `FLOOR`/`ROUND`.
+        // A positive (or non-literal) `d` keeps the fractional part as a real.
+        let to_integer = matches!(&d,
+            ast::Expr::Literal(ast::Literal::Numeric(n))
+                if n.parse::<f64>().is_ok_and(|v| v <= 0.0));
         let scale_num = call_fn("pow", vec![*numeric_expr("10"), d.clone()]);
         let scale_den = call_fn("pow", vec![*numeric_expr("10"), d]);
         let scaled = ast::Expr::binary(x, ast::Operator::Multiply, scale_num);
         let truncated = unary_fn("trunc", scaled);
-        Ok(float_division(truncated, scale_den))
+        let result = float_division(truncated, scale_den);
+        Ok(if to_integer {
+            cast_to_integer(result)
+        } else {
+            result
+        })
     }
 
     /// Parses MySQL `STRCMP(a, b)` (the name and `(` are already consumed),
@@ -13948,6 +13960,18 @@ mod tests {
             panic!("expected trunc(...)");
         };
         assert_eq!(name.as_str(), "trunc");
+
+        // With a literal `d <= 0` the whole-number result is cast to INTEGER (an
+        // outer CAST wrapping the division); a positive `d` stays a real division.
+        for d in ["0", "-2"] {
+            let ast::Expr::Cast { expr, type_name } =
+                parse_expr(&format!("TRUNCATE(x, {d})")).unwrap()
+            else {
+                panic!("expected TRUNCATE(x, {d}) to cast to INTEGER");
+            };
+            assert_eq!(type_name.unwrap().name, "INTEGER");
+            assert!(matches!(expr.as_ref(), ast::Expr::Binary(_, ast::Operator::Divide, _)));
+        }
     }
 
     #[test]
