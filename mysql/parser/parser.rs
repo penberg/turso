@@ -37,6 +37,10 @@ pub struct Parser {
     /// Column aliases from `AS alias (c1, c2, ...)`, mapped positionally to the
     /// INSERT column list — `(column_alias, actual_column)` pairs.
     upsert_col_aliases: Vec<(String, String)>,
+    /// `CREATE INDEX` statements deferred from a `CREATE TABLE`'s inline
+    /// secondary `KEY`/`INDEX` definitions (the engine's `CREATE TABLE` has no
+    /// inline secondary index), drained after the table by `statement_list`.
+    pending_indexes: Vec<ast::Stmt>,
 }
 
 impl Parser {
@@ -54,6 +58,7 @@ impl Parser {
             in_upsert_assignment: false,
             upsert_row_alias: None,
             upsert_col_aliases: Vec::new(),
+            pending_indexes: Vec::new(),
         })
     }
 
@@ -144,7 +149,17 @@ impl Parser {
             return Ok(Vec::new());
         }
 
-        Ok(vec![self.statement()?])
+        // A `CREATE TABLE` with inline secondary `KEY`/`INDEX` clauses defers them
+        // as `CREATE INDEX` statements (the engine's `CREATE TABLE` has none);
+        // emit them after the table.
+        let stmt = self.statement()?;
+        if self.pending_indexes.is_empty() {
+            Ok(vec![stmt])
+        } else {
+            let mut stmts = vec![stmt];
+            stmts.append(&mut self.pending_indexes);
+            Ok(stmts)
+        }
     }
 
     // === Statement dispatch ===
@@ -339,9 +354,10 @@ impl Parser {
         // resolved into the engine's rowid-alias autoincrement after parsing.
         let mut columns: Vec<(ast::ColumnDefinition, bool)> = Vec::new();
         let mut constraints = Vec::new();
+        let mut inline_indexes: Vec<(Option<ast::Name>, Vec<ast::SortedColumn>)> = Vec::new();
         loop {
             if self.next_is_table_constraint() {
-                self.table_constraint(&mut constraints)?;
+                self.table_constraint(&mut constraints, &mut inline_indexes)?;
             } else {
                 columns.push(self.column_def()?);
             }
@@ -361,6 +377,29 @@ impl Parser {
 
         Self::apply_auto_increment(&mut columns, &mut constraints)?;
         let columns: Vec<ast::ColumnDefinition> = columns.into_iter().map(|(c, _)| c).collect();
+
+        // Each inline secondary key becomes a deferred CREATE INDEX, emitted by
+        // `statement_list` after this table (the engine has no inline form). The
+        // index inherits `IF NOT EXISTS` so re-running the CREATE TABLE is safe.
+        for (idx_name, idx_columns) in inline_indexes {
+            let name = idx_name.unwrap_or_else(|| {
+                let first = match idx_columns.first().map(|c| c.expr.as_ref()) {
+                    Some(ast::Expr::Id(n)) => n.as_str(),
+                    _ => "idx",
+                };
+                ast::Name::from_string(format!("{}_{}", tbl_name.name.as_str(), first))
+            });
+            self.pending_indexes.push(ast::Stmt::CreateIndex {
+                unique: false,
+                if_not_exists,
+                idx_name: ast::QualifiedName::single(name),
+                tbl_name: tbl_name.name.clone(),
+                using: None,
+                columns: idx_columns,
+                with_clause: Vec::new(),
+                where_clause: None,
+            });
+        }
 
         Ok(ast::Stmt::CreateTable {
             temporary,
@@ -1091,7 +1130,11 @@ impl Parser {
         matches!(self.peek(), Some(Token::Word(w)) if is_table_constraint_keyword(w))
     }
 
-    fn table_constraint(&mut self, out: &mut Vec<ast::NamedTableConstraint>) -> Result<()> {
+    fn table_constraint(
+        &mut self,
+        out: &mut Vec<ast::NamedTableConstraint>,
+        indexes: &mut Vec<(Option<ast::Name>, Vec<ast::SortedColumn>)>,
+    ) -> Result<()> {
         let mut name = None;
         if self.eat_keyword("CONSTRAINT") {
             // Optional symbol name (absent if the constraint type follows).
@@ -1147,14 +1190,35 @@ impl Parser {
                     self.skip_to_item_boundary();
                 }
             }
+        } else if self.is_keyword("FOREIGN") {
+            // Foreign keys have no engine equivalent: skip them.
+            self.skip_to_item_boundary();
         } else if self.is_keyword("KEY")
             || self.is_keyword("INDEX")
-            || self.is_keyword("FOREIGN")
             || self.is_keyword("FULLTEXT")
             || self.is_keyword("SPATIAL")
         {
-            // Index definitions and constraints we do not model yet: skip them.
-            self.skip_to_item_boundary();
+            // An inline secondary index `[FULLTEXT|SPATIAL] {KEY|INDEX} [name]
+            // (cols)`. The engine's CREATE TABLE has no inline secondary index,
+            // so capture it for a deferred CREATE INDEX (FULLTEXT/SPATIAL degrade
+            // to a plain index, as the ALTER ADD forms do). A column prefix length
+            // (`col(191)`) and a `USING` type are dropped by the column list.
+            self.eat_keyword("FULLTEXT");
+            self.eat_keyword("SPATIAL");
+            let _ = self.eat_keyword("KEY") || self.eat_keyword("INDEX");
+            let idx_name = if self.is(&Token::LParen) || self.is_keyword("USING") {
+                None
+            } else {
+                Some(self.name()?)
+            };
+            if self.eat_keyword("USING") {
+                let _ = self.name()?;
+            }
+            let columns = self.sorted_column_list()?;
+            if self.eat_keyword("USING") {
+                let _ = self.name()?;
+            }
+            indexes.push((idx_name, columns));
         } else {
             return Err(self.unexpected("a table constraint"));
         }
@@ -13672,6 +13736,53 @@ mod tests {
             assert_eq!(tbl_name.name.as_str(), "users");
             assert!(where_clause.is_none(), "TRUNCATE must delete all rows");
         }
+    }
+
+    #[test]
+    fn create_table_inline_keys_become_deferred_create_index() {
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+
+        // CREATE TABLE with inline KEY/INDEX clauses yields the CREATE TABLE plus
+        // one CREATE INDEX per secondary key (the engine has no inline form).
+        let stmts = parse_all(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, KEY ka (a), INDEX (b))",
+        )
+        .unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(stmts[0], ast::Stmt::CreateTable { .. }));
+        // The named key keeps its name; the unnamed one is `<table>_<col>`.
+        let ast::Stmt::CreateIndex {
+            unique,
+            idx_name,
+            tbl_name,
+            columns,
+            ..
+        } = &stmts[1]
+        else {
+            panic!("expected a CREATE INDEX for the inline KEY");
+        };
+        assert!(!unique);
+        assert_eq!(idx_name.name.as_str(), "ka");
+        assert_eq!(tbl_name.as_str(), "t");
+        assert_eq!(columns.len(), 1);
+        let ast::Stmt::CreateIndex { idx_name, .. } = &stmts[2] else {
+            panic!("expected a CREATE INDEX for the unnamed inline INDEX");
+        };
+        assert_eq!(idx_name.name.as_str(), "t_b");
+
+        // A table with no inline secondary key yields just the CREATE TABLE.
+        let stmts = parse_all("CREATE TABLE t (id INT PRIMARY KEY, a INT)").unwrap();
+        assert_eq!(stmts.len(), 1);
+
+        // FULLTEXT/SPATIAL inline keys degrade to a plain index, FOREIGN KEY is
+        // dropped (no engine equivalent).
+        let stmts = parse_all(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, FULLTEXT KEY fa (a), \
+             FOREIGN KEY (b) REFERENCES u (id))",
+        )
+        .unwrap();
+        assert_eq!(stmts.len(), 2); // table + the fulltext-as-plain index only
+        assert!(matches!(stmts[1], ast::Stmt::CreateIndex { .. }));
     }
 
     #[test]

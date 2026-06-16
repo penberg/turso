@@ -1,0 +1,34 @@
+# CREATE TABLE with inline secondary KEY/INDEX clauses creates the indexes.
+#
+# MySQL allows `KEY name (cols)` / `INDEX name (cols)` inside CREATE TABLE. The
+# engine's CREATE TABLE has no inline secondary index, so the front-end strips
+# each one and emits a `CREATE INDEX` after the table (the table is created
+# first, then its indexes). Before this, the inline keys were silently dropped,
+# so the indexes did not exist -- which WordPress's dbDelta relies on (it issues
+# SHOW INDEX to avoid re-adding keys). FULLTEXT/SPATIAL degrade to a plain index;
+# a column prefix length (`col(191)`) is dropped (the whole column is indexed).
+#
+# The SHOW INDEX rows are the schema-derived columns (see show_index.test):
+# Cardinality/Sub_part/Packed are NULL and the row order is unspecified, so each
+# index is checked with a `WHERE Key_name = ...` filter. Uses its own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ikd (id INT PRIMARY KEY, a INT, b INT, c INT, KEY ikd_a (a), KEY ikd_bc (b, c))
+
+# The single-column inline key exists.
+query
+SHOW INDEX FROM ikd WHERE Key_name = 'ikd_a'
+----
+ikd	1	ikd_a	1	a	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+
+# The composite inline key has one row per column, in declaration order.
+query
+SHOW INDEX FROM ikd WHERE Key_name = 'ikd_bc'
+----
+ikd	1	ikd_bc	1	b	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+ikd	1	ikd_bc	2	c	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+
+# Since the inline index already exists, re-adding it by the same name fails
+# (it would not, if the inline key had been dropped at CREATE TABLE).
+statement error
+ALTER TABLE ikd ADD KEY ikd_a (a)
