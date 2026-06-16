@@ -1671,11 +1671,12 @@ impl Parser {
     }
 
     /// Consumes and discards an optional trailing row-locking clause —
-    /// `FOR UPDATE`, `FOR SHARE`, or `LOCK IN SHARE MODE`. The engine is a single
-    /// writer, so explicit row locking is a no-op and the locked query returns
-    /// exactly the same rows as the unlocked one; see `mysql/COMPAT.md`. The
-    /// `OF tbl` / `NOWAIT` / `SKIP LOCKED` refinements are not consumed here, so
-    /// they fall through and are rejected as unsupported.
+    /// `FOR UPDATE`, `FOR SHARE`, or `LOCK IN SHARE MODE`, including the
+    /// `FOR ... [OF tbl [, tbl] ...] [NOWAIT | SKIP LOCKED]` refinements. The
+    /// engine is a single writer, so explicit row locking is a no-op and the
+    /// locked query returns exactly the same rows as the unlocked one (`NOWAIT` /
+    /// `SKIP LOCKED` only change behaviour under contention, which cannot arise);
+    /// see `mysql/COMPAT.md`.
     fn skip_locking_clause(&mut self) {
         if self.is_keyword("FOR") {
             // Only `FOR UPDATE` / `FOR SHARE` is a locking clause; leave anything
@@ -1686,6 +1687,28 @@ impl Parser {
             ) {
                 self.advance(); // FOR
                 self.advance(); // UPDATE | SHARE
+
+                // `OF tbl [, tbl] ...` names the tables to lock; consume and
+                // discard the (optionally `db.`-qualified) name list.
+                if self.eat_keyword("OF") {
+                    loop {
+                        if matches!(self.peek(), Some(Token::Word(_))) {
+                            self.advance();
+                            if self.eat(&Token::Dot) {
+                                self.advance(); // qualified table name
+                            }
+                        }
+                        if self.eat(&Token::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+
+                // The lock-acquisition option `NOWAIT` or `SKIP LOCKED`.
+                if !self.eat_keyword("NOWAIT") && self.eat_keyword("SKIP") {
+                    self.eat_keyword("LOCKED");
+                }
             }
         } else if self.is_keyword("LOCK") {
             // `LOCK IN SHARE MODE`.
@@ -7122,6 +7145,14 @@ mod tests {
             "SELECT a FROM t FOR SHARE",
             "SELECT a FROM t LOCK IN SHARE MODE",
             "SELECT a FROM t WHERE a = 1 ORDER BY a FOR UPDATE",
+            // The `OF tbl [, tbl] ...` and `NOWAIT` / `SKIP LOCKED` refinements.
+            "SELECT a FROM t FOR UPDATE NOWAIT",
+            "SELECT a FROM t FOR UPDATE SKIP LOCKED",
+            "SELECT a FROM t FOR SHARE NOWAIT",
+            "SELECT a FROM t FOR SHARE SKIP LOCKED",
+            "SELECT a FROM t FOR UPDATE OF t",
+            "SELECT a FROM t AS x FOR UPDATE OF x, t",
+            "SELECT a FROM t FOR UPDATE OF t NOWAIT",
         ] {
             assert!(
                 matches!(parse(sql).unwrap(), ast::Stmt::Select(_)),
@@ -7131,6 +7162,8 @@ mod tests {
         // A `FOR`-prefixed clause that is not a locking read is still rejected
         // (the stray `FOR` is left for the end-of-input check).
         assert!(parse("SELECT a FROM t FOR somethingelse").is_err());
+        // A trailing token after a valid locking clause is still rejected.
+        assert!(parse("SELECT a FROM t FOR UPDATE GARBAGE").is_err());
     }
 
     #[test]

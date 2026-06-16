@@ -34,3 +34,27 @@ query
 SELECT a FROM lock_demo WHERE a = 2 FOR SHARE
 ----
 2
+
+# The MySQL 8.0 refinements -- NOWAIT, SKIP LOCKED, and `OF tbl` -- only change
+# behaviour under contention, which cannot arise on a single writer, so they are
+# accepted and ignored and return the same rows.
+query
+SELECT a FROM lock_demo WHERE a = 1 FOR UPDATE NOWAIT
+----
+1
+
+query
+SELECT a FROM lock_demo WHERE a < 3 ORDER BY a FOR UPDATE SKIP LOCKED
+----
+1
+2
+
+query
+SELECT a FROM lock_demo WHERE a = 3 FOR UPDATE OF lock_demo
+----
+3
+
+query
+SELECT a FROM lock_demo AS d WHERE a = 2 FOR SHARE OF d NOWAIT
+----
+2
