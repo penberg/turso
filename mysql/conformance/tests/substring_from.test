@@ -57,3 +57,21 @@ SELECT id, SUBSTRING(s FROM 1 FOR 4) FROM sf_demo ORDER BY id
 ----
 1	word
 2	data
+
+# Out-of-range positions and lengths yield '' as MySQL does, not the whole
+# string that SQLite's substr would return: pos = 0, a position before the
+# start (pos < -length), and a negative length all give the empty string.
+# (Compared to '' so the all-empty result is representable here.)
+query
+SELECT SUBSTRING('hello', 0) = '', SUBSTRING('hello', -10) = '',
+       SUBSTRING('hello', 2, -1) = '', SUBSTRING('hello', 0, 2) = '',
+       MID('hello', 0) = ''
+----
+1	1	1	1	1
+
+# In-range edges still work: pos at the last char, a position past the end
+# (also ''), and a negative position within range.
+query
+SELECT SUBSTRING('hello', 5), SUBSTRING('hello', 6), SUBSTRING('hello', -1), SUBSTRING('hello', -5)
+----
+o		o	hello

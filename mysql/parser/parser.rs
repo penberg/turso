@@ -3758,10 +3758,10 @@ impl Parser {
         }
 
         // `SUBSTRING`/`SUBSTR` accept both the comma form `(str, pos[, len])` and
-        // the SQL-standard `(str FROM pos [FOR len])`; both lower to the engine's
-        // `substr`. (`MID`, the 3-argument synonym, keeps the comma form and is
-        // renamed via the generic path.)
-        if upper == "SUBSTRING" || upper == "SUBSTR" {
+        // the SQL-standard `(str FROM pos [FOR len])`; both lower to a guarded
+        // `substr`. `MID` is the comma-form synonym and shares the same lowering
+        // (so its out-of-range edge cases match too).
+        if upper == "SUBSTRING" || upper == "SUBSTR" || upper == "MID" {
             return self.substring_call();
         }
 
@@ -4346,12 +4346,7 @@ impl Parser {
             (pos, len)
         };
         self.expect(&Token::RParen, "`)`")?;
-
-        let mut args = vec![target, pos];
-        if let Some(len) = len {
-            args.push(len);
-        }
-        Ok(call_fn("substr", args))
+        Ok(guarded_substr(target, pos, len))
     }
 
     /// Parses a `GROUP_CONCAT([DISTINCT] expr [SEPARATOR 's'])` call (the name and
@@ -6299,6 +6294,46 @@ fn substr_fn(s: ast::Expr, start: ast::Expr, len: ast::Expr) -> ast::Expr {
     }
 }
 
+/// Lowers MySQL `SUBSTRING(str, pos[, len])` (and `SUBSTR`/`MID`) to the engine's
+/// `substr`, guarded so the out-of-range cases match MySQL rather than SQLite.
+/// They agree for an in-range position (1-based, negative counts from the end),
+/// but MySQL yields `''` where SQLite returns the whole string or a backward
+/// slice: when `pos = 0`, when `pos` is more than `length(str)` before the start
+/// (`pos < -length(str)`), and — with a length — when `len < 0`. A `CASE` returns
+/// `''` in those cases; NULL operands fall through to `substr`, which yields NULL
+/// as MySQL does.
+fn guarded_substr(target: ast::Expr, pos: ast::Expr, len: Option<ast::Expr>) -> ast::Expr {
+    let zero = || ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+    // pos = 0
+    let pos_is_zero = ast::Expr::binary(pos.clone(), ast::Operator::Equals, zero());
+    // pos < -length(str)  (length counts characters, as MySQL's check does)
+    let neg_length = ast::Expr::unary(
+        ast::UnaryOperator::Negative,
+        call_fn("length", vec![target.clone()]),
+    );
+    let pos_underflows = ast::Expr::binary(pos.clone(), ast::Operator::Less, neg_length);
+    let mut out_of_range = ast::Expr::binary(pos_is_zero, ast::Operator::Or, pos_underflows);
+
+    let substr = match len {
+        Some(len) => {
+            // A negative length is also empty in MySQL.
+            let len_negative = ast::Expr::binary(len.clone(), ast::Operator::Less, zero());
+            out_of_range = ast::Expr::binary(out_of_range, ast::Operator::Or, len_negative);
+            substr_fn(target, pos, len)
+        }
+        None => call_fn("substr", vec![target, pos]),
+    };
+
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(out_of_range),
+            Box::new(ast::Expr::Literal(ast::Literal::String(requote("")))),
+        )],
+        else_expr: Some(Box::new(substr)),
+    }
+}
+
 /// Builds the lowering for `LPAD`/`RPAD`: pad `target` to `len` characters using
 /// `pad`, on the left when `left` is true, otherwise the right.
 ///
@@ -6840,7 +6875,7 @@ fn is_supported_function(upper_name: &str) -> bool {
         // Functions sharing behaviour with the engine under a different name;
         // renamed on emit (see `engine_function_name`).
         | "IF"
-        | "MID" | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
+        | "LCASE" | "UCASE" | "CHAR_LENGTH" | "CHARACTER_LENGTH"
         // The scalar `GREATEST` / `LEAST` map to the engine's multi-argument
         // `max` / `min`, which — like MySQL — return NULL if any argument is NULL.
         | "GREATEST" | "LEAST"
@@ -7156,7 +7191,6 @@ fn expr_contains_aggregate(expr: &ast::Expr) -> bool {
 fn engine_function_name(upper_name: &str) -> Option<&'static str> {
     Some(match upper_name {
         "IF" => "iif",
-        "MID" => "substr",
         "LCASE" => "lower",
         "UCASE" => "upper",
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => "length",
@@ -10369,11 +10403,16 @@ mod tests {
     #[test]
     fn substring_from_for_lowers_like_comma_form() {
         // The SQL-standard SUBSTRING(str FROM pos FOR len) lowers identically to
-        // the comma form SUBSTRING(str, pos, len) -> substr(str, pos, len).
+        // the comma form SUBSTRING(str, pos, len) -> a CASE-guarded substr (the
+        // guard matches MySQL's out-of-range semantics).
         let from_for = parse_expr("SUBSTRING('hello' FROM 2 FOR 3)").unwrap();
         assert_eq!(from_for, parse_expr("SUBSTRING('hello', 2, 3)").unwrap());
-        let ast::Expr::FunctionCall { name, args, .. } = &from_for else {
-            panic!("expected a function call");
+        // The lowering is a CASE whose else branch is substr(str, pos, len).
+        let ast::Expr::Case { else_expr, .. } = &from_for else {
+            panic!("expected a CASE-guarded substr");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.as_deref().unwrap() else {
+            panic!("expected substr in the else branch");
         };
         assert_eq!(name.as_str(), "substr");
         assert_eq!(args.len(), 3);
@@ -10382,9 +10421,13 @@ mod tests {
         let from_only = parse_expr("SUBSTRING('hello' FROM 2)").unwrap();
         assert_eq!(from_only, parse_expr("SUBSTRING('hello', 2)").unwrap());
 
-        // SUBSTR accepts the same FROM/FOR syntax (an exact synonym).
+        // SUBSTR and MID share the exact same lowering.
         assert_eq!(
             parse_expr("SUBSTR('hello' FROM 2 FOR 3)").unwrap(),
+            parse_expr("SUBSTRING('hello', 2, 3)").unwrap()
+        );
+        assert_eq!(
+            parse_expr("MID('hello', 2, 3)").unwrap(),
             parse_expr("SUBSTRING('hello', 2, 3)").unwrap()
         );
     }
@@ -11183,9 +11226,9 @@ mod tests {
         ));
 
         // String functions sharing name and behaviour with the engine.
+        // (SUBSTR/SUBSTRING/MID lower to a guarded substr, tested separately.)
         for input in [
             "REPLACE(s, '-', '_')",
-            "SUBSTR(s, 2, 3)",
             "TRIM(s)",
             "LTRIM(s)",
             "RTRIM(s)",
@@ -11573,9 +11616,9 @@ mod tests {
 
     #[test]
     fn function_synonyms_are_renamed() {
+        // (SUBSTRING / SUBSTR / MID lower to a CASE-guarded substr, covered by
+        // `substring_from_for_lowers_like_comma_form`.)
         for (input, engine) in [
-            ("SUBSTRING('s', 1, 2)", "substr"),
-            ("MID('s', 1, 2)", "substr"),
             ("LCASE('S')", "lower"),
             ("UCASE('s')", "upper"),
             ("CHAR_LENGTH('s')", "length"),
