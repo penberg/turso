@@ -4103,6 +4103,13 @@ impl Parser {
             ));
         }
 
+        // `ROW(e1, e2, ...)` is MySQL's explicit row constructor — identical to a
+        // parenthesized row-value tuple `(e1, e2, ...)` — so it lowers to the
+        // engine's row value (see `row_constructor_call`).
+        if upper == "ROW" {
+            return self.row_constructor_call();
+        }
+
         // `CONCAT(a, b, ...)` lowers to the engine's `||` concatenation, which —
         // like MySQL's CONCAT — yields NULL if any argument is NULL. (The
         // engine's own `concat()` skips NULLs instead, so it is not used here.)
@@ -5857,6 +5864,29 @@ impl Parser {
             integer_arg(pos),
             len.map(integer_arg),
         ))
+    }
+
+    /// Parses `ROW(e1, e2, ...)` (the name and `(` already consumed) — MySQL's
+    /// explicit row constructor — and lowers it to the engine's parenthesized
+    /// row-value tuple `(e1, e2, ...)`, the same node a literal `(e1, e2, ...)`
+    /// produces. The engine compares a row value element-wise, exactly as MySQL
+    /// compares a `ROW(...)`: `ROW(1,2) = ROW(1,2)` → 1, `ROW(1,2) < ROW(1,3)` →
+    /// 1, `ROW(1,2) IN (ROW(1,2), ROW(3,4))` → 1. At least two elements are
+    /// required, as in MySQL where `ROW(x)` is a syntax error. A row value is
+    /// usable only in a row comparison; using one in a scalar context
+    /// (`SELECT ROW(1,2)`) is an error on both, with differing messages.
+    fn row_constructor_call(&mut self) -> Result<ast::Expr> {
+        let mut exprs = vec![Box::new(self.expr()?)];
+        while self.eat(&Token::Comma) {
+            exprs.push(Box::new(self.expr()?));
+        }
+        if exprs.len() < 2 {
+            return Err(ParseError::Unsupported(
+                "ROW() requires at least two elements".to_string(),
+            ));
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::Parenthesized(exprs))
     }
 
     /// Parses `SUBSTRING_INDEX(str, delim, count)` (the name and `(` already
@@ -16546,6 +16576,34 @@ mod tests {
         // A row-value operand is *not* COLLATE-wrapped (a tuple is not a scalar),
         // so it stays a Parenthesized — unlike a scalar `IN` operand.
         assert!(matches!(lhs.as_ref(), ast::Expr::Parenthesized(e) if e.len() == 2));
+    }
+
+    #[test]
+    fn row_constructor_lowers_to_a_row_value_tuple() {
+        // `ROW(e1, e2, ...)` lowers to the same Parenthesized row value as the
+        // literal `(e1, e2, ...)` tuple, so it compares element-wise.
+        assert_eq!(
+            parse_expr("ROW(a, b, 1)").unwrap(),
+            parse_expr("(a, b, 1)").unwrap()
+        );
+        let ast::Expr::Parenthesized(exprs) = parse_expr("ROW(a, b)").unwrap() else {
+            panic!("expected ROW(...) to lower to a Parenthesized row value");
+        };
+        assert_eq!(exprs.len(), 2);
+        assert_eq!(*exprs[0], col("a"));
+        assert_eq!(*exprs[1], col("b"));
+
+        // `ROW(1, 2) = ROW(1, 2)` is a row-value equality, exactly like the tuple
+        // form `(1, 2) = (1, 2)`.
+        assert_eq!(
+            parse_expr("ROW(1, 2) = ROW(1, 2)").unwrap(),
+            parse_expr("(1, 2) = (1, 2)").unwrap()
+        );
+
+        // MySQL requires at least two elements: `ROW(x)` is rejected (a syntax
+        // error there), as is the empty `ROW()`.
+        assert!(parse_expr("ROW(1)").is_err());
+        assert!(parse_expr("ROW()").is_err());
     }
 
     #[test]
