@@ -3829,10 +3829,7 @@ impl Parser {
 
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
-        Ok(ast::Expr::Cast {
-            expr: Box::new(expr),
-            type_name: Some(type_name),
-        })
+        Ok(build_cast(expr, type_name))
     }
 
     /// Parses `CONVERT(...)`, which has two MySQL forms:
@@ -3852,10 +3849,7 @@ impl Parser {
         self.expect(&Token::Comma, "`,` or `USING`")?;
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
-        Ok(ast::Expr::Cast {
-            expr: Box::new(expr),
-            type_name: Some(type_name),
-        })
+        Ok(build_cast(expr, type_name))
     }
 
     /// Parses and maps a MySQL `CAST` target type onto an engine type whose
@@ -8166,6 +8160,51 @@ fn substring_index_before_first(s: ast::Expr, d: ast::Expr) -> ast::Expr {
     }
 }
 
+/// Builds a `CAST(expr AS type)`, with one MySQL-faithful refinement for an
+/// integer target (`SIGNED`/`UNSIGNED`, mapped to `INTEGER`): MySQL **rounds** a
+/// numeric argument (`CAST(3.7 AS SIGNED)` is `4`) but parses a string by its
+/// leading integer (`CAST('12.9' AS UNSIGNED)` is `12`), whereas the engine's
+/// plain `CAST ... AS INTEGER` truncates a numeric too. A runtime `typeof` guard
+/// restores MySQL's behaviour — a numeric (`integer`/`real`) value is rounded
+/// before the cast, while a string/blob/NULL value is cast directly (the
+/// leading-integer parse). Every other target is a plain cast.
+fn build_cast(expr: ast::Expr, type_name: ast::Type) -> ast::Expr {
+    if type_name.name != "INTEGER" {
+        return ast::Expr::Cast {
+            expr: Box::new(expr),
+            type_name: Some(type_name),
+        };
+    }
+    let int_cast = |e: ast::Expr| ast::Expr::Cast {
+        expr: Box::new(e),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    let type_is = |s: &str, e: ast::Expr| {
+        ast::Expr::binary(
+            unary_fn("typeof", e),
+            ast::Operator::Equals,
+            ast::Expr::Literal(ast::Literal::String(requote(s))),
+        )
+    };
+    // `typeof(expr) = 'integer' OR typeof(expr) = 'real'` — a numeric value.
+    let is_numeric = ast::Expr::binary(
+        type_is("integer", expr.clone()),
+        ast::Operator::Or,
+        type_is("real", expr.clone()),
+    );
+    let rounded = int_cast(call_fn("round", vec![expr.clone()]));
+    let truncated = int_cast(expr);
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(is_numeric), Box::new(rounded))],
+        else_expr: Some(Box::new(truncated)),
+    }
+}
+
 /// Builds `substr(s, start, len)`.
 fn substr_fn(s: ast::Expr, start: ast::Expr, len: ast::Expr) -> ast::Expr {
     ast::Expr::FunctionCall {
@@ -12136,9 +12175,6 @@ mod tests {
         // engine type with the matching affinity.
         let cases = [
             ("CAST(a AS CHAR)", "CHAR"),
-            ("CAST(a AS SIGNED)", "INTEGER"),
-            ("CAST(a AS SIGNED INTEGER)", "INTEGER"),
-            ("CAST(a AS UNSIGNED)", "INTEGER"),
             ("CAST(a AS DECIMAL)", "DECIMAL"),
             ("CAST(a AS DOUBLE)", "REAL"),
             ("CAST(a AS BINARY)", "BLOB"),
@@ -12151,6 +12187,23 @@ mod tests {
             let ty = type_name.expect("cast has a target type");
             assert_eq!(ty.name, expected, "for `{sql}`");
             assert!(ty.size.is_none(), "length must be dropped for `{sql}`");
+        }
+        // An integer target (SIGNED/UNSIGNED) lowers to a `typeof`-guarded CASE
+        // that rounds a numeric value before the `CAST ... AS INTEGER` and casts a
+        // string/NULL directly (MySQL's argument-type-dependent rounding).
+        for sql in [
+            "CAST(a AS SIGNED)",
+            "CAST(a AS SIGNED INTEGER)",
+            "CAST(a AS UNSIGNED)",
+        ] {
+            let ast::Expr::Case { else_expr, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            let else_branch = else_expr.unwrap();
+            let ast::Expr::Cast { type_name, .. } = else_branch.as_ref() else {
+                panic!("expected the ELSE of `{sql}` to be a CAST AS INTEGER");
+            };
+            assert_eq!(type_name.as_ref().unwrap().name, "INTEGER", "for `{sql}`");
         }
         // DATE/DATETIME/TIME have no affinity, so they lower to the engine's
         // date()/datetime()/time() functions instead of a Cast.
@@ -14195,11 +14248,21 @@ mod tests {
     fn convert_using_drops_charset_and_type_form_is_a_cast() {
         // CONVERT(expr USING charset) drops the charset and yields the bare expr.
         assert_eq!(parse_expr("CONVERT(a USING utf8mb4)").unwrap(), col("a"));
-        // CONVERT(expr, type) is the same as CAST(expr AS type).
-        let ast::Expr::Cast { type_name, .. } = parse_expr("CONVERT(a, SIGNED)").unwrap() else {
+        // CONVERT(expr, type) is the same as CAST(expr AS type): a non-integer
+        // target is a plain Cast, ...
+        let ast::Expr::Cast { type_name, .. } = parse_expr("CONVERT(a, CHAR)").unwrap() else {
             panic!("expected CONVERT(expr, type) to parse as a Cast");
         };
-        assert_eq!(type_name.unwrap().name, "INTEGER");
+        assert_eq!(type_name.unwrap().name, "CHAR");
+        // ... and an integer target gets the same rounding CASE as `CAST AS SIGNED`.
+        assert_eq!(
+            parse_expr("CONVERT(a, SIGNED)").unwrap(),
+            parse_expr("CAST(a AS SIGNED)").unwrap()
+        );
+        assert!(matches!(
+            parse_expr("CONVERT(a, SIGNED)").unwrap(),
+            ast::Expr::Case { .. }
+        ));
     }
 
     #[test]

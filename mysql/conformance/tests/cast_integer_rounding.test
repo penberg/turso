@@ -1,0 +1,49 @@
+# CAST(... AS SIGNED/UNSIGNED) rounding.
+#
+# When casting to an integer, MySQL rounds a numeric argument
+# (CAST(3.7 AS SIGNED) is 4, half away from zero) but parses a string by its
+# leading integer (CAST('12.9' AS UNSIGNED) is 12 — it stops at the '.'). The
+# front-end reproduces both with a runtime typeof guard: a numeric value is
+# rounded before the cast, a string/NULL value is cast directly. CONVERT(expr,
+# type) shares the same lowering.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# A numeric argument is rounded (half away from zero), not truncated.
+query
+SELECT CAST(3.7 AS SIGNED), CAST(2.5 AS SIGNED), CAST(2.4 AS SIGNED), CAST(-2.5 AS SIGNED)
+----
+4	3	2	-3
+
+# A string argument is parsed by its leading integer (no rounding at the dot).
+query
+SELECT CAST('12.9' AS UNSIGNED), CAST('3.7' AS SIGNED), CAST('100abc' AS SIGNED), CAST('abc' AS SIGNED)
+----
+12	3	100	0
+
+# An integer argument and a NULL pass through.
+query
+SELECT CAST(12 AS SIGNED), CAST(NULL AS SIGNED)
+----
+12	NULL
+
+# CONVERT(expr, type) rounds and truncate-parses the same way.
+query
+SELECT CONVERT(3.7, SIGNED), CONVERT('12.9', UNSIGNED)
+----
+4	12
+
+statement ok
+CREATE TABLE castr_t (id INT PRIMARY KEY, dval DOUBLE, sval VARCHAR(20))
+
+statement ok
+INSERT INTO castr_t VALUES (1, 3.7, '3.7'), (2, 4.8, '12.9')
+
+# A DOUBLE column rounds; a VARCHAR column with the same text truncate-parses.
+# (Non-half values are used: a DOUBLE exactly at .5 rounds half-to-even in MySQL
+# but half-away-from-zero here -- see mysql/COMPAT.md.)
+query
+SELECT id, CAST(dval AS SIGNED), CAST(sval AS UNSIGNED) FROM castr_t ORDER BY id
+----
+1	4	3
+2	5	12
