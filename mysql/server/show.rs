@@ -696,16 +696,24 @@ const BASE_TABLES_QUERY: &str = "SELECT name FROM sqlite_schema WHERE type = 'ta
 /// Lists base table names from the schema, optionally filtered by a `LIKE`
 /// pattern, as a MySQL `SHOW [FULL] TABLES` result set.
 fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResult, LimboError> {
-    let mut query = BASE_TABLES_QUERY.to_string();
+    // SHOW TABLES lists both base tables and views; SHOW FULL TABLES tags each by
+    // `Table_type` (`BASE TABLE` / `VIEW`). The engine's internal tables are
+    // excluded as in `BASE_TABLES_QUERY`.
+    let mut query = "SELECT name, type FROM sqlite_schema WHERE type IN ('table', 'view') \
+         AND name NOT LIKE 'sqlite_%' \
+         AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'"
+        .to_string();
     if let Some(pat) = &show.like {
         query.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
     }
     query.push_str(" ORDER BY name");
 
-    let mut names: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
     if let Some(mut stmt) = conn.query(&query)? {
         stmt.run_with_row_callback(|row| {
-            names.push(value_to_string(row.get_value(0)).unwrap_or_default());
+            let name = value_to_string(row.get_value(0)).unwrap_or_default();
+            let typ = value_to_string(row.get_value(1)).unwrap_or_default();
+            entries.push((name, typ));
             Ok(())
         })?;
     }
@@ -717,11 +725,16 @@ fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResu
     } else {
         vec!["Tables_in_database"]
     };
-    let rows = names
+    let rows = entries
         .into_iter()
-        .map(|name| {
+        .map(|(name, typ)| {
             if show.full {
-                vec![Some(name), Some("BASE TABLE".to_string())]
+                let table_type = if typ.eq_ignore_ascii_case("view") {
+                    "VIEW"
+                } else {
+                    "BASE TABLE"
+                };
+                vec![Some(name), Some(table_type.to_string())]
             } else {
                 vec![Some(name)]
             }

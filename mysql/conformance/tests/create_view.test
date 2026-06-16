@@ -1,0 +1,103 @@
+# CREATE VIEW / DROP VIEW.
+#
+# The engine has native views, so the front-end now translates `CREATE [OR
+# REPLACE] VIEW name [(cols)] AS <select>` (with the MySQL ALGORITHM / DEFINER /
+# SQL SECURITY attributes and WITH CHECK OPTION accepted and ignored) and `DROP
+# VIEW [IF EXISTS] name[, ...]`. The view body is translated like any query, so
+# MySQL functions work in it. The view is listed by information_schema.TABLES
+# (TABLE_TYPE = 'VIEW'), information_schema.VIEWS, and SHOW [FULL] TABLES.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. The test
+# drops its views at the end so none persist into other tests.
+
+statement ok
+CREATE TABLE IF NOT EXISTS cv_base (id INT PRIMARY KEY, v INT, g VARCHAR(8))
+
+statement ok
+INSERT INTO cv_base VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'a')
+
+# A view over a filter/projection, queried like a table.
+statement ok
+CREATE VIEW cv_filter AS SELECT id, v * 2 AS dbl FROM cv_base WHERE v > 10
+
+query
+SELECT id, dbl FROM cv_filter ORDER BY id
+----
+2	40
+3	60
+
+# A view using a MySQL function and an aggregate.
+statement ok
+CREATE VIEW cv_agg AS SELECT g, COUNT(*) AS c, UPPER(g) AS gu FROM cv_base GROUP BY g
+
+query
+SELECT g, c, gu FROM cv_agg ORDER BY g
+----
+a	2	A
+b	1	B
+
+# Column aliases in the SELECT rename the view's columns.
+statement ok
+CREATE VIEW cv_cols AS SELECT id AS first, v AS second FROM cv_base
+
+query
+SELECT first, second FROM cv_cols ORDER BY first
+----
+1	10
+2	20
+3	30
+
+# CREATE OR REPLACE redefines an existing view.
+statement ok
+CREATE OR REPLACE VIEW cv_filter AS SELECT id, v FROM cv_base WHERE v < 25
+
+query
+SELECT id, v FROM cv_filter ORDER BY id
+----
+1	10
+2	20
+
+# mysqldump's view header (ALGORITHM / DEFINER / SQL SECURITY) is accepted.
+statement ok
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW cv_dumped AS SELECT id FROM cv_base
+
+query
+SELECT COUNT(*) FROM cv_dumped
+----
+3
+
+# A view appears in information_schema.TABLES as TABLE_TYPE = 'VIEW' with NULL
+# engine/size/auto-increment.
+query
+SELECT TABLE_TYPE, ENGINE, AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cv_agg'
+----
+VIEW	NULL	NULL
+
+# It is listed by information_schema.VIEWS.
+query
+SELECT TABLE_NAME, CHECK_OPTION, SECURITY_TYPE FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cv_agg'
+----
+cv_agg	NONE	DEFINER
+
+# SHOW FULL TABLES tags the view and the base table by their Table_type.
+query
+SHOW FULL TABLES LIKE 'cv%'
+----
+cv_agg	VIEW
+cv_base	BASE TABLE
+cv_cols	VIEW
+cv_dumped	VIEW
+cv_filter	VIEW
+
+# DROP VIEW removes it; DROP VIEW IF EXISTS handles a list including an absent one.
+statement ok
+DROP VIEW cv_filter
+
+statement ok
+DROP VIEW IF EXISTS cv_agg, cv_cols, cv_dumped, cv_never
+
+# All the views are gone.
+query
+SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'cv%'
+----
+0

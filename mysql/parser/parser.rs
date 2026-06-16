@@ -287,7 +287,25 @@ impl Parser {
     // === CREATE TABLE ===
 
     fn create(&mut self) -> Result<ast::Stmt> {
-        // `CREATE` has already been consumed.
+        // `CREATE` has already been consumed. `CREATE [OR REPLACE] [ALGORITHM=...]
+        // [DEFINER=...] [SQL SECURITY ...] VIEW ...` — the view prefixes precede
+        // the `VIEW` keyword, so check for them before the table/index forms.
+        let or_replace = if self.eat_keyword("OR") {
+            self.expect_keyword("REPLACE")?;
+            true
+        } else {
+            false
+        };
+        self.skip_create_view_attributes()?;
+        if self.eat_keyword("VIEW") {
+            return self.create_view(or_replace);
+        }
+        if or_replace {
+            return Err(ParseError::Unsupported(
+                "CREATE OR REPLACE applies only to a VIEW".to_string(),
+            ));
+        }
+
         let temporary = self.eat_keyword("TEMPORARY");
         if self.eat_keyword("TABLE") {
             return self.create_table(temporary);
@@ -307,8 +325,79 @@ impl Parser {
             _ => "?".to_string(),
         };
         Err(ParseError::Unsupported(format!(
-            "CREATE {what} is not supported yet (only CREATE TABLE / CREATE INDEX are implemented)"
+            "CREATE {what} is not supported yet (only CREATE TABLE / CREATE INDEX / CREATE VIEW are implemented)"
         )))
+    }
+
+    /// Consumes the optional `ALGORITHM = ...`, `DEFINER = ...`, and `SQL SECURITY
+    /// ...` attributes that may precede `VIEW` in a `CREATE VIEW` (mysqldump emits
+    /// all three). The engine has no equivalent, so they are parsed and discarded.
+    fn skip_create_view_attributes(&mut self) -> Result<()> {
+        if self.eat_keyword("ALGORITHM") {
+            self.expect(&Token::Eq, "`=`")?;
+            let _ = self.name()?; // UNDEFINED | MERGE | TEMPTABLE
+        }
+        if self.eat_keyword("DEFINER") {
+            self.expect(&Token::Eq, "`=`")?;
+            // The user spec — `user@host`, its quoted forms, or `CURRENT_USER`
+            // / `CURRENT_USER()` — runs to the next attribute keyword or `VIEW`.
+            while !self.is_keyword("SQL") && !self.is_keyword("VIEW") && self.peek().is_some() {
+                self.advance();
+            }
+        }
+        if self.eat_keyword("SQL") {
+            self.expect_keyword("SECURITY")?;
+            let _ = self.name()?; // DEFINER | INVOKER
+        }
+        Ok(())
+    }
+
+    /// Parses `CREATE [OR REPLACE] VIEW name [(col, ...)] AS <select> [WITH
+    /// [CASCADED|LOCAL] CHECK OPTION]` (the `VIEW` keyword already consumed) into
+    /// the engine's native `CREATE VIEW`. The select body is translated by the
+    /// front-end (so its MySQL functions/operators lower like any other query).
+    /// The engine has no `OR REPLACE`, so it is emulated by dropping any existing
+    /// view first; the `WITH CHECK OPTION` clause is accepted but not enforced
+    /// (the engine does not validate writes through a view).
+    fn create_view(&mut self, or_replace: bool) -> Result<ast::Stmt> {
+        let view_name = self.qualified_name()?;
+        // The explicit column-rename list `(c1, c2, ...)` is not modeled — the
+        // engine does not apply it to the view built from a translated AST — so it
+        // is rejected; the equivalent column aliases in the `SELECT` work instead.
+        if self.is(&Token::LParen) {
+            return Err(ParseError::Unsupported(
+                "CREATE VIEW with an explicit column list is not supported yet \
+                 (use column aliases in the SELECT)"
+                    .to_string(),
+            ));
+        }
+        let columns = Vec::new();
+        self.expect_keyword("AS")?;
+        self.expect_keyword("SELECT")?;
+        let select = self.parse_select()?;
+        if self.eat_keyword("WITH") {
+            let _ = self.eat_keyword("CASCADED") || self.eat_keyword("LOCAL");
+            self.expect_keyword("CHECK")?;
+            self.expect_keyword("OPTION")?;
+        }
+
+        let create = ast::Stmt::CreateView {
+            temporary: false,
+            if_not_exists: false,
+            view_name: view_name.clone(),
+            columns,
+            select,
+        };
+        if or_replace {
+            // No `CREATE OR REPLACE VIEW` in the engine: drop any existing view
+            // first (the drop is the main statement, the create deferred after it).
+            self.pending_statements.push(create);
+            return Ok(ast::Stmt::DropView {
+                if_exists: true,
+                view_name,
+            });
+        }
+        Ok(create)
     }
 
     /// Parses `CREATE [UNIQUE] INDEX idx_name [USING ...] ON tbl_name (cols)`
@@ -1407,15 +1496,42 @@ impl Parser {
             ))
         } else if self.eat_keyword("INDEX") {
             self.drop_index()
+        } else if self.eat_keyword("VIEW") {
+            self.drop_view()
         } else {
             let what = match self.peek() {
                 Some(Token::Word(w)) => w.to_ascii_uppercase(),
                 _ => "?".to_string(),
             };
             Err(ParseError::Unsupported(format!(
-                "DROP {what} is not supported yet (only DROP TABLE / DROP INDEX are implemented)"
+                "DROP {what} is not supported yet (only DROP TABLE / DROP INDEX / DROP VIEW are implemented)"
             )))
         }
+    }
+
+    /// Parses `DROP VIEW [IF EXISTS] name[, name ...] [RESTRICT|CASCADE]` (the
+    /// `DROP VIEW` keywords already consumed) into the engine's `DROP VIEW`. The
+    /// engine has no multi-view drop, so additional views are deferred (like
+    /// multi-table `DROP TABLE`); `RESTRICT`/`CASCADE` are accepted and ignored,
+    /// as MySQL ignores them for views.
+    fn drop_view(&mut self) -> Result<ast::Stmt> {
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let main = ast::Stmt::DropView {
+            if_exists,
+            view_name: self.qualified_name()?,
+        };
+        while self.eat(&Token::Comma) {
+            let view_name = self.qualified_name()?;
+            self.pending_statements
+                .push(ast::Stmt::DropView { if_exists, view_name });
+        }
+        let _ = self.eat_keyword("RESTRICT") || self.eat_keyword("CASCADE");
+        Ok(main)
     }
 
     /// Parses `DROP INDEX [IF EXISTS] idx_name [ON tbl_name]` (`DROP INDEX` is
@@ -2451,10 +2567,21 @@ impl Parser {
             ));
         }
 
+        // `information_schema.VIEWS` lists the database's views (synthesized from
+        // the engine catalog, see `information_schema_views_select`).
+        if is_information_schema_views(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_views_select(self.current_db.as_deref())?,
+                alias,
+            ));
+        }
+
         // The `information_schema` object-enumeration views the engine never
-        // populates (`VIEWS`, `ROUTINES`, `TRIGGERS`, `EVENTS`) are emulated as
-        // always-empty result sets, so a dump/backup tool that enumerates them
-        // gets nothing rather than an error (see `information_schema_empty_view_select`).
+        // populates (`ROUTINES`, `TRIGGERS`, `EVENTS`) are emulated as always-empty
+        // result sets, so a dump/backup tool that enumerates them gets nothing
+        // rather than an error (see `information_schema_empty_view_select`).
         if let Some(select) = information_schema_empty_view_select(&tbl_name)? {
             let alias = self.table_alias()?;
             self.skip_index_hints()?;
@@ -10577,17 +10704,17 @@ fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Sel
     const SQL: &str = "SELECT \
          name AS TABLE_NAME, \
          'def' AS TABLE_SCHEMA, \
-         'InnoDB' AS ENGINE, \
-         'BASE TABLE' AS TABLE_TYPE, \
-         0 AS TABLE_ROWS, \
-         0 AS DATA_LENGTH, \
-         0 AS INDEX_LENGTH, \
-         CASE WHEN sqlite_schema.sql LIKE '%AUTOINCREMENT%' \
+         CASE WHEN type = 'view' THEN NULL ELSE 'InnoDB' END AS ENGINE, \
+         CASE WHEN type = 'view' THEN 'VIEW' ELSE 'BASE TABLE' END AS TABLE_TYPE, \
+         CASE WHEN type = 'view' THEN NULL ELSE 0 END AS TABLE_ROWS, \
+         CASE WHEN type = 'view' THEN NULL ELSE 0 END AS DATA_LENGTH, \
+         CASE WHEN type = 'view' THEN NULL ELSE 0 END AS INDEX_LENGTH, \
+         CASE WHEN type = 'table' AND sqlite_schema.sql LIKE '%AUTOINCREMENT%' \
               THEN (SELECT seq + 1 FROM sqlite_sequence \
                     WHERE sqlite_sequence.name = sqlite_schema.name) \
               ELSE NULL END AS AUTO_INCREMENT \
          FROM sqlite_schema \
-         WHERE type = 'table' \
+         WHERE type IN ('table', 'view') \
          AND name NOT LIKE 'sqlite_%' \
          AND substr(name, 1, 17) <> '__turso_internal_'";
     let sql = info_schema_with_schema(SQL, current_db);
@@ -10635,8 +10762,47 @@ fn information_schema_schemata_select(current_db: Option<&str>) -> Result<ast::S
     }
 }
 
+/// Whether `name` refers to `information_schema.VIEWS` (schema and table compared
+/// case-insensitively).
+fn is_information_schema_views(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("VIEWS")
+}
+
+/// Emulates `information_schema.VIEWS` from the engine catalog, one row per view
+/// (`sqlite_schema` rows of type `view`). `TABLE_SCHEMA` reports the current
+/// database; `CHECK_OPTION` is `NONE` and `SECURITY_TYPE` `DEFINER`, as for an
+/// ordinary view. `VIEW_DEFINITION` is left empty and `IS_UPDATABLE` reported as
+/// `NO` — the engine does not expose MySQL's normalized definition text nor
+/// compute updatability (a documented divergence) — so backup tools that
+/// enumerate view *names* work, the common case.
+fn information_schema_views_select(current_db: Option<&str>) -> Result<ast::Select> {
+    const SQL: &str = "SELECT \
+         'def' AS TABLE_CATALOG, \
+         'def' AS TABLE_SCHEMA, \
+         name AS TABLE_NAME, \
+         '' AS VIEW_DEFINITION, \
+         'NONE' AS CHECK_OPTION, \
+         'NO' AS IS_UPDATABLE, \
+         '' AS DEFINER, \
+         'DEFINER' AS SECURITY_TYPE, \
+         'utf8mb4' AS CHARACTER_SET_CLIENT, \
+         'utf8mb4_general_ci' AS COLLATION_CONNECTION \
+         FROM sqlite_schema \
+         WHERE type = 'view' \
+         AND name NOT LIKE 'sqlite_%' \
+         AND substr(name, 1, 17) <> '__turso_internal_'";
+    let sql = info_schema_with_schema(SQL, current_db);
+    match Parser::new(sql.as_bytes())?.parse_statement()? {
+        ast::Stmt::Select(select) => Ok(select),
+        _ => unreachable!("the information_schema.VIEWS emulation parses as a SELECT"),
+    }
+}
+
 /// Emulates the `information_schema` object-enumeration views the engine never
-/// populates — it cannot define stored `VIEWS`, `ROUTINES` (procedures /
+/// populates — it cannot define stored `ROUTINES` (procedures /
 /// functions), `TRIGGERS`, or `EVENTS` — as always-empty result sets carrying
 /// the columns mysqldump and backup/migration tools select. The view is built as
 /// a constant-column `SELECT ... FROM sqlite_schema WHERE type = <never matched>`
@@ -10654,12 +10820,7 @@ fn information_schema_empty_view_select(
         return Ok(None);
     }
     let view = name.name.as_str();
-    let columns = if view.eq_ignore_ascii_case("VIEWS") {
-        "'def' AS TABLE_CATALOG, 'def' AS TABLE_SCHEMA, '' AS TABLE_NAME, \
-         '' AS VIEW_DEFINITION, 'NONE' AS CHECK_OPTION, 'NO' AS IS_UPDATABLE, \
-         '' AS DEFINER, 'DEFINER' AS SECURITY_TYPE, \
-         'utf8mb4' AS CHARACTER_SET_CLIENT, 'utf8mb4_general_ci' AS COLLATION_CONNECTION"
-    } else if view.eq_ignore_ascii_case("ROUTINES") {
+    let columns = if view.eq_ignore_ascii_case("ROUTINES") {
         "'' AS SPECIFIC_NAME, 'def' AS ROUTINE_CATALOG, 'def' AS ROUTINE_SCHEMA, \
          '' AS ROUTINE_NAME, '' AS ROUTINE_TYPE, '' AS DATA_TYPE, \
          'SQL' AS ROUTINE_BODY, '' AS ROUTINE_DEFINITION, 'DEFINER' AS SECURITY_TYPE, \

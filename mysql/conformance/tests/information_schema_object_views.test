@@ -1,11 +1,11 @@
 # Empty information_schema object-enumeration views.
 #
-# information_schema.VIEWS / ROUTINES / TRIGGERS / EVENTS list a database's
-# views, stored procedures/functions, triggers, and scheduled events. The engine
-# cannot define any of these through the front-end, so for any database they are
-# empty -- exactly what a MySQL server returns when none are defined. The views
-# did not exist in the front-end, so a reference errored ("no such database:
-# information_schema").
+# information_schema.ROUTINES / TRIGGERS / EVENTS list a database's stored
+# procedures/functions, triggers, and scheduled events. The engine cannot define
+# any of these through the front-end, so for any database they are empty -- what
+# a MySQL server returns when none are defined. The views did not exist in the
+# front-end, so a reference errored ("no such database: information_schema").
+# (information_schema.VIEWS does list real views now -- see create_view.test.)
 #
 # mysqldump (with its default --routines / --triggers / --events) and backup /
 # migration plugins enumerate these per database during an export; they now get
@@ -15,16 +15,6 @@
 # tools do, so a real server's other-schema objects (e.g. the built-in `sys`
 # triggers) do not affect the comparison. Expected to pass against both
 # turso-mysql-server and a real mysqld.
-
-# No user views in this database.
-query
-SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE()
-----
-
-query
-SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE()
-----
-0
 
 # No stored procedures or functions.
 query
