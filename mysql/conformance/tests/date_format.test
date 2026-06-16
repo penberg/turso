@@ -206,3 +206,19 @@ query
 SELECT DATE_FORMAT('2026-06-15 14:05:09', '%M %D, %y at %r'), DATE_FORMAT(NULL, '%y %r')
 ----
 June 15th, 26 at 02:05:09 PM	NULL
+
+# A long format string packed with the CASE-heavy 12-hour / meridiem specifiers
+# (%h %I %l %p %r %T %k) must format correctly without overflowing the engine's
+# expression-evaluator stack. The pieces are concatenated as a balanced `||`
+# tree so the AST stays shallow regardless of how many specifiers appear.
+query
+SELECT DATE_FORMAT('2020-06-15 14:05:03', '%h %I %l %p %r %T %k')
+----
+02 02 2 PM 02:05:03 PM 14:05:03 14
+
+# An even longer mix of name, numeric and clock specifiers still formats and
+# keeps NULL propagation.
+query
+SELECT DATE_FORMAT('2020-06-15 14:05:03', '%Y-%m-%d %H:%i:%s %p %r %T %W %M %j %h'), DATE_FORMAT(NULL, '%h %I %l %p %r %T %k')
+----
+2020-06-15 14:05:03 PM 02:05:03 PM 14:05:03 Monday June 167 02	NULL

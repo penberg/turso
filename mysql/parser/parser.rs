@@ -9437,24 +9437,41 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
     }
     flush(&mut run, &mut pieces);
 
-    let mut exprs = pieces.into_iter().map(|piece| match piece {
-        Piece::Fmt(fmt) => strftime_text(&fmt, target.clone()),
-        Piece::Name(fmt, names, start) => name_from_date(fmt, names, start, target.clone()),
-        Piece::Int(fmt) => cast_strftime_int(fmt, target.clone()),
-        Piece::Meridiem => meridiem_expr(target.clone()),
-        Piece::Hour12 { padded } => hour12_expr(target.clone(), padded),
-        Piece::OrdinalDay => ordinal_day_expr(target.clone()),
-        Piece::YearTwoDigit => year_two_digit_expr(target.clone()),
-    });
+    let exprs: Vec<ast::Expr> = pieces
+        .into_iter()
+        .map(|piece| match piece {
+            Piece::Fmt(fmt) => strftime_text(&fmt, target.clone()),
+            Piece::Name(fmt, names, start) => name_from_date(fmt, names, start, target.clone()),
+            Piece::Int(fmt) => cast_strftime_int(fmt, target.clone()),
+            Piece::Meridiem => meridiem_expr(target.clone()),
+            Piece::Hour12 { padded } => hour12_expr(target.clone(), padded),
+            Piece::OrdinalDay => ordinal_day_expr(target.clone()),
+            Piece::YearTwoDigit => year_two_digit_expr(target.clone()),
+        })
+        .collect();
     // An empty format renders strftime('', target) — the empty string for a
     // valid target, NULL for a NULL one, matching MySQL.
-    let Some(mut acc) = exprs.next() else {
+    if exprs.is_empty() {
         return Ok(strftime_text("", target));
-    };
-    for next in exprs {
-        acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
     }
-    Ok(acc)
+    // Concatenate the pieces with a *balanced* `||` tree so a long format string
+    // stays shallow: a left-linear chain reaches a depth equal to the piece count,
+    // and the engine's expression evaluator overflows its stack on a format with
+    // many (especially `CASE`-heavy `%h`/`%p`/`%r`/…) specifiers. NULL still
+    // propagates — `||` is NULL whenever either operand is, at any depth.
+    let mut level = exprs;
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut it = level.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(ast::Expr::binary(a, ast::Operator::Concat, b)),
+                None => next.push(a),
+            }
+        }
+        level = next;
+    }
+    Ok(level.into_iter().next().expect("non-empty"))
 }
 
 /// Wraps a `datetime(target, '<modifier>')` month/year step with MySQL's

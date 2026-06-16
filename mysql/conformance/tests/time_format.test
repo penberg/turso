@@ -63,3 +63,11 @@ SELECT id, TIME_FORMAT(t, '%h:%i %p') FROM tf_demo ORDER BY id
 ----
 1	08:15 AM
 2	08:45 PM
+
+# A long format string with many CASE-heavy 12-hour / meridiem specifiers must
+# format without overflowing the engine's expression-evaluator stack (the pieces
+# are concatenated as a balanced `||` tree).
+query
+SELECT TIME_FORMAT('14:05:03', '%h %I %l %p %r %T %k')
+----
+02 02 2 PM 02:05:03 PM 14:05:03 14
