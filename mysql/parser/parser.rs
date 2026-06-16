@@ -3626,6 +3626,13 @@ impl Parser {
             return self.char_call();
         }
 
+        // `ASCII(str)` / `ORD(str)` return the code point of the first character,
+        // mapping to the engine's `unicode()` with MySQL's edge cases restored
+        // (see `ascii_call`).
+        if upper == "ASCII" || upper == "ORD" {
+            return self.ascii_call();
+        }
+
         // MySQL's `LENGTH(x)` is a BYTE count. The engine's `length()` counts
         // characters, but `length()` of a BLOB counts bytes, so lower it to
         // `length(CAST(x AS BLOB))`.
@@ -4104,6 +4111,36 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
         Ok(call_fn("char", args))
+    }
+
+    /// Parses an `ASCII(str)` / `ORD(str)` call (the name and `(` are already
+    /// consumed) and lowers it to the code point of the first character via the
+    /// engine's `unicode()`, with MySQL's edges restored:
+    /// `CASE WHEN str = '' THEN 0 ELSE unicode(str) END`. MySQL's `ASCII('')` is
+    /// `0` (the engine's `unicode('')` is NULL), and a NULL argument stays NULL
+    /// (the `= ''` test is NULL, so the `ELSE` runs `unicode(NULL)` = NULL).
+    ///
+    /// For an ASCII first character this matches MySQL exactly (`ASCII` and `ORD`
+    /// agree there). It diverges for a non-ASCII first character: MySQL's `ASCII`
+    /// returns the leading *byte* (0-255) and `ORD` a byte-weighted value, while
+    /// this returns the Unicode code point; a string whose first byte is NUL also
+    /// diverges (MySQL `0`, here NULL). Documented in COMPAT.md.
+    fn ascii_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let is_empty = ast::Expr::binary(
+            arg.clone(),
+            ast::Operator::Equals,
+            ast::Expr::Literal(ast::Literal::String(requote(""))),
+        );
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(is_empty),
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
+            )],
+            else_expr: Some(Box::new(unary_fn("unicode", arg))),
+        })
     }
 
     /// Parses a `FIELD(x, a, b, ...)` call (the name and `(` are already
@@ -11051,6 +11088,33 @@ mod tests {
         assert_eq!(name.as_str(), "char");
         assert_eq!(args.len(), 2);
         assert_eq!(*args[1], num("105"));
+    }
+
+    #[test]
+    fn ascii_and_ord_lower_to_guarded_unicode() {
+        // ASCII(s) / ORD(s) -> CASE WHEN s = '' THEN 0 ELSE unicode(s) END.
+        for sql in ["ASCII(s)", "ORD(s)"] {
+            let ast::Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } = parse_expr(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            assert!(base.is_none(), "{sql}");
+            assert_eq!(when_then_pairs.len(), 1, "{sql}");
+            // The guard is `s = ''`, returning the integer 0.
+            assert_eq!(*when_then_pairs[0].1, num("0"), "{sql}");
+            // The ELSE is unicode(s).
+            let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone()
+            else {
+                panic!("expected `{sql}` ELSE to be unicode()");
+            };
+            assert_eq!(name.as_str(), "unicode", "{sql}");
+            assert_eq!(args.len(), 1, "{sql}");
+            assert_eq!(*args[0], col("s"), "{sql}");
+        }
     }
 
     #[test]

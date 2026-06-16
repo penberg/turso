@@ -1,0 +1,66 @@
+# ASCII(str) / ORD(str) conformance.
+#
+# MySQL's ASCII(str) and ORD(str) return the code of the first character of str
+# (ASCII is the leading byte, ORD a byte-weighted value; for an ASCII first
+# character the two agree). The front-end lowers both to the engine's unicode()
+# with MySQL's edges restored: an empty string yields 0 (unicode('') is NULL in
+# the engine) and a NULL argument yields NULL.
+#
+# Scope: only ASCII first characters are asserted here, where ASCII == ORD ==
+# code point and the result is exact. A non-ASCII first character diverges
+# (ASCII returns the leading byte, ORD a byte-weighted value, the lowering the
+# Unicode code point); that is documented in COMPAT.md, not tested against a
+# real mysqld.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+# The code of the first character; a multi-character string uses only the first.
+query
+SELECT ASCII('A'), ASCII('abc'), ASCII('z'), ASCII(' ')
+----
+65	97	122	32
+
+# ORD agrees with ASCII for ASCII characters.
+query
+SELECT ORD('A'), ORD('abc'), ORD('9')
+----
+65	97	57
+
+# An empty string is 0 (not NULL, which the engine's unicode() would give).
+query
+SELECT ASCII(''), ORD('')
+----
+0	0
+
+# A numeric argument is taken as its decimal string, so ASCII(5) is ASCII('5').
+query
+SELECT ASCII(5), ASCII('5'), ASCII(0)
+----
+53	53	48
+
+# NULL propagates.
+query
+SELECT ASCII(NULL) IS NULL, ORD(NULL) IS NULL
+----
+1	1
+
+# Usable over a column and in a predicate (first letter of each value).
+statement ok
+CREATE TABLE IF NOT EXISTS ascii_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO ascii_demo (id, s) VALUES (1, 'apple'), (2, 'Banana'), (3, 'cherry')
+
+query
+SELECT id, ASCII(s) FROM ascii_demo ORDER BY id
+----
+1	97
+2	66
+3	99
+
+# Capital letters have codes below 97 (lower-case 'a').
+query
+SELECT id FROM ascii_demo WHERE ASCII(s) < 97 ORDER BY id
+----
+2
