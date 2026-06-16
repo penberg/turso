@@ -144,9 +144,16 @@ impl Parser {
             // no-ops (`MODIFY` / same-name `CHANGE`) which emit nothing; a whole
             // ALTER of only no-ops yields an empty list, so the server replies OK
             // without touching the table.
-            let mut stmts: Vec<ast::Stmt> = self.alter_operation(name.clone())?.into_iter().collect();
+            // Share the auto-named-index dedup list across the operations, so two
+            // unnamed keys added in one `ALTER` (`ADD KEY (a), ADD KEY (a, b)`) get
+            // distinct names rather than colliding.
+            let mut used_index_names: Vec<String> = Vec::new();
+            let mut stmts: Vec<ast::Stmt> = self
+                .alter_operation(name.clone(), &mut used_index_names)?
+                .into_iter()
+                .collect();
             while self.eat(&Token::Comma) {
-                stmts.extend(self.alter_operation(name.clone())?);
+                stmts.extend(self.alter_operation(name.clone(), &mut used_index_names)?);
             }
             return Ok(stmts);
         }
@@ -512,7 +519,7 @@ impl Parser {
     fn alter(&mut self) -> Result<ast::Stmt> {
         self.expect_keyword("TABLE")?;
         let name = self.qualified_name()?;
-        let stmt = self.alter_operation(name)?;
+        let stmt = self.alter_operation(name, &mut Vec::new())?;
         if self.is(&Token::Comma) {
             return Err(ParseError::Unsupported(
                 "ALTER TABLE with multiple operations is not supported yet".to_string(),
@@ -535,7 +542,11 @@ impl Parser {
     /// `name` (the operation keyword — `ADD`/`DROP`/`RENAME` — has not been
     /// consumed) and lowers it to one engine statement. Stops before any trailing
     /// comma, so the multi-operation caller can split on it.
-    fn alter_operation(&mut self, name: ast::QualifiedName) -> Result<Option<ast::Stmt>> {
+    fn alter_operation(
+        &mut self,
+        name: ast::QualifiedName,
+        used_index_names: &mut Vec<String>,
+    ) -> Result<Option<ast::Stmt>> {
         if self.eat_keyword("DROP") {
             return Ok(Some(self.alter_drop(name)?));
         }
@@ -598,7 +609,7 @@ impl Parser {
         // `KEY`/`INDEX` keyword is optional only after `UNIQUE`.
         let unique = self.eat_keyword("UNIQUE");
         if self.eat_keyword("KEY") || self.eat_keyword("INDEX") || unique {
-            return Ok(Some(self.alter_add_index(name, unique)?));
+            return Ok(Some(self.alter_add_index(name, unique, used_index_names)?));
         }
 
         // `ADD FULLTEXT [KEY|INDEX] [name] (cols)` has no engine full-text index,
@@ -610,7 +621,7 @@ impl Parser {
         // the engine does not implement.
         if self.eat_keyword("FULLTEXT") {
             let _ = self.eat_keyword("KEY") || self.eat_keyword("INDEX");
-            return Ok(Some(self.alter_add_index(name, false)?));
+            return Ok(Some(self.alter_add_index(name, false, used_index_names)?));
         }
 
         // `ADD PRIMARY KEY (cols)` -- the engine cannot add a real (rowid)
@@ -669,7 +680,12 @@ impl Parser {
     /// it is synthesized from the table and first column. Index names live in a
     /// per-database namespace here (unlike MySQL's per-table one), so the same
     /// index name on two tables would collide.
-    fn alter_add_index(&mut self, tbl: ast::QualifiedName, unique: bool) -> Result<ast::Stmt> {
+    fn alter_add_index(
+        &mut self,
+        tbl: ast::QualifiedName,
+        unique: bool,
+        used_index_names: &mut Vec<String>,
+    ) -> Result<ast::Stmt> {
         // An optional index name precedes the column list; it is absent when the
         // next token opens the column list or an index-type clause.
         let explicit_name = if self.is(&Token::LParen) || self.is_keyword("USING") {
@@ -684,13 +700,23 @@ impl Parser {
 
         let columns = self.sorted_column_list()?;
 
-        let idx_name = explicit_name.unwrap_or_else(|| {
-            let first = match columns.first().map(|c| c.expr.as_ref()) {
-                Some(ast::Expr::Id(n)) => n.as_str(),
-                _ => "idx",
-            };
-            ast::Name::from_string(format!("{}_{}", tbl.name.as_str(), first))
-        });
+        // An unnamed key is named after its first column (`<table>_<col>`); a name
+        // already taken by an earlier key in the same multi-operation `ALTER` gets
+        // `_2` / `_3` / … appended, as MySQL dedups — so `ADD KEY (a), ADD KEY (a,
+        // b)` does not generate the same name twice (`used_index_names` tracks them
+        // across the operations; see `dedup_index_name`).
+        let idx_name = match explicit_name {
+            Some(name) => name,
+            None => {
+                let first = match columns.first().map(|c| c.expr.as_ref()) {
+                    Some(ast::Expr::Id(n)) => n.as_str(),
+                    _ => "idx",
+                };
+                let base = format!("{}_{}", tbl.name.as_str(), first);
+                ast::Name::from_string(dedup_index_name(base, used_index_names))
+            }
+        };
+        used_index_names.push(idx_name.as_str().to_string());
 
         Ok(ast::Stmt::CreateIndex {
             unique,

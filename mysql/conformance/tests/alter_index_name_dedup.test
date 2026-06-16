@@ -1,0 +1,62 @@
+# Auto-named index deduplication in multi-operation ALTER TABLE.
+#
+# A multi-operation `ALTER TABLE t ADD KEY (a), ADD KEY (a, b)` adds several
+# indexes in one statement. The front-end expands each `ADD KEY` into a separate
+# CREATE INDEX, and an unnamed key is named after its first column -- so two
+# unnamed keys sharing a first column would generate the same name and the second
+# CREATE INDEX would fail ("index with name ... already exists"). MySQL keeps them
+# distinct by appending _2, _3, ...; the front-end now dedups across a multi-op
+# ALTER the same way (completing the CREATE TABLE inline-key dedup).
+#
+# The generated names (`<table>_<col>` vs MySQL's bare `<col>`) differ, so the
+# checks compare index counts rather than names. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS altdedup_demo (id INT PRIMARY KEY, a INT, b INT, c INT)
+
+statement ok
+INSERT INTO altdedup_demo VALUES (1, 5, 6, 7), (2, 5, 8, 9)
+
+# Three unnamed keys sharing first column `a`, all added in one ALTER.
+statement ok
+ALTER TABLE altdedup_demo ADD KEY (a), ADD KEY (a, b), ADD KEY (a, c)
+
+# Four distinct indexes: PRIMARY plus the three on `a` (names deduped).
+query
+SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'altdedup_demo'
+----
+4
+
+# Total index-column rows: PRIMARY(1) + (a)(1) + (a,b)(2) + (a,c)(2) = 6.
+query
+SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'altdedup_demo'
+----
+6
+
+# The indexes are usable and the rows intact.
+query
+SELECT b FROM altdedup_demo WHERE a = 5 AND b = 6
+----
+6
+
+# A column add and an explicit name in the same ALTER are unaffected: the
+# explicit `named_a` coexists with an unnamed key on `a` (three distinct indexes).
+statement ok
+CREATE TABLE IF NOT EXISTS altmix_demo (id INT PRIMARY KEY, a INT, b INT)
+
+statement ok
+ALTER TABLE altmix_demo ADD COLUMN d INT, ADD KEY named_a (a), ADD KEY (a)
+
+query
+SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'altmix_demo'
+----
+3
+
+# Two *explicitly* duplicated index names in one ALTER still error (only the
+# auto-generated names are deduped), as MySQL rejects a duplicate key name.
+statement ok
+CREATE TABLE IF NOT EXISTS altdup_demo (id INT PRIMARY KEY, a INT, b INT)
+
+statement error
+ALTER TABLE altdup_demo ADD KEY dupname (a), ADD KEY dupname (b)
