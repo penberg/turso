@@ -1,0 +1,53 @@
+# Auto-named index deduplication in CREATE TABLE.
+#
+# An unnamed index (`KEY (cols)`) is named after its first column. Two unnamed
+# keys that share a first column -- e.g. a single-column index and a composite
+# one starting with it, `KEY (a), KEY (a, b)` -- would generate the same name, so
+# MySQL appends `_2`, `_3`, … to keep them distinct. The front-end auto-names
+# unnamed keys `<table>_<col>` (table-prefixed, since the engine's index names
+# are database-global), and now dedups the same way; previously the colliding
+# CREATE INDEX failed ("index with name ... already exists").
+#
+# The generated names (`<table>_<col>` here vs MySQL's bare `<col>`) differ, so
+# the checks compare index counts rather than names. Expected to pass against
+# both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS idxdedup_demo (id INT PRIMARY KEY, a INT, b INT, c INT, KEY (a), KEY (a, b), KEY (a, c))
+
+statement ok
+INSERT INTO idxdedup_demo VALUES (1, 5, 6, 7), (2, 5, 8, 9)
+
+# Four distinct indexes exist: PRIMARY plus the three on `a` (their names deduped).
+query
+SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'idxdedup_demo'
+----
+4
+
+# Total index-column rows: PRIMARY(1) + (a)(1) + (a,b)(2) + (a,c)(2) = 6.
+query
+SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'idxdedup_demo'
+----
+6
+
+# The indexes are usable for lookups, and the rows are intact.
+query
+SELECT b FROM idxdedup_demo WHERE a = 5 AND b = 6
+----
+6
+
+# An explicitly named key coexists with an unnamed one on the same column without
+# a spurious dedup (the names do not collide), giving three distinct indexes.
+statement ok
+CREATE TABLE IF NOT EXISTS idxnamed_demo (id INT PRIMARY KEY, a INT, KEY named_a (a), KEY (a))
+
+query
+SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'idxnamed_demo'
+----
+3
+
+# The explicit name is preserved exactly.
+query
+SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'idxnamed_demo' AND INDEX_NAME = 'named_a'
+----
+1

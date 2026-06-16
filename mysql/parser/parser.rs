@@ -425,14 +425,26 @@ impl Parser {
         // Each inline secondary key becomes a deferred CREATE INDEX, emitted by
         // `statement_list` after this table (the engine has no inline form). The
         // index inherits `IF NOT EXISTS` so re-running the CREATE TABLE is safe.
+        // An unnamed key is named after its first column (`<table>_<col>`, table-
+        // prefixed so it is unique within the engine's per-database index
+        // namespace); a name already taken by an earlier key gets `_2`, `_3`, …
+        // appended, as MySQL does — two unnamed keys sharing a first column
+        // (`KEY (a), KEY (a, b)`) would otherwise generate the same name and the
+        // second `CREATE INDEX` would fail on the duplicate.
+        let mut used_index_names: Vec<String> = Vec::new();
         for (idx_name, idx_columns, unique) in inline_indexes {
-            let name = idx_name.unwrap_or_else(|| {
-                let first = match idx_columns.first().map(|c| c.expr.as_ref()) {
-                    Some(ast::Expr::Id(n)) => n.as_str(),
-                    _ => "idx",
-                };
-                ast::Name::from_string(format!("{}_{}", tbl_name.name.as_str(), first))
-            });
+            let name = match idx_name {
+                Some(name) => name,
+                None => {
+                    let first = match idx_columns.first().map(|c| c.expr.as_ref()) {
+                        Some(ast::Expr::Id(n)) => n.as_str(),
+                        _ => "idx",
+                    };
+                    let base = format!("{}_{}", tbl_name.name.as_str(), first);
+                    ast::Name::from_string(dedup_index_name(base, &used_index_names))
+                }
+            };
+            used_index_names.push(name.as_str().to_string());
             self.pending_statements.push(ast::Stmt::CreateIndex {
                 unique,
                 if_not_exists,
@@ -9727,6 +9739,24 @@ fn regexp_flag_prefix(match_type: Option<&str>) -> Result<String> {
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
 fn requote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Returns `base`, or `base_2` / `base_3` / … if `base` already appears in
+/// `used` (compared case-insensitively, as index names are). MySQL deduplicates
+/// the auto-generated names of unnamed indexes that would otherwise collide.
+fn dedup_index_name(base: String, used: &[String]) -> String {
+    let taken = |candidate: &str| used.iter().any(|u| u.eq_ignore_ascii_case(candidate));
+    if !taken(&base) {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Reverses [`requote`]: strips the surrounding single quotes and un-doubles any
