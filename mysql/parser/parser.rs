@@ -7030,6 +7030,11 @@ fn is_supported_function(upper_name: &str) -> bool {
         // engine's `concat_ws`. (Distinct from `CONCAT`, which is lowered to `||`
         // so it propagates NULL; see `concat_call`.)
         | "CONCAT_WS"
+        // `REVERSE(s)` reverses the characters of `s`, mapping onto the engine's
+        // `string_reverse` (renamed on emit). NULL propagates and a number is
+        // reversed as its decimal string, as in MySQL. (MySQL reverses raw bytes,
+        // so a multi-byte character diverges; documented in COMPAT.md.)
+        | "REVERSE"
         // Functions sharing behaviour with the engine under a different name;
         // renamed on emit (see `engine_function_name`).
         | "IF"
@@ -7361,6 +7366,7 @@ fn engine_function_name(upper_name: &str) -> Option<&'static str> {
         "TIMESTAMP" => "datetime",
         "LAST_INSERT_ID" => "last_insert_rowid",
         "JSON_VALID" => "json_valid",
+        "REVERSE" => "string_reverse",
         _ => return None,
     })
 }
@@ -7627,7 +7633,7 @@ mod tests {
 
         // A CHECK the front-end cannot translate (an unsupported function) is
         // dropped, so the table still parses with no Check constraint.
-        let (columns, _) = body("CREATE TABLE t (id INT PRIMARY KEY, s TEXT CHECK (REVERSE(s) = s))");
+        let (columns, _) = body("CREATE TABLE t (id INT PRIMARY KEY, s TEXT CHECK (CRC32(s) = 0))");
         assert!(!columns[1]
             .constraints
             .iter()
@@ -11816,7 +11822,7 @@ mod tests {
     fn function_call_not_in_allow_list_is_unsupported() {
         for input in [
             "SLEEP(1)",
-            "REVERSE('x')",
+            "CRC32('x')",
             "SOUNDEX('x')",
             "totally_made_up(1)",
         ] {
@@ -11854,6 +11860,7 @@ mod tests {
             ("TIME('2020-01-01 10:00')", "time"),
             ("TIMESTAMP('2020-01-01')", "datetime"),
             ("LAST_INSERT_ID()", "last_insert_rowid"),
+            ("REVERSE('abc')", "string_reverse"),
         ] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");

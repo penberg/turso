@@ -1,0 +1,65 @@
+# REVERSE(str) conformance.
+#
+# MySQL's REVERSE(str) returns str with its characters in reverse order. The
+# front-end maps it onto the engine's string_reverse() (renamed on emit): NULL
+# propagates and a number is reversed as its decimal string, exactly as MySQL
+# does.
+#
+# Scope: only ASCII (single-byte) strings are asserted. MySQL reverses raw
+# bytes, so a multi-byte character would corrupt under MySQL while the engine
+# reverses whole characters -- a divergence documented in COMPAT.md, not tested
+# against a real mysqld.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and ORDER BY-deterministic queries.
+
+# Basic reversal, including spaces and punctuation kept in place (reversed).
+query
+SELECT REVERSE('abc'), REVERSE('Hello, World'), REVERSE('ab cd')
+----
+cba	dlroW ,olleH	dc ba
+
+# A single character and the empty string are unchanged; a palindrome reverses
+# to itself.
+query
+SELECT REVERSE('a'), CONCAT('[', REVERSE(''), ']'), REVERSE('racecar')
+----
+a	[]	racecar
+
+# A number is reversed as its decimal string.
+query
+SELECT REVERSE(12345)
+----
+54321
+
+# Reversing twice is the identity.
+query
+SELECT REVERSE(REVERSE('wordpress'))
+----
+wordpress
+
+# NULL propagates.
+query
+SELECT REVERSE(NULL) IS NULL
+----
+1
+
+# Usable over a column and in a predicate (palindromes match REVERSE(s) = s).
+statement ok
+CREATE TABLE IF NOT EXISTS rev_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO rev_demo (id, s) VALUES (1, 'level'), (2, 'table'), (3, 'noon')
+
+query
+SELECT id, REVERSE(s) FROM rev_demo ORDER BY id
+----
+1	level
+2	elbat
+3	noon
+
+query
+SELECT id FROM rev_demo WHERE REVERSE(s) = s ORDER BY id
+----
+1
+3
