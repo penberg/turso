@@ -3764,6 +3764,21 @@ impl Parser {
                 Ok(ast::Expr::Literal(ast::Literal::Numeric(n)))
             }
             Some(Token::Word(w)) => {
+                // A charset introducer before a string literal sets the literal's
+                // charset: an underscore-prefixed charset name (`_utf8mb4'x'`,
+                // `_latin1'x'`, `_binary'x'`) or the national-character `N'x'`. The
+                // engine is single-charset, so the introducer is dropped and the
+                // string is used as-is. The following-string guard keeps a real
+                // identifier (`_foo`, a column) from being mistaken for one.
+                if is_charset_introducer(w) && matches!(self.peek_nth(1), Some(Token::Str(_))) {
+                    self.advance(); // the introducer word
+                    let lit = match self.peek() {
+                        Some(Token::Str(s)) => requote(s),
+                        _ => unreachable!("a string literal follows the introducer"),
+                    };
+                    self.advance();
+                    return Ok(ast::Expr::Literal(ast::Literal::String(lit)));
+                }
                 match w.to_ascii_uppercase().as_str() {
                     "NULL" => {
                         self.advance();
@@ -9548,6 +9563,15 @@ fn regexp_flag_prefix(match_type: Option<&str>) -> Result<String> {
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
 fn requote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Whether `word` is a MySQL charset introducer that can precede a string literal:
+/// an underscore-prefixed charset name (`_utf8mb4`, `_latin1`, `_binary`, …) or
+/// the national-character `N` (and lowercase `n`). The engine is single-charset,
+/// so the introducer is dropped and the following string used verbatim; an
+/// unknown charset name is accepted rather than validated (MySQL would reject it).
+fn is_charset_introducer(word: &str) -> bool {
+    word.starts_with('_') || word.eq_ignore_ascii_case("N")
 }
 
 /// Keywords that, appearing where a column type would, mean the type is absent.
@@ -17294,5 +17318,28 @@ mod tests {
             panic!("expected DropTable");
         };
         assert!(if_exists);
+    }
+
+    #[test]
+    fn charset_introducer_drops_to_the_string() {
+        // A charset introducer before a string literal is dropped, leaving the
+        // string itself (the single-charset engine ignores the charset).
+        for sql in ["_utf8mb4'hi'", "_latin1'hi'", "_binary'hi'", "N'hi'", "n'hi'"] {
+            assert_eq!(
+                parse_expr(sql).unwrap(),
+                ast::Expr::Literal(ast::Literal::String("'hi'".to_string())),
+                "for `{sql}`"
+            );
+        }
+        // The introducer applies only directly before a string: an underscore- or
+        // `N`-named identifier on its own is still a column reference.
+        assert!(matches!(
+            parse_expr("_col").unwrap(),
+            ast::Expr::Id(_) | ast::Expr::Qualified(..)
+        ));
+        assert!(matches!(
+            parse_expr("N").unwrap(),
+            ast::Expr::Id(_) | ast::Expr::Qualified(..)
+        ));
     }
 }

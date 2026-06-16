@@ -1,0 +1,48 @@
+# Charset introducers on string literals.
+#
+# MySQL lets a string literal carry a charset introducer: an underscore-prefixed
+# charset name (_utf8mb4'x', _latin1'x', _binary'x') or the national-character
+# N'x'. The engine is single-charset, so the front-end drops the introducer and
+# uses the string as-is. The introducer only applies directly before a string, so
+# an ordinary identifier named `N` or `_col` is unaffected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its own
+# table name.
+
+# Each introducer yields its string value unchanged.
+query
+SELECT _utf8mb4'hello', _latin1'x', N'abc', n'xyz', _binary'data'
+----
+hello	x	abc	xyz	data
+
+# A space between the introducer and the string is allowed (except after N), and
+# an escaped quote inside the string still works.
+query
+SELECT _utf8mb4 'spaced', _utf8mb4'a''b'
+----
+spaced	a'b
+
+# An introduced literal composes in expressions like any string: concatenation,
+# length (characters), byte-hex, and case folding.
+query
+SELECT CONCAT(_utf8mb4'x', 'y'), LENGTH(_utf8mb4'hello'), HEX(_binary'A'), UPPER(_utf8mb4'abc')
+----
+xy	5	41	ABC
+
+# The introducer is only special directly before a string: a column named `N` or
+# `_col`, and `N` used as an alias, are ordinary identifiers.
+statement ok
+CREATE TABLE introducer_demo (`_col` INT, `N` INT)
+
+statement ok
+INSERT INTO introducer_demo (`_col`, `N`) VALUES (5, 9)
+
+query
+SELECT `_col`, `N` FROM introducer_demo
+----
+5	9
+
+query
+SELECT 1 AS N, 2 AS _x
+----
+1	2
