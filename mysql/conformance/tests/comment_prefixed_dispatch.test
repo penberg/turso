@@ -1,0 +1,46 @@
+# Comment-prefixed and comment-wrapped session statements.
+#
+# The server answers the connection-setup statements (`SET NAMES`, `SET
+# @@sql_mode`, `SHOW COLUMNS`, `SELECT @@var`) by their leading keyword, ahead of
+# the parser. A dump or client routinely prefixes or wraps these in comments --
+# `/* c */ SET NAMES utf8mb4`, `/*!40101 SET NAMES utf8mb4 */` (mysqldump's
+# charset preamble) -- which a raw keyword match would miss, so the statement was
+# rejected as unsupported. The server now strips a leading comment and unwraps a
+# single wrapping version-gated executable comment before dispatching.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. (`#` and
+# `--` line comments are exercised by the strip_dispatch_comments unit tests, as
+# the .test format reserves those for its own comments.)
+
+statement ok
+CREATE TABLE IF NOT EXISTS cmt_demo (id INT PRIMARY KEY, v INT)
+
+# A plain leading block comment before a SET (a server-dispatched statement the
+# parser does not accept).
+statement ok
+/* charset */ SET NAMES utf8mb4
+
+# mysqldump's version-gated charset preamble: the whole SET is wrapped.
+statement ok
+/*!40101 SET NAMES utf8mb4 */
+
+# A wrapped sql_mode assignment is still recognized and stored.
+statement ok
+/*!40101 SET @@SESSION.sql_mode = 'NO_ENGINE_SUBSTITUTION' */
+
+# A comment-prefixed SHOW reaches the schema handler.
+statement ok
+/* cols */ SHOW COLUMNS FROM cmt_demo
+
+# A comment-prefixed introspection SELECT still resolves its session value.
+query
+/* whoami */ SELECT DATABASE() = DATABASE()
+----
+1
+
+# A comment-prefixed ordinary SELECT is unaffected (it runs through the parser,
+# whose lexer drops the comment).
+query
+/* pick */ SELECT 1 + 1
+----
+2

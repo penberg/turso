@@ -256,11 +256,18 @@ fn run_query(
 ) -> Vec<u8> {
     debug!(%sql, "COM_QUERY");
 
+    // The session/introspection statements below are recognized by their leading
+    // keyword. A dump or client may prefix or wrap a statement in comments
+    // (`/* c */ SET NAMES ...`, `/*!40101 SET NAMES utf8mb4 */`), which the text
+    // match would miss; strip them first so the statement is still dispatched.
+    // The parser path keeps the original SQL (its lexer handles comments).
+    let dispatch_sql = strip_dispatch_comments(sql);
+
     // `SELECT ROW_COUNT()` reports the affected-row count of the previous
     // statement. It is answered here (the engine has no such function) from the
     // value the statement below remembers. This query is itself a result-set
     // statement, so it leaves `ROW_COUNT()` at -1 for the next call, as in MySQL.
-    if is_row_count_query(sql) {
+    if is_row_count_query(dispatch_sql) {
         let value = *last_row_count;
         *last_row_count = -1;
         return encode_session_response(
@@ -280,7 +287,7 @@ fn run_query(
     // `SELECT FOUND_ROWS()` reports the count remembered from the last
     // `SQL_CALC_FOUND_ROWS` query (see below). It is answered here because the
     // engine has no such function.
-    if is_found_rows_query(sql) {
+    if is_found_rows_query(dispatch_sql) {
         return encode_session_response(
             first_seq,
             SessionResponse::Row {
@@ -296,7 +303,7 @@ fn run_query(
     // constant value and `explode()` on it fails. MySQL's default value and
     // mode normalization/reordering are not modeled — the value is stored and
     // returned verbatim.
-    if let Some(value) = parse_set_sql_mode(sql) {
+    if let Some(value) = parse_set_sql_mode(dispatch_sql) {
         *sql_mode = value;
         // A `SET` reports a `ROW_COUNT()` of 0, like any non-row statement.
         *last_row_count = 0;
@@ -304,7 +311,7 @@ fn run_query(
         encode_frame(&mut out, first_seq, &OkPacket::default().encode());
         return out;
     }
-    if is_select_sql_mode(sql) {
+    if is_select_sql_mode(dispatch_sql) {
         return encode_session_response(
             first_seq,
             SessionResponse::Row {
@@ -317,14 +324,14 @@ fn run_query(
     // Client libraries probe the connection with session/introspection queries
     // (`SELECT @@max_allowed_packet`, `SET ...`) before running real SQL. Answer
     // those here so the parser only ever sees user statements.
-    if let Some(response) = session::try_handle(sql) {
+    if let Some(response) = session::try_handle(dispatch_sql) {
         return encode_session_response(first_seq, response);
     }
 
     // `SHOW [FULL] COLUMNS FROM tbl` is answered from the schema here; the AST
     // has no `SHOW`, so it cannot go through the parser. Every other `SHOW`
     // falls through and is rejected by the parser as unsupported.
-    if let Some(outcome) = show::try_handle(conn, sql) {
+    if let Some(outcome) = show::try_handle(conn, dispatch_sql) {
         return match outcome {
             Ok(ShowOutcome::Columns(result)) => encode_columns_result(first_seq, result),
             Ok(ShowOutcome::NoSuchTable(name)) => no_such_table_response(first_seq, &name),
@@ -372,6 +379,59 @@ fn run_query(
     }
 
     execute_stmt(conn, stmt, first_seq, last_row_count)
+}
+
+/// The server version id reported in the handshake (`8.0.0` → `80000`), used to
+/// decide whether a leading version-gated executable comment runs — the same
+/// threshold the lexer applies on the parser path.
+const SERVER_VERSION_ID: u32 = 80000;
+
+/// Returns `sql` with leading whitespace and comments stripped, and a single
+/// wrapping MySQL executable comment (`/*! ... */`) unwrapped, so the
+/// keyword-prefix dispatch in `run_query` still recognizes a statement that a
+/// dump or client prefixed or wrapped with comments: `/* c */ SET NAMES utf8mb4`,
+/// `-- x`\n`SET ...`, and `/*!40101 SET NAMES utf8mb4 */` all reduce to `SET NAMES
+/// utf8mb4`. Only leading trivia and one outer executable-comment wrapper are
+/// handled — enough for the dump/handshake patterns; comments anywhere else are
+/// left to the parser, which receives the original SQL and lexes them itself.
+fn strip_dispatch_comments(sql: &str) -> &str {
+    let mut s = sql.trim_start();
+    loop {
+        // `-- ` / `--<eol>` and `#` line comments run to the end of the line.
+        let line_comment = match s.strip_prefix("--") {
+            Some(r) if r.is_empty() || r.starts_with([' ', '\t', '\r', '\n']) => Some(r),
+            _ => s.strip_prefix('#'),
+        };
+        if let Some(r) = line_comment {
+            s = r.find('\n').map_or("", |i| &r[i + 1..]).trim_start();
+            continue;
+        }
+        // Version-gated executable comment `/*!##### ... */`: when the gate is at
+        // most the server version, unwrap it (drop the opener and trailing `*/`).
+        if let Some(r) = s.strip_prefix("/*!") {
+            let digits_end = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
+            let gate: u32 = r[..digits_end].parse().unwrap_or(0);
+            if gate <= SERVER_VERSION_ID {
+                if let Some(body) = r[digits_end..].strip_suffix("*/") {
+                    s = body.trim();
+                    continue;
+                }
+            }
+            break;
+        }
+        // Plain `/* ... */` block comment.
+        if let Some(r) = s.strip_prefix("/*") {
+            match r.find("*/") {
+                Some(i) => {
+                    s = r[i + 2..].trim_start();
+                    continue;
+                }
+                None => break,
+            }
+        }
+        break;
+    }
+    s
 }
 
 /// Extracts the value from a `SET [SESSION|GLOBAL] sql_mode = '...'` statement
@@ -1048,5 +1108,32 @@ mod tests {
         ] {
             assert!(!is_row_count_query(sql), "should not match `{sql}`");
         }
+    }
+
+    #[test]
+    fn strips_leading_and_wrapping_comments_for_dispatch() {
+        // A plain block, line, or hash comment before the statement is removed.
+        assert_eq!(strip_dispatch_comments("/* c */ SET NAMES utf8mb4"), "SET NAMES utf8mb4");
+        assert_eq!(strip_dispatch_comments("-- x\nSET NAMES utf8mb4"), "SET NAMES utf8mb4");
+        assert_eq!(strip_dispatch_comments("# x\nSET NAMES utf8mb4"), "SET NAMES utf8mb4");
+        // Stacked comments and surrounding whitespace are all stripped.
+        assert_eq!(
+            strip_dispatch_comments("  /* a */ /* b */\tSHOW COLUMNS FROM t"),
+            "SHOW COLUMNS FROM t"
+        );
+        // A version-gated executable comment at or below the server version is
+        // unwrapped (opener and trailing `*/` dropped).
+        assert_eq!(
+            strip_dispatch_comments("/*!40101 SET NAMES utf8mb4 */"),
+            "SET NAMES utf8mb4"
+        );
+        assert_eq!(strip_dispatch_comments("/*! SET autocommit=1 */"), "SET autocommit=1");
+        // A gate above the server version is not unwrapped (left for the parser
+        // path, which discards it).
+        assert!(strip_dispatch_comments("/*!99999 SET NAMES utf8mb4 */").starts_with("/*!99999"));
+        // Only leading trivia is removed (the dispatchers trim the tail
+        // themselves), and a statement with no leading comment is unchanged.
+        assert_eq!(strip_dispatch_comments("  SET NAMES utf8mb4  "), "SET NAMES utf8mb4  ");
+        assert_eq!(strip_dispatch_comments("SELECT 1"), "SELECT 1");
     }
 }
