@@ -485,6 +485,10 @@ impl Parser {
     ///     the engine's columns are affinity-typed (matching how the rename form
     ///     of `CHANGE` already discards its retype). `dbDelta()` relies on these
     ///     succeeding.
+    ///   - `{DISABLE|ENABLE} KEYS` (a MyISAM index-maintenance toggle InnoDB
+    ///     ignores) and `FORCE` (a table rebuild) → accepted **no-ops**, since the
+    ///     engine has nothing to toggle or rebuild. mysqldump brackets bulk
+    ///     `INSERT`s with `ALTER TABLE … DISABLE KEYS` / `… ENABLE KEYS`.
     ///
     /// Everything else — `ADD FOREIGN KEY`/`SPATIAL`/`CONSTRAINT`,
     /// `DROP {FOREIGN KEY|CONSTRAINT}`, and `RENAME INDEX` — is rejected as
@@ -542,6 +546,18 @@ impl Parser {
         if self.eat_keyword("MODIFY") {
             self.eat_keyword("COLUMN");
             let _ = self.column_def()?;
+            return Ok(None);
+        }
+        // `{DISABLE|ENABLE} KEYS` toggles non-unique index maintenance on MyISAM;
+        // InnoDB — and this engine — ignore it. `FORCE` requests a table rebuild,
+        // which has no effect on the engine's storage. Both are accepted no-ops
+        // (`None`). mysqldump brackets its bulk `INSERT`s with `/*!40000 ALTER
+        // TABLE t DISABLE KEYS */` … `/*!40000 ALTER TABLE t ENABLE KEYS */`.
+        if self.eat_keyword("DISABLE") || self.eat_keyword("ENABLE") {
+            self.expect_keyword("KEYS")?;
+            return Ok(None);
+        }
+        if self.eat_keyword("FORCE") {
             return Ok(None);
         }
         if !self.eat_keyword("ADD") {
@@ -13082,6 +13098,24 @@ mod tests {
             &stmts[0],
             ast::Stmt::AlterTable(a) if matches!(a.body, ast::AlterTableBody::AddColumn(_))
         ));
+    }
+
+    #[test]
+    fn alter_table_disable_keys_and_force_are_noops() {
+        // `{DISABLE|ENABLE} KEYS` and `FORCE` have nothing to toggle or rebuild on
+        // the engine, so each yields an empty statement list (mysqldump emits the
+        // DISABLE/ENABLE KEYS pair around bulk inserts). Case-insensitive.
+        let parse_all = |sql: &str| Parser::new(sql.as_bytes()).unwrap().parse_statement_list();
+        for sql in [
+            "ALTER TABLE t DISABLE KEYS",
+            "ALTER TABLE t ENABLE KEYS",
+            "ALTER TABLE t disable keys",
+            "ALTER TABLE t FORCE",
+        ] {
+            assert_eq!(parse_all(sql).unwrap(), vec![], "{sql} should be a no-op");
+        }
+        // `DISABLE`/`ENABLE` without `KEYS` is a syntax error, not a silent no-op.
+        assert!(parse_all("ALTER TABLE t DISABLE").is_err());
     }
 
     #[test]

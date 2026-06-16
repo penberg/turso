@@ -1,0 +1,52 @@
+# ALTER TABLE ... DISABLE KEYS / ENABLE KEYS / FORCE.
+#
+# DISABLE KEYS / ENABLE KEYS toggle non-unique index maintenance on MyISAM;
+# InnoDB ignores them, and so does this engine (it has no such switch). FORCE
+# requests a table rebuild, which has no effect on the engine's storage. All
+# three are accepted as no-ops. mysqldump brackets every table's bulk INSERTs
+# with `/*!40000 ALTER TABLE t DISABLE KEYS */` ... `/*!40000 ALTER TABLE t
+# ENABLE KEYS */`, so an imported dump runs these constantly; the parser used to
+# reject them (`only ALTER TABLE ... ADD / DROP / RENAME / CHANGE`).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS altkeys_demo (id INT PRIMARY KEY, v INT, KEY k_altkeys (v))
+
+statement ok
+INSERT INTO altkeys_demo VALUES (1, 10), (2, 20)
+
+# The bare forms.
+statement ok
+ALTER TABLE altkeys_demo DISABLE KEYS
+
+statement ok
+ALTER TABLE altkeys_demo ENABLE KEYS
+
+statement ok
+ALTER TABLE altkeys_demo FORCE
+
+# The version-gated executable-comment form mysqldump actually emits.
+statement ok
+/*!40000 ALTER TABLE altkeys_demo DISABLE KEYS */
+
+statement ok
+/*!40000 ALTER TABLE altkeys_demo ENABLE KEYS */
+
+# The table is untouched and fully usable after the no-ops: existing rows remain,
+# the index still resolves lookups, and further DDL/DML works.
+query
+SELECT id FROM altkeys_demo WHERE v = 20
+----
+2
+
+statement ok
+ALTER TABLE altkeys_demo ADD COLUMN w INT
+
+statement ok
+INSERT INTO altkeys_demo (id, v) VALUES (3, 30)
+
+query
+SELECT COUNT(*) FROM altkeys_demo
+----
+3
