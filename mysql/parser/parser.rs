@@ -5484,6 +5484,9 @@ impl Parser {
                 vec![unary_fn("lower", haystack), unary_fn("lower", needle)],
             ));
         };
+        // MySQL rounds a fractional start position to an integer; without this the
+        // fraction would leak into the absolute result (`pos - 1 + rel`).
+        let pos = integer_arg(pos);
 
         // Search from `pos`: find the needle in the tail `substr(haystack, pos)`,
         // then shift the relative position back to absolute (`pos - 1 + rel`).
@@ -5560,7 +5563,12 @@ impl Parser {
             (pos, len)
         };
         self.expect(&Token::RParen, "`)`")?;
-        Ok(guarded_substr(target, pos, len))
+        // MySQL rounds a fractional position/length to an integer.
+        Ok(guarded_substr(
+            target,
+            integer_arg(pos),
+            len.map(integer_arg),
+        ))
     }
 
     /// Parses `SUBSTRING_INDEX(str, delim, count)` (the name and `(` already
@@ -6968,6 +6976,9 @@ impl Parser {
         self.expect(&Token::Comma, "`,`")?;
         let newstr = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
+        // MySQL rounds a fractional position/length to an integer.
+        let pos = integer_arg(pos);
+        let len = integer_arg(len);
 
         let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
         // pos < 1 OR pos > length(str)

@@ -1,0 +1,54 @@
+# Rounding of the position/length arguments of SUBSTRING / MID / LOCATE / INSERT.
+#
+# MySQL coerces the integer position and length arguments of these functions the
+# way CAST(... AS SIGNED) does: a numeric value is rounded and a string parses its
+# leading integer. The engine would otherwise truncate a fractional value toward
+# zero (and LOCATE even leaked the fraction into its result), so the front-end
+# wraps each such argument in that same integer coercion. Integer, string, and
+# NULL arguments are unaffected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# SUBSTRING/MID round a fractional position and length.
+query
+SELECT SUBSTRING('hello', 2.9), SUBSTRING('hello', 1.9, 2), SUBSTRING('hello', 2, 2.9), MID('hello', 1.9, 2)
+----
+llo	el	ell	el
+
+# A position that rounds to 0 is out of range (empty); a string position parses.
+query
+SELECT CONCAT('[', SUBSTRING('hello', 0.4), ']'), SUBSTRING('hello', '2')
+----
+[]	ello
+
+# LOCATE's 3-argument start position rounds (and no fractional leaks into the
+# integer result).
+query
+SELECT LOCATE('l', 'hello', 2.9), LOCATE('l', 'hello', 2.4), LOCATE('l', 'hello', '2')
+----
+3	3	3
+
+# INSERT rounds its position and length.
+query
+SELECT INSERT('hello', 2.9, 2, 'XX'), INSERT('hello', 2, 2.9, 'XX'), INSERT('hello', '2', '2', 'XX')
+----
+heXXo	hXXo	hXXlo
+
+# Integer and NULL arguments are unchanged.
+query
+SELECT SUBSTRING('hello', 2, 2), LOCATE('l', 'hello'), INSERT('hello', 2, 2, 'XX'), SUBSTRING('hello', 2, NULL)
+----
+el	3	hXXlo	NULL
+
+statement ok
+CREATE TABLE spr_t (id INT PRIMARY KEY, s VARCHAR(20), p DOUBLE)
+
+statement ok
+INSERT INTO spr_t VALUES (1, 'abcdef', 1.9), (2, 'abcdef', 3.5)
+
+# A fractional position from a DOUBLE column rounds per row.
+query
+SELECT id, SUBSTRING(s, p, 2) FROM spr_t ORDER BY id
+----
+1	bc
+2	de
