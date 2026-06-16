@@ -9379,8 +9379,9 @@ fn date_part_format(upper_name: &str) -> Option<&'static str> {
 /// hour, `%p` meridiem, `%r` = `hh:mm:ss AM/PM`), the ordinal day `%D` (1st,
 /// 2nd…), and the two-digit year `%y` are each a `strftime`/`CASE` expression.
 /// The pieces are concatenated with `||`. A NULL `target` makes every piece NULL,
-/// so the whole result is NULL, as in MySQL. The week-of-year modes with no
-/// matching strftime form (`%u`, `%V`, `%X`, `%x`) and microseconds (`%f`, no
+/// so the whole result is NULL, as in MySQL. The ISO week-year `%x` maps to
+/// strftime's `%G` (pairing with `%v`→`%V`); the week-of-year modes with no
+/// matching strftime form (`%u`, `%V`, `%X`) and microseconds (`%f`, no
 /// sub-second precision) are rejected rather than silently mistranslated.
 fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
     // A piece is a strftime format run, a name lookup, or an integer extraction
@@ -9426,6 +9427,13 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
             // matching strftime format and stay rejected.
             Some('U') => run.push_str("%U"),
             Some('v') => run.push_str("%V"),
+            // `%x` is the year of the `%v` (ISO 8601, Monday-first) week — so a
+            // late-December date in week 1 of the next year, or an early-January
+            // date in week 52/53 of the previous one, carries the ISO year. That
+            // is exactly strftime's `%G` (ISO 8601 year), which pairs with `%V`.
+            // MySQL `%X` (the year of the Sunday-first `%V` week) has no strftime
+            // form and stays rejected.
+            Some('x') => run.push_str("%G"),
             // `%T` is the 24-hour `HH:MM:SS` time, i.e. `%H:%i:%s`.
             Some('T') => run.push_str("%H:%M:%S"),
             Some('%') => run.push_str("%%"),
@@ -12667,15 +12675,15 @@ mod tests {
             matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%Y-%m-%d %H:%M:%S'"),
             "format was not translated correctly"
         );
-        // `%j`/`%w` pass through; `%U`/`%v` map to strftime `%U`/`%V`; `%T`
-        // expands to `%H:%M:%S`.
+        // `%j`/`%w` pass through; `%U`/`%v` map to strftime `%U`/`%V`; `%x` (ISO
+        // week-year) maps to `%G`; `%T` expands to `%H:%M:%S`.
         let ast::Expr::FunctionCall { args, .. } =
-            parse_expr("DATE_FORMAT(d, '%j-%w %U %v %T')").unwrap()
+            parse_expr("DATE_FORMAT(d, '%j-%w %U %v %x %T')").unwrap()
         else {
             unreachable!()
         };
         assert!(
-            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%j-%w %U %V %H:%M:%S'")
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%j-%w %U %V %G %H:%M:%S'")
         );
         // The name specifiers `%M`/`%W`/`%b`/`%a` have no strftime form, so they
         // lower to a CASE name lookup; `%W` alone is therefore a bare CASE.
@@ -12716,7 +12724,8 @@ mod tests {
             ast::Expr::Binary(_, ast::Operator::Concat, _)
         ));
         // Specifiers still without a lowering are rejected (microseconds `%f`,
-        // and the week-of-year modes `%u`/`%V`/`%X`/`%x`).
+        // and the week-of-year modes `%u`/`%V`/`%X` — note `%X`, the year of the
+        // Sunday-first `%V` week, has no strftime form, unlike the supported `%x`).
         for fmt in [
             "DATE_FORMAT(d, '%f')",
             "DATE_FORMAT(d, '%u')",

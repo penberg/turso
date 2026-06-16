@@ -3,7 +3,8 @@
 # MySQL's DATE_FORMAT formats a datetime with format specifiers. The front-end
 # lowers it to strftime() for the directly-translatable specifiers -- %Y %m %d
 # %H, %i (minutes -> %M), %s (seconds -> %S), %j (day of year), %w (weekday
-# number), %U (Sunday-first week), %v (ISO week -> %V), %T (-> %H:%M:%S), %% --
+# number), %U (Sunday-first week), %v (ISO week -> %V), %x (ISO week-year ->
+# %G), %T (-> %H:%M:%S), %% --
 # and expands the name specifiers (%M month name, %b abbreviated month, %W
 # weekday name, %a abbreviated weekday) to CASE lookups, and the no-leading-zero
 # numeric specifiers (%e day, %c month, %k hour) to integer casts, the 12-hour
@@ -11,7 +12,7 @@
 # two-digit year (%y), and the day-with-ordinal-suffix %D to CASE / strftime
 # expressions, concatenating the pieces. Literal characters pass through. The
 # format must be a string literal; specifiers without any of these forms (the
-# week modes %u/%V/%X/%x and microseconds %f) are rejected. See mysql/COMPAT.md.
+# week modes %u/%V/%X and microseconds %f) are rejected. See mysql/COMPAT.md.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -87,6 +88,14 @@ query
 SELECT DATE_FORMAT('2020-01-06', '%v'), DATE_FORMAT('2021-01-01', '%v')
 ----
 02	53
+
+# %x is the year of the %v (ISO 8601) week, so it follows the week across a year
+# boundary: 2021-01-01 is in ISO week 53 of 2020 (%x = 2020), and 2023-01-01 is
+# in week 52 of 2022 (%x = 2022). It pairs with %v to form an ISO year-week.
+query
+SELECT DATE_FORMAT('2021-01-01', '%x'), DATE_FORMAT('2023-01-01', '%x'), DATE_FORMAT('2026-06-15', '%x-W%v')
+----
+2020	2022	2026-W25
 
 # %M is the full month name, %W the full weekday name (2020-03-15 is a Sunday in
 # March). These have no strftime form and expand to CASE lookups.
