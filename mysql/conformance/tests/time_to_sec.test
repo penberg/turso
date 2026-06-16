@@ -1,14 +1,17 @@
 # TIME_TO_SEC(t) / SEC_TO_TIME(s) conformance.
 #
 # TIME_TO_SEC returns the seconds since midnight of t's time part; SEC_TO_TIME is
-# the inverse, formatting a second count as 'HH:MM:SS'. The front-end lowers
+# the inverse, formatting a second count as '[-]HH:MM:SS'. The front-end lowers
 # TIME_TO_SEC to H*3600 + M*60 + S (each part CAST(strftime(code, t) AS INTEGER))
-# and SEC_TO_TIME to time(s, 'unixepoch'). NULL propagates.
+# and SEC_TO_TIME to printf('%s%02d:%02d:%02d', ...) over the absolute second
+# count, so it renders the full MySQL span: hours past 24 (25:00:00) and a
+# leading '-' for a negative count. NULL propagates.
 #
-# Scope: the normal time-of-day range only. MySQL's TIME allows up to 838 hours
-# and negatives, and SEC_TO_TIME would render hours past 24 (e.g. 25:00:00); the
-# engine wraps at 24 hours, so only 00:00:00..23:59:59 / 0..86399 is exercised (a
-# documented divergence).
+# Scope: TIME_TO_SEC still only covers the 00:00:00..23:59:59 range (the engine
+# parses no TIME above 24h). SEC_TO_TIME, by contrast, is exercised across the
+# negative and >24h range. Two SEC_TO_TIME divergences are left untested: a
+# fractional second is dropped (MySQL keeps it), and a count past MySQL's
+# +-838:59:59 is not clamped.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -30,6 +33,19 @@ query
 SELECT SEC_TO_TIME(3723), SEC_TO_TIME(0), SEC_TO_TIME(86399)
 ----
 01:02:03	00:00:00	23:59:59
+
+# A count of 24 hours or more keeps counting hours (the field is unbounded), not
+# wrapping back to 00 as a time-of-day would.
+query
+SELECT SEC_TO_TIME(86400), SEC_TO_TIME(90000), SEC_TO_TIME(3020399)
+----
+24:00:00	25:00:00	838:59:59
+
+# A negative second count renders a leading '-'.
+query
+SELECT SEC_TO_TIME(-3661), SEC_TO_TIME(-90000), SEC_TO_TIME(-59)
+----
+-01:01:01	-25:00:00	-00:00:59
 
 # The two are inverses over the supported range.
 query

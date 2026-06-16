@@ -5495,51 +5495,9 @@ impl Parser {
             }),
         };
 
-        // sign = CASE WHEN d < 0 THEN '-' ELSE '' END
-        let sign = ast::Expr::Case {
-            base: None,
-            when_then_pairs: vec![(
-                Box::new(ast::Expr::binary(
-                    d.clone(),
-                    ast::Operator::Less,
-                    *numeric_expr("0"),
-                )),
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote("-")))),
-            )],
-            else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::String(requote(""))))),
-        };
-
-        // The HH/MM/SS fields of the absolute second count (hours unbounded).
-        let abs_d = || unary_fn("abs", d.clone());
-        let hh = ast::Expr::binary(abs_d(), ast::Operator::Divide, *numeric_expr("3600"));
-        let mm = ast::Expr::binary(
-            ast::Expr::binary(abs_d(), ast::Operator::Modulus, *numeric_expr("3600")),
-            ast::Operator::Divide,
-            *numeric_expr("60"),
-        );
-        let ss = ast::Expr::binary(abs_d(), ast::Operator::Modulus, *numeric_expr("60"));
-
-        let body = call_fn(
-            "printf",
-            vec![
-                ast::Expr::Literal(ast::Literal::String(requote("%s%02d:%02d:%02d"))),
-                sign,
-                hh,
-                mm,
-                ss,
-            ],
-        );
-
-        // A NULL or unparseable argument makes `d` NULL; return SQL NULL then
-        // (printf would otherwise coerce the NULL fields to zeros).
-        Ok(ast::Expr::Case {
-            base: None,
-            when_then_pairs: vec![(
-                Box::new(ast::Expr::is_null(d.clone())),
-                Box::new(ast::Expr::Literal(ast::Literal::Null)),
-            )],
-            else_expr: Some(Box::new(body)),
-        })
+        // Render the second difference as `[-]HH:MM:SS`. A NULL or unparseable
+        // argument makes `d` NULL, so the shared formatter returns SQL NULL.
+        Ok(signed_hms(d))
     }
 
     /// Parses an `ISNULL(x)` call (the name and `(` are already consumed) and
@@ -7081,30 +7039,28 @@ impl Parser {
         Ok(time_to_sec_expr(t))
     }
 
-    /// Lowers `SEC_TO_TIME(s)` (the name and `(` are already consumed) to
-    /// `time(s, 'unixepoch')` — the `'HH:MM:SS'` time `s` seconds after midnight.
-    /// NULL propagates. The engine wraps at 24 hours, so only `0`..`86399` matches
-    /// MySQL (which would render e.g. `25:00:00`) — a documented divergence.
-    /// Exactly one argument is required.
+    /// Lowers `SEC_TO_TIME(s)` (the name and `(` are already consumed) to the
+    /// MySQL `TIME` string `[-]HH:MM:SS` that is `s` seconds, via the shared
+    /// [`signed_hms`] formatter. Unlike a `time(s, 'unixepoch')` lowering — which
+    /// wraps at 24 hours and cannot render a negative — this handles the full
+    /// span: `SEC_TO_TIME(90000)` is `25:00:00` and `SEC_TO_TIME(-3661)` is
+    /// `-01:01:01`, as in MySQL. A raw integer `CAST` truncates the second count
+    /// toward zero, so a fractional input drops its sub-second part (a documented
+    /// divergence) while keeping the sign. NULL propagates. The result is not
+    /// clamped to MySQL's `±838:59:59` range (as with `TIMEDIFF`). Exactly one
+    /// argument is required.
     fn sec_to_time_call(&mut self) -> Result<ast::Expr> {
         let s = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("time"),
-            distinctness: None,
-            args: vec![
-                Box::new(s),
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote(
-                    "unixepoch",
-                )))),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        })
+        let d = ast::Expr::Cast {
+            expr: Box::new(s),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        };
+        Ok(signed_hms(d))
     }
 
     /// Lowers `MOD(a, b)` (the name and `(` are already consumed) to the same
@@ -9040,6 +8996,59 @@ fn time_to_sec_expr(t: ast::Expr) -> ast::Expr {
     let seconds = cast_strftime_int("%S", t);
     let hm = ast::Expr::binary(hours, ast::Operator::Add, minutes);
     ast::Expr::binary(hm, ast::Operator::Add, seconds)
+}
+
+/// Renders a signed whole-second count `d` as a MySQL `TIME` string
+/// `[-]HH:MM:SS` — the hour field unbounded (e.g. `25:00:00`, `838:59:59`) and a
+/// leading `-` when `d` is negative — via `printf('%s%02d:%02d:%02d', …)` over
+/// the absolute second count. A guarding `CASE` returns SQL NULL when `d` is
+/// NULL, so a NULL does not become printf's zero-filled `00:00:00`. Shared by
+/// `TIMEDIFF` and `SEC_TO_TIME`. The result is not clamped to MySQL's
+/// `±838:59:59` TIME range (a documented divergence).
+fn signed_hms(d: ast::Expr) -> ast::Expr {
+    // sign = CASE WHEN d < 0 THEN '-' ELSE '' END
+    let sign = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(ast::Expr::binary(
+                d.clone(),
+                ast::Operator::Less,
+                *numeric_expr("0"),
+            )),
+            Box::new(ast::Expr::Literal(ast::Literal::String(requote("-")))),
+        )],
+        else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::String(requote(""))))),
+    };
+
+    // The HH/MM/SS fields of the absolute second count (hours unbounded).
+    let abs_d = || unary_fn("abs", d.clone());
+    let hh = ast::Expr::binary(abs_d(), ast::Operator::Divide, *numeric_expr("3600"));
+    let mm = ast::Expr::binary(
+        ast::Expr::binary(abs_d(), ast::Operator::Modulus, *numeric_expr("3600")),
+        ast::Operator::Divide,
+        *numeric_expr("60"),
+    );
+    let ss = ast::Expr::binary(abs_d(), ast::Operator::Modulus, *numeric_expr("60"));
+
+    let body = call_fn(
+        "printf",
+        vec![
+            ast::Expr::Literal(ast::Literal::String(requote("%s%02d:%02d:%02d"))),
+            sign,
+            hh,
+            mm,
+            ss,
+        ],
+    );
+
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(ast::Expr::is_null(d)),
+            Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        )],
+        else_expr: Some(Box::new(body)),
+    }
 }
 
 /// Builds the absolute month count of a MySQL period `p` (`YYYYMM` or `YYMM`),
@@ -12933,17 +12942,31 @@ mod tests {
             ast::Expr::Binary(_, ast::Operator::Add, _)
         ));
 
-        // SEC_TO_TIME(s) -> time(s, 'unixepoch').
-        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("SEC_TO_TIME(s)").unwrap()
+        // SEC_TO_TIME(s) -> a NULL-guarded printf of the signed HH:MM:SS fields
+        // (the shared `signed_hms` formatter), so the top is a `CASE` whose ELSE
+        // is a printf() call. The second count is a raw integer CAST of `s`.
+        let ast::Expr::Case {
+            base: None,
+            else_expr: Some(else_expr),
+            ..
+        } = parse_expr("SEC_TO_TIME(s)").unwrap()
         else {
-            panic!("expected SEC_TO_TIME to lower to a function call");
+            panic!("expected SEC_TO_TIME to lower to a guarded CASE");
         };
-        assert_eq!(name.as_str(), "time");
-        assert_eq!(args.len(), 2);
-        assert_eq!(*args[0], col("s"));
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.as_ref() else {
+            panic!("expected the CASE body to be a printf() call");
+        };
+        assert_eq!(name.as_str(), "printf");
         assert!(
-            matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'unixepoch'")
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%s%02d:%02d:%02d'")
         );
+        // It shares the formatter with TIMEDIFF: both wrap a second count in
+        // `signed_hms`, so SEC_TO_TIME of a TIME_TO_SEC difference round-trips the
+        // same shape a TIMEDIFF would.
+        assert!(matches!(
+            parse_expr("SEC_TO_TIME(x)").unwrap(),
+            ast::Expr::Case { .. }
+        ));
     }
 
     #[test]
