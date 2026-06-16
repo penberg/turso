@@ -53,3 +53,16 @@ query labels
 SELECT ABS(-5), CASE WHEN a > 0 THEN 1 ELSE 0 END FROM cl
 ----
 ABS(-5)	CASE WHEN a > 0 THEN 1 ELSE 0 END
+
+# A string literal is labelled by its decoded value (quotes removed, doubled
+# quotes collapsed); a numeric / NULL literal by its value.
+query labels
+SELECT 'hi', 'it''s', 5, NULL
+----
+hi	it's	5	NULL
+
+# A hex literal is labelled by its verbatim source text.
+query labels
+SELECT 0x41, X'4142'
+----
+0x41	X'4142'

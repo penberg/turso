@@ -1862,11 +1862,26 @@ impl Parser {
     /// label is attached as an [`ast::As::ImplicitColumnName`] so it names the
     /// column without becoming a referenceable alias.
     fn implicit_column_label(&self, expr: &ast::Expr, start: usize, end: usize) -> Option<ast::As> {
-        if matches!(
-            expr,
-            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::Name(_) | ast::Expr::Literal(_)
-        ) {
-            return None;
+        match expr {
+            // A bare/qualified column reference keeps the engine's label (the
+            // column name), which already matches MySQL.
+            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::Name(_) => return None,
+            // A string literal is labelled by its *decoded* value (`'it''s'` →
+            // `it's`), which the engine would otherwise keep quoted.
+            ast::Expr::Literal(ast::Literal::String(s)) => {
+                let decoded = s
+                    .strip_prefix('\'')
+                    .and_then(|t| t.strip_suffix('\''))
+                    .map(|t| t.replace("''", "'"))?;
+                return Some(ast::As::ImplicitColumnName(ast::Name::exact(decoded)));
+            }
+            // A hex literal is labelled by its verbatim source (`0x41`, `X'41'`),
+            // handled by the source slice below; the engine would render the blob.
+            ast::Expr::Literal(ast::Literal::Blob(_)) => {}
+            // Other literals (numeric, NULL) are labelled correctly by the engine
+            // (the value / `NULL`).
+            ast::Expr::Literal(_) => return None,
+            _ => {}
         }
         let text = String::from_utf8_lossy(self.input.get(start..end)?);
         let trimmed = text.trim_end();
@@ -7277,12 +7292,21 @@ mod tests {
         assert_eq!(label(&cols[1]), Some("a +  b"));
         assert_eq!(label(&cols[2]), Some("LENGTH('x')"));
 
-        // A bare/qualified column reference and a literal get no implicit label
-        // (the engine labels them like MySQL: the column name / the value).
-        let cols = columns("SELECT a, t.b, 5, 'hi' FROM t");
+        // A bare/qualified column reference and a numeric/NULL literal get no
+        // implicit label (the engine labels them like MySQL: the column name /
+        // the value).
+        let cols = columns("SELECT a, t.b, 5, NULL FROM t");
         for col in &cols {
             assert_eq!(label(col), None);
         }
+
+        // A string literal is labelled by its decoded value, and a hex literal
+        // by its verbatim source.
+        let cols = columns("SELECT 'hi', 'it''s', 0x41, X'4142' FROM t");
+        assert_eq!(label(&cols[0]), Some("hi"));
+        assert_eq!(label(&cols[1]), Some("it's"));
+        assert_eq!(label(&cols[2]), Some("0x41"));
+        assert_eq!(label(&cols[3]), Some("X'4142'"));
 
         // An explicit alias is kept as-is (not an implicit label).
         let cols = columns("SELECT UPPER('a') AS up FROM t");
