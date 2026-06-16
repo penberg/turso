@@ -201,6 +201,14 @@ impl Parser {
                 self.advance();
                 self.rollback_transaction()
             }
+            "SAVEPOINT" => {
+                self.advance();
+                self.savepoint()
+            }
+            "RELEASE" => {
+                self.advance();
+                self.release_savepoint()
+            }
             "TRUNCATE" => {
                 self.advance();
                 self.truncate_table()
@@ -222,7 +230,7 @@ impl Parser {
                 self.table_statement()
             }
             // Recognized statement keywords that are simply not implemented yet.
-            "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SAVEPOINT" | "GRANT"
+            "SET" | "SHOW" | "USE" | "DESCRIBE" | "DESC" | "EXPLAIN" | "GRANT"
             | "REVOKE" | "CALL" | "DO" | "VALUES" | "PREPARE" | "EXECUTE"
             | "DEALLOCATE" | "LOCK" | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR"
             | "FLUSH" | "KILL" | "LOAD" | "HANDLER" | "IMPORT" => Err(ParseError::Unsupported(
@@ -2705,15 +2713,20 @@ impl Parser {
         Ok(ast::Stmt::Commit { name: None })
     }
 
-    /// Parses `ROLLBACK [WORK]`. `ROLLBACK TO [SAVEPOINT]` and the
+    /// Parses `ROLLBACK [WORK]` and `ROLLBACK [WORK] TO [SAVEPOINT] name`. The
+    /// latter undoes the statements since that savepoint, which the engine
+    /// supports natively (the `SAVEPOINT` keyword is optional, as in MySQL). The
     /// `AND CHAIN`/`RELEASE` modifiers are rejected. `ROLLBACK` has already been
     /// consumed.
     fn rollback_transaction(&mut self) -> Result<ast::Stmt> {
         self.eat_keyword("WORK");
-        if self.is_keyword("TO") {
-            return Err(ParseError::Unsupported(
-                "ROLLBACK TO SAVEPOINT is not supported yet".to_string(),
-            ));
+        if self.eat_keyword("TO") {
+            self.eat_keyword("SAVEPOINT");
+            let name = self.name()?;
+            return Ok(ast::Stmt::Rollback {
+                tx_name: None,
+                savepoint_name: Some(name),
+            });
         }
         if self.has_trailing_tokens() {
             return Err(ParseError::Unsupported(
@@ -2724,6 +2737,22 @@ impl Parser {
             tx_name: None,
             savepoint_name: None,
         })
+    }
+
+    /// Parses `SAVEPOINT name`, marking a point a later `ROLLBACK TO` can return
+    /// to — the engine's native savepoint. `SAVEPOINT` has already been consumed.
+    fn savepoint(&mut self) -> Result<ast::Stmt> {
+        let name = self.name()?;
+        Ok(ast::Stmt::Savepoint { name })
+    }
+
+    /// Parses `RELEASE SAVEPOINT name`, which discards a savepoint without
+    /// rolling back (MySQL requires the `SAVEPOINT` keyword here). `RELEASE` has
+    /// already been consumed.
+    fn release_savepoint(&mut self) -> Result<ast::Stmt> {
+        self.expect_keyword("SAVEPOINT")?;
+        let name = self.name()?;
+        Ok(ast::Stmt::Release { name })
     }
 
     /// Whether any non-terminating token remains before the end of the
@@ -10079,8 +10108,29 @@ mod tests {
         ));
         assert!(matches!(
             parse("ROLLBACK").unwrap(),
-            ast::Stmt::Rollback { .. }
+            ast::Stmt::Rollback {
+                savepoint_name: None,
+                ..
+            }
         ));
+
+        // Savepoints pass through to the engine's native ones.
+        let ast::Stmt::Savepoint { name } = parse("SAVEPOINT sp1").unwrap() else {
+            panic!("expected a SAVEPOINT");
+        };
+        assert_eq!(name.as_str(), "sp1");
+        // ROLLBACK TO [SAVEPOINT] name carries the savepoint name.
+        for sql in ["ROLLBACK TO sp1", "ROLLBACK TO SAVEPOINT sp1", "ROLLBACK WORK TO SAVEPOINT sp1"] {
+            let ast::Stmt::Rollback { savepoint_name, .. } = parse(sql).unwrap() else {
+                panic!("expected a ROLLBACK for `{sql}`");
+            };
+            assert_eq!(savepoint_name.as_ref().map(|n| n.as_str()), Some("sp1"), "{sql}");
+        }
+        // RELEASE SAVEPOINT name.
+        let ast::Stmt::Release { name } = parse("RELEASE SAVEPOINT sp1").unwrap() else {
+            panic!("expected a RELEASE");
+        };
+        assert_eq!(name.as_str(), "sp1");
     }
 
     #[test]
@@ -10088,15 +10138,14 @@ mod tests {
         for sql in [
             "START TRANSACTION READ ONLY",
             "START TRANSACTION WITH CONSISTENT SNAPSHOT",
-            "ROLLBACK TO SAVEPOINT sp",
-            "ROLLBACK TO sp",
-            "SAVEPOINT sp",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
         }
+        // RELEASE requires the SAVEPOINT keyword in MySQL, so the bare form fails.
+        assert!(parse("RELEASE sp").is_err());
     }
 
     #[test]

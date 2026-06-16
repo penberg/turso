@@ -1,0 +1,68 @@
+# SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT conformance.
+#
+# MySQL's savepoints mark points within a transaction that a later
+# ROLLBACK TO returns to (undoing the statements since), while RELEASE discards a
+# savepoint without rolling back. The engine supports savepoints natively, so the
+# front-end passes them straight through: SAVEPOINT name, ROLLBACK [WORK] TO
+# [SAVEPOINT] name (the SAVEPOINT keyword is optional, as in MySQL), and
+# RELEASE SAVEPOINT name.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name and commits before finishing so it leaves no open transaction.
+
+statement ok
+CREATE TABLE IF NOT EXISTS sp_demo (id INT PRIMARY KEY)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO sp_demo VALUES (1)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO sp_demo VALUES (2)
+
+# ROLLBACK TO undoes the second insert but keeps the first.
+statement ok
+ROLLBACK TO SAVEPOINT a
+
+statement ok
+INSERT INTO sp_demo VALUES (3)
+
+# The optional SAVEPOINT keyword may be omitted on ROLLBACK TO.
+statement ok
+SAVEPOINT b
+
+statement ok
+INSERT INTO sp_demo VALUES (4)
+
+statement ok
+ROLLBACK TO b
+
+statement ok
+INSERT INTO sp_demo VALUES (5)
+
+# RELEASE discards a savepoint without rolling back its statements.
+statement ok
+SAVEPOINT c
+
+statement ok
+INSERT INTO sp_demo VALUES (6)
+
+statement ok
+RELEASE SAVEPOINT c
+
+statement ok
+COMMIT
+
+# Rows 1, 3, 5, 6 survive; 2 and 4 were rolled back to their savepoints.
+query
+SELECT id FROM sp_demo ORDER BY id
+----
+1
+3
+5
+6

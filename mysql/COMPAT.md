@@ -443,9 +443,9 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | START TRANSACTION / BEGIN [WORK]                | ✅     | Mapped to the engine's `BEGIN` (deferred). `READ ONLY`/`READ WRITE`/`WITH CONSISTENT SNAPSHOT` characteristics are rejected. |
 | COMMIT [WORK]                                    | ✅     | `AND CHAIN`/`RELEASE` rejected. |
 | ROLLBACK [WORK]                                  | ✅     | `AND CHAIN`/`RELEASE` rejected. |
-| SAVEPOINT                                        | ❌     |         |
-| ROLLBACK TO SAVEPOINT                            | ❌     | Rejected as unsupported. |
-| RELEASE SAVEPOINT                                | ❌     |         |
+| SAVEPOINT name                                   | ✅     | Passed through to the engine's native savepoint. |
+| ROLLBACK [WORK] TO [SAVEPOINT] name              | ✅     | Undoes the statements since the savepoint, via the engine's `ROLLBACK TO`. The `SAVEPOINT` keyword is optional, as in MySQL. |
+| RELEASE SAVEPOINT name                           | ✅     | Discards a savepoint without rolling back, via the engine's `RELEASE`. The `SAVEPOINT` keyword is required (MySQL syntax). |
 | SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE | 🚧 | The trailing locking-read clause is accepted and ignored, including the `OF tbl [, tbl] ...` table list and the `NOWAIT` / `SKIP LOCKED` lock-acquisition options. The engine is a single writer, so the locked query returns the same rows as the unlocked one; no real row locking is performed, and `NOWAIT` / `SKIP LOCKED` (which only matter under contention) are no-ops. |
 | LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE       | ❌     |         |
 | LOCK TABLES / UNLOCK TABLES                      | ❌     |         |
