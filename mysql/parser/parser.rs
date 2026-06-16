@@ -6045,7 +6045,8 @@ impl Parser {
             args: vec![
                 Box::new(str_arg),
                 Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
-                Box::new(len_arg),
+                // MySQL rounds a fractional length (`LEFT('abcd', 2.9)` → `abc`).
+                Box::new(integer_arg(len_arg)),
             ],
             order_by: Vec::new(),
             within_group: Vec::new(),
@@ -6067,16 +6068,18 @@ impl Parser {
         self.expect(&Token::Comma, "`,`")?;
         let len_arg = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
+        // MySQL rounds a fractional length (`RIGHT('abcd', 2.9)` → `bcd`).
+        let len = integer_arg(len_arg);
         // `-len`, built as `0 - len` to avoid a unary-minus node.
         let neg_len = ast::Expr::binary(
             ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
             ast::Operator::Subtract,
-            len_arg.clone(),
+            len.clone(),
         );
         Ok(ast::Expr::FunctionCall {
             name: ast::Name::from_string("substr"),
             distinctness: None,
-            args: vec![Box::new(str_arg), Box::new(neg_len), Box::new(len_arg)],
+            args: vec![Box::new(str_arg), Box::new(neg_len), Box::new(len)],
             order_by: Vec::new(),
             within_group: Vec::new(),
             filter_over: ast::FunctionTail {
@@ -6927,7 +6930,8 @@ impl Parser {
         self.expect(&Token::Comma, "`,`")?;
         let n = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
-        Ok(repeat_expr(s, n))
+        // MySQL rounds a fractional count (`REPEAT('x', 2.9)` → `xxx`).
+        Ok(repeat_expr(s, integer_arg(n)))
     }
 
     /// Lowers `SPACE(n)` (the name and `(` are already consumed) to `REPEAT(' ',
@@ -6938,7 +6942,8 @@ impl Parser {
         let n = self.expr()?;
         self.expect(&Token::RParen, "`)`")?;
         let space = ast::Expr::Literal(ast::Literal::String(requote(" ")));
-        Ok(repeat_expr(space, n))
+        // MySQL rounds a fractional count (`SPACE(2.9)` is three spaces).
+        Ok(repeat_expr(space, integer_arg(n)))
     }
 
     /// Lowers `INSERT(str, pos, len, newstr)` (the name and `(` are already
@@ -8228,6 +8233,21 @@ fn build_cast(expr: ast::Expr, type_name: ast::Type) -> ast::Expr {
         when_then_pairs: vec![(Box::new(is_numeric), Box::new(rounded))],
         else_expr: Some(Box::new(truncated)),
     }
+}
+
+/// Coerces a count/length/position argument to an integer the way MySQL does — a
+/// numeric value rounds, a string parses its leading integer (see [`build_cast`]).
+/// The engine would otherwise truncate a fractional argument toward zero, so
+/// `LEFT('abcd', 2.9)` would be `ab` rather than MySQL's `abc`.
+fn integer_arg(x: ast::Expr) -> ast::Expr {
+    build_cast(
+        x,
+        ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        },
+    )
 }
 
 /// Builds `substr(s, start, len)`.
@@ -14358,8 +14378,10 @@ mod tests {
 
     #[test]
     fn repeat_lowers_to_zeroblob_replace_with_null_guard() {
-        // REPEAT(s, n) -> CASE WHEN n IS NULL THEN NULL
-        //                      ELSE replace(hex(zeroblob(n)), '00', s) END.
+        // REPEAT(s, n) -> CASE WHEN <int n> IS NULL THEN NULL
+        //                      ELSE replace(hex(zeroblob(<int n>)), '00', s) END,
+        // where <int n> is the count coerced to an integer like CAST(n AS SIGNED)
+        // (MySQL rounds a fractional count).
         let ast::Expr::Case {
             base,
             when_then_pairs,
@@ -14370,9 +14392,12 @@ mod tests {
         };
         assert!(base.is_none(), "searched CASE, no base expression");
 
-        // The single WHEN guards a NULL count: `n IS NULL` -> NULL.
+        // The single WHEN guards a NULL (coerced) count -> NULL.
         assert_eq!(when_then_pairs.len(), 1);
-        assert_eq!(*when_then_pairs[0].0, ast::Expr::is_null(col("n")));
+        assert_eq!(
+            *when_then_pairs[0].0,
+            ast::Expr::is_null(parse_expr("CAST(n AS SIGNED)").unwrap())
+        );
         assert_eq!(
             *when_then_pairs[0].1,
             ast::Expr::Literal(ast::Literal::Null)

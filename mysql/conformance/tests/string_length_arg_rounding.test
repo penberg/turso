@@ -1,0 +1,53 @@
+# Rounding of the count/length argument of LEFT / RIGHT / REPEAT / SPACE.
+#
+# MySQL coerces the integer count/length argument of these functions the way
+# CAST(... AS SIGNED) does: a numeric value is rounded (LEFT('abcd', 2.9) keeps 3
+# characters) and a string parses its leading integer. The engine would otherwise
+# truncate a fractional value toward zero, so the front-end wraps the argument in
+# that same integer coercion. An integer or NULL argument is unaffected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# LEFT/RIGHT round a fractional length (2.9 -> 3, 2.4 -> 2).
+query
+SELECT LEFT('hello', 2.9), LEFT('hello', 2.4), RIGHT('hello', 2.9), RIGHT('hello', 2.4)
+----
+hel	he	llo	lo
+
+# A string length parses its leading integer; a non-numeric string is 0 (wrapped
+# in brackets so the empty result is visible).
+query
+SELECT LEFT('hello', '3'), RIGHT('hello', '3'), CONCAT('[', LEFT('hello', 'x'), ']')
+----
+hel	llo	[]
+
+# REPEAT/SPACE round a fractional count the same way.
+query
+SELECT REPEAT('x', 2.9), REPEAT('x', 2.4), REPEAT('ab', '2')
+----
+xxx	xx	abab
+
+# SPACE rounds its count (each value wrapped so the empty padding is visible).
+query
+SELECT CONCAT('[', SPACE(2.9), ']'), CONCAT('[', SPACE(2.4), ']')
+----
+[   ]	[  ]
+
+# Integer and NULL arguments are unchanged.
+query
+SELECT LEFT('hello', 3), RIGHT('hello', 2), REPEAT('a', 0), LEFT('hello', NULL), REPEAT('a', NULL)
+----
+hel	lo		NULL	NULL
+
+statement ok
+CREATE TABLE slr_t (id INT PRIMARY KEY, s VARCHAR(20), n DOUBLE)
+
+statement ok
+INSERT INTO slr_t VALUES (1, 'abcdef', 2.9), (2, 'abcdef', 3.5)
+
+# A fractional length from a DOUBLE column rounds per row.
+query
+SELECT id, LEFT(s, n) FROM slr_t ORDER BY id
+----
+1	abc
+2	abcd
