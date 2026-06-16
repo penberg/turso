@@ -18,6 +18,9 @@ use crate::token::Token;
 pub struct Parser {
     tokens: Vec<(Token, usize)>,
     pos: usize,
+    /// The original input, kept so an unaliased select-list expression can be
+    /// labelled with its verbatim source text (matching MySQL's column naming).
+    input: Vec<u8>,
     /// Byte offset just past the end of input, for end-of-input errors.
     eof: usize,
     /// Number of positional `?` placeholders seen so far. MySQL parameters are
@@ -38,6 +41,7 @@ impl Parser {
         Ok(Self {
             tokens,
             pos: 0,
+            input: input.to_vec(),
             eof: input.len(),
             params: 0,
             in_upsert_assignment: false,
@@ -1808,8 +1812,15 @@ impl Parser {
                 self.advance(); // `*`
                 columns.push(ast::ResultColumn::TableStar(name));
             } else {
+                let start = self.offset_here();
                 let expr = self.expr()?;
-                let alias = self.column_alias()?;
+                let end = self.offset_here();
+                let alias = match self.column_alias()? {
+                    Some(explicit) => Some(explicit),
+                    // An unaliased non-trivial expression takes its verbatim
+                    // source text as the column name, as MySQL does.
+                    None => self.implicit_column_label(&expr, start, end),
+                };
                 columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
             }
             if self.eat(&Token::Comma) {
@@ -1818,6 +1829,41 @@ impl Parser {
             break;
         }
         Ok(columns)
+    }
+
+    /// The byte offset of the current token (or end-of-input past the last one).
+    fn offset_here(&self) -> usize {
+        self.tokens.get(self.pos).map(|(_, off)| *off).unwrap_or(self.eof)
+    }
+
+    /// The default column label for an unaliased select-list expression spanning
+    /// the source bytes `[start, end)`. MySQL labels such a column with the
+    /// verbatim source text of the expression — `UPPER('x')`, `COUNT(*)`, `a+b` —
+    /// rather than a re-rendered form (which the engine would otherwise print with
+    /// stray spaces, qualified column names, and the lowered function bodies). A
+    /// bare column reference (`a`, `t.a`) and a literal are excluded: the engine
+    /// already labels those the way MySQL does (the column name / the value), and
+    /// the verbatim text would wrongly keep the table qualifier or quotes. The
+    /// label is attached as an [`ast::As::ImplicitColumnName`] so it names the
+    /// column without becoming a referenceable alias.
+    fn implicit_column_label(&self, expr: &ast::Expr, start: usize, end: usize) -> Option<ast::As> {
+        if matches!(
+            expr,
+            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::Name(_) | ast::Expr::Literal(_)
+        ) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(self.input.get(start..end)?);
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // `Name::exact` stores the text verbatim; `from_string` would try to
+        // interpret a leading quote (e.g. `'x' + 1`) as a quoted identifier and
+        // panic when the closing quote doesn't match.
+        Some(ast::As::ImplicitColumnName(ast::Name::exact(
+            trimmed.to_string(),
+        )))
     }
 
     /// Parses an optional select-list column alias: `AS name`, a backtick-quoted
@@ -6991,6 +7037,48 @@ mod tests {
             panic!("expected OneSelect::Select");
         };
         assert!(from.is_none());
+    }
+
+    #[test]
+    fn unaliased_expression_takes_verbatim_source_label() {
+        // Returns the result columns of a parsed SELECT.
+        fn columns(sql: &str) -> Vec<ast::ResultColumn> {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT");
+            };
+            let ast::OneSelect::Select { columns, .. } = select.body.select else {
+                panic!("expected OneSelect::Select");
+            };
+            columns
+        }
+        // The implicit label of the n-th column, or None.
+        fn label(col: &ast::ResultColumn) -> Option<&str> {
+            match col {
+                ast::ResultColumn::Expr(_, Some(ast::As::ImplicitColumnName(n))) => Some(n.as_str()),
+                _ => None,
+            }
+        }
+
+        // A function call / arithmetic gets the verbatim source text, spacing
+        // preserved, even across the front-end's lowering of LENGTH.
+        let cols = columns("SELECT UPPER('a'),  a +  b , LENGTH('x') FROM t");
+        assert_eq!(label(&cols[0]), Some("UPPER('a')"));
+        assert_eq!(label(&cols[1]), Some("a +  b"));
+        assert_eq!(label(&cols[2]), Some("LENGTH('x')"));
+
+        // A bare/qualified column reference and a literal get no implicit label
+        // (the engine labels them like MySQL: the column name / the value).
+        let cols = columns("SELECT a, t.b, 5, 'hi' FROM t");
+        for col in &cols {
+            assert_eq!(label(col), None);
+        }
+
+        // An explicit alias is kept as-is (not an implicit label).
+        let cols = columns("SELECT UPPER('a') AS up FROM t");
+        assert!(matches!(
+            &cols[0],
+            ast::ResultColumn::Expr(_, Some(ast::As::As(n))) if n.as_str() == "up"
+        ));
     }
 
     #[test]

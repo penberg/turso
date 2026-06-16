@@ -1,0 +1,55 @@
+# Default column labels for unaliased select-list expressions.
+#
+# MySQL labels an unaliased result column with the verbatim source text of its
+# expression -- `UPPER('abc')`, `COUNT(*)`, `a+b` -- preserving the spacing as
+# written. The engine would otherwise re-render the (translated) expression with
+# stray spaces and its lowered function bodies (`UPPER ('abc')`,
+# `length (CAST ('x' AS BLOB))`), so the front-end attaches the verbatim source
+# text as the column name. A bare column reference and a literal keep the engine
+# labelling (the column name / the value), as MySQL does.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS cl (a INT PRIMARY KEY, b INT)
+
+statement ok
+INSERT INTO cl (a, b) VALUES (5, 3)
+
+# A function call keeps its name flush against the parenthesis.
+query labels
+SELECT UPPER('abc')
+----
+UPPER('abc')
+
+# COUNT(*) and a function whose front-end lowering differs from the source.
+query labels
+SELECT COUNT(*), LENGTH('x') FROM cl
+----
+COUNT(*)	LENGTH('x')
+
+# Arithmetic keeps the exact spacing as written.
+query labels
+SELECT a+b, a + b FROM cl
+----
+a+b	a + b
+
+# A bare / qualified column reference is labelled by its column name, and a
+# literal by its value -- not the verbatim text.
+query labels
+SELECT a, cl.b FROM cl
+----
+a	b
+
+# An explicit alias still wins.
+query labels
+SELECT UPPER('x') AS up, a AS col FROM cl
+----
+up	col
+
+# Nested calls and CASE keep their verbatim form.
+query labels
+SELECT ABS(-5), CASE WHEN a > 0 THEN 1 ELSE 0 END FROM cl
+----
+ABS(-5)	CASE WHEN a > 0 THEN 1 ELSE 0 END

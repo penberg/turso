@@ -32,6 +32,9 @@
 //! * `query types` — like `query`, but the single expected line lists the
 //!   MySQL column *type* of each result column (e.g. `LONG`, `VAR_STRING`),
 //!   checking the result-set metadata rather than the rows.
+//! * `query labels` — like `query types`, but the single expected line lists
+//!   the column *label* (name) of each result column, checking the default
+//!   column naming.
 //! * `exec ok` / `exec error` — like `statement`, but run over the binary
 //!   protocol as a prepared statement. An optional `params` line binds the
 //!   `?` placeholders (tab-separated; `NULL` for SQL NULL).
@@ -66,6 +69,13 @@ pub enum Record {
     /// A query whose result-column types must match `expected` (a single line
     /// of tab-separated MySQL type names).
     QueryTypes {
+        line: usize,
+        sql: String,
+        expected: Vec<String>,
+    },
+    /// A query whose result-column *labels* (names) must match `expected` (a
+    /// single line of tab-separated column names).
+    QueryLabels {
         line: usize,
         sql: String,
         expected: Vec<String>,
@@ -151,6 +161,14 @@ pub fn parse(content: &str) -> Result<Vec<Record>> {
             "query types" => {
                 let (sql, expected) = read_query_block(&lines, &mut i, directive_line)?;
                 records.push(Record::QueryTypes {
+                    line: directive_line,
+                    sql,
+                    expected,
+                });
+            }
+            "query labels" => {
+                let (sql, expected) = read_query_block(&lines, &mut i, directive_line)?;
+                records.push(Record::QueryLabels {
                     line: directive_line,
                     sql,
                     expected,
@@ -341,6 +359,21 @@ fn run_record(conn: &mut Conn, record: &Record) -> Outcome {
                 message: format!("query failed: {e}"),
             },
         },
+        Record::QueryLabels {
+            line,
+            sql,
+            expected,
+        } => match query_labels(conn, sql) {
+            Ok(actual) if &actual == expected => Outcome::Pass,
+            Ok(actual) => Outcome::Fail {
+                line: *line,
+                message: format!("column-label mismatch:\n{}", diff(expected, &actual)),
+            },
+            Err(e) => Outcome::Fail {
+                line: *line,
+                message: format!("query failed: {e}"),
+            },
+        },
         Record::Exec {
             line,
             expect_ok,
@@ -400,6 +433,19 @@ fn query_types(conn: &mut Conn, sql: &str) -> Result<Vec<String>> {
         .map(|column| type_name(column.column_type()))
         .collect();
     Ok(vec![types.join("\t")])
+}
+
+/// Runs a query and renders its result-set column labels (names) as a single
+/// tab-separated line.
+fn query_labels(conn: &mut Conn, sql: &str) -> Result<Vec<String>> {
+    let result = conn.query_iter(sql).context("query_iter")?;
+    let labels: Vec<String> = result
+        .columns()
+        .as_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    Ok(vec![labels.join("\t")])
 }
 
 /// Runs a prepared query over the binary protocol and renders its rows.
