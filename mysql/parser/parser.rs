@@ -2305,6 +2305,18 @@ impl Parser {
             ));
         }
 
+        // `information_schema.KEY_COLUMN_USAGE` (one row per key/unique-constraint
+        // column) is synthesized the same way (see
+        // `information_schema_key_column_usage_select`).
+        if is_information_schema_key_column_usage(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_key_column_usage_select(),
+                alias,
+            ));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -9432,6 +9444,75 @@ fn information_schema_table_constraints_select() -> ast::Select {
     }
 }
 
+/// Whether `name` refers to `information_schema.KEY_COLUMN_USAGE` (both parts
+/// compared case-insensitively, as MySQL treats them).
+fn is_information_schema_key_column_usage(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("KEY_COLUMN_USAGE")
+}
+
+/// Builds the derived-table `SELECT` that emulates MySQL's
+/// `information_schema.KEY_COLUMN_USAGE` (one row per column of a primary-key or
+/// unique constraint) from the engine catalog. It is the union of the primary-key
+/// columns (named `PRIMARY`, numbered by `ROW_NUMBER` so a composite key counts
+/// `1, 2, ...`) and the named unique-index columns (`pragma_index_list` /
+/// `pragma_index_info`, the unique `origin = 'c'` indexes). `ORDINAL_POSITION` is
+/// the column's 1-based position within the constraint. A non-unique `KEY` is not
+/// a constraint and is excluded.
+///
+/// This engine has no foreign keys, so the foreign-key columns
+/// (`POSITION_IN_UNIQUE_CONSTRAINT`, `REFERENCED_*`) are always NULL. Parsed with
+/// the engine parser (`turso_parser`), like the other emulations. Same
+/// `TABLE_SCHEMA` placeholder limitation as `TABLES` (filtering on it matches
+/// nothing); see `mysql/COMPAT.md`.
+fn information_schema_key_column_usage_select() -> ast::Select {
+    const SQL: &[u8] = b"SELECT \
+         'def' AS CONSTRAINT_CATALOG, \
+         'def' AS CONSTRAINT_SCHEMA, \
+         'PRIMARY' AS CONSTRAINT_NAME, \
+         'def' AS TABLE_CATALOG, \
+         'def' AS TABLE_SCHEMA, \
+         m.name AS TABLE_NAME, \
+         p.name AS COLUMN_NAME, \
+         ROW_NUMBER() OVER (PARTITION BY m.name ORDER BY p.cid) AS ORDINAL_POSITION, \
+         NULL AS POSITION_IN_UNIQUE_CONSTRAINT, \
+         NULL AS REFERENCED_TABLE_SCHEMA, \
+         NULL AS REFERENCED_TABLE_NAME, \
+         NULL AS REFERENCED_COLUMN_NAME \
+         FROM sqlite_schema m \
+         JOIN pragma_table_info(m.name) p \
+         WHERE m.type = 'table' AND p.pk > 0 \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_' \
+         UNION ALL \
+         SELECT \
+         'def', \
+         'def', \
+         il.name, \
+         'def', \
+         'def', \
+         m.name, \
+         ii.name, \
+         ii.seqno + 1, \
+         NULL, \
+         NULL, \
+         NULL, \
+         NULL \
+         FROM sqlite_schema m \
+         JOIN pragma_index_list(m.name) il \
+         JOIN pragma_index_info(il.name) ii \
+         WHERE m.type = 'table' AND il.origin = 'c' AND il.\"unique\" = 1 \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_'";
+    let mut parser = turso_parser::parser::Parser::new(SQL);
+    match parser.next() {
+        Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
+        _ => unreachable!("the information_schema.KEY_COLUMN_USAGE emulation parses as a SELECT"),
+    }
+}
+
 /// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
 /// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
 /// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
@@ -14873,13 +14954,19 @@ mod tests {
             ),
             ast::SelectTable::Select(..)
         ));
+        assert!(matches!(
+            base_table(
+                "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_NAME = 'x'"
+            ),
+            ast::SelectTable::Select(..)
+        ));
         // A plain table, and an unemulated information_schema table, are unchanged.
         assert!(matches!(
             base_table("SELECT id FROM wp_posts"),
             ast::SelectTable::Table(..)
         ));
         assert!(matches!(
-            base_table("SELECT 1 FROM information_schema.KEY_COLUMN_USAGE"),
+            base_table("SELECT 1 FROM information_schema.REFERENTIAL_CONSTRAINTS"),
             ast::SelectTable::Table(..)
         ));
     }

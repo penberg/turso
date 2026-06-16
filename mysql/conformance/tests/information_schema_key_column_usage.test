@@ -1,0 +1,44 @@
+# information_schema.KEY_COLUMN_USAGE.
+#
+# MySQL lists the columns of each key/unique constraint (and foreign key) in
+# information_schema.KEY_COLUMN_USAGE; ORM and migration tools read it alongside
+# TABLE_CONSTRAINTS to map a constraint to its columns. The engine has no such
+# schema, so the front-end rewrites a reference to it into a derived table over
+# the engine catalog: the primary-key columns (named PRIMARY, numbered 1..n by
+# position) unioned with the named unique-index columns. ORDINAL_POSITION is the
+# column's 1-based position within the constraint; a non-unique KEY is not a
+# constraint and is excluded.
+#
+# This engine has no foreign keys, so POSITION_IN_UNIQUE_CONSTRAINT and the
+# REFERENCED_* columns are always NULL. Limitation (not exercised here, see
+# mysql/COMPAT.md): TABLE_SCHEMA is a placeholder, so filtering on it matches
+# nothing. The query orders by CONSTRAINT_NAME / ORDINAL_POSITION and uses
+# file-unique table and index names.
+
+statement ok
+CREATE TABLE iskcu_t (id INT PRIMARY KEY, a INT, b INT, UNIQUE KEY uq_iskcu (a), KEY idx_iskcu (b))
+
+# The primary-key column and the unique-key column, each at position 1; the
+# referenced-table column is NULL (no foreign keys), and the non-unique KEY
+# idx_iskcu is absent.
+query
+SELECT CONSTRAINT_NAME, COLUMN_NAME, ORDINAL_POSITION, REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_NAME = 'iskcu_t' ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION
+----
+PRIMARY	id	1	NULL
+uq_iskcu	a	1	NULL
+
+# Exactly two key columns (the non-unique key contributes none).
+query
+SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_NAME = 'iskcu_t'
+----
+2
+
+statement ok
+CREATE TABLE iskcu_c (x INT, y INT, PRIMARY KEY (x, y))
+
+# A composite primary key lists its columns with ascending ORDINAL_POSITION.
+query
+SELECT COLUMN_NAME, ORDINAL_POSITION FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_NAME = 'iskcu_c' ORDER BY ORDINAL_POSITION
+----
+x	1
+y	2
