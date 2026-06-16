@@ -1,0 +1,55 @@
+# Read-only system variables clients and WordPress probe.
+#
+# Client connectors, WordPress (`wpdb`, Site Health), and plugins read various
+# `@@variables` during setup and feature detection. The front-end answers them
+# from a fixed table of plausible MySQL-default values; the ones below were
+# missing, so `SELECT @@var` returned an empty string instead of the value.
+#
+# Values are the standard MySQL 8.4 session/global defaults, which are fixed
+# (not server-configured), so they match a real mysqld. Booleans are compared via
+# `SELECT @@var`, where MySQL renders them as 0/1 (its `SHOW VARIABLES` renders
+# the same booleans as OFF/ON -- a separate, pre-existing divergence shared by
+# the long-standing `autocommit` / `foreign_key_checks` variables).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# The default storage engine matches the InnoDB the front-end reports everywhere.
+query
+SELECT @@default_storage_engine, @@default_tmp_storage_engine
+----
+InnoDB	InnoDB
+
+# Session SQL toggles WordPress and clients read (WordPress sets sql_auto_is_null
+# to 0 at connect, and reads back these defaults).
+query
+SELECT @@sql_auto_is_null, @@sql_big_selects, @@sql_safe_updates, @@big_tables
+----
+0	1	0	0
+
+query
+SELECT @@sql_notes, @@sql_warnings, @@innodb_strict_mode
+----
+1	0	1
+
+# Numeric/limit and charset introspection.
+query
+SELECT @@group_concat_max_len, @@net_buffer_length, @@sql_select_limit
+----
+1024	16384	18446744073709551615
+
+query
+SELECT @@character_set_system, @@have_query_cache
+----
+utf8mb3	NO
+
+# Non-boolean variables render identically through SHOW VARIABLES, which draws
+# from the same table.
+query
+SHOW VARIABLES LIKE 'default_storage_engine'
+----
+default_storage_engine	InnoDB
+
+query
+SHOW VARIABLES LIKE 'group_concat_max_len'
+----
+group_concat_max_len	1024
