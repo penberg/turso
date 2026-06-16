@@ -43,6 +43,15 @@ pub fn try_handle(sql: &str) -> Option<SessionResponse> {
         return Some(SessionResponse::Ok);
     }
 
+    // `FLUSH ...` (TABLES, PRIVILEGES, STATUS, LOGS, HOSTS, TABLES WITH READ LOCK,
+    // ...) flushes server-side caches and state this single-node engine does not
+    // keep, so it is a no-op that reports success — matching MySQL's empty OK.
+    // It appears in mysqldump output and DB-admin / import flows. (Bare `FLUSH`
+    // with no target is left to the parser, which rejects it as MySQL does.)
+    if words.first() == Some(&"FLUSH") && words.len() >= 2 {
+        return Some(SessionResponse::Ok);
+    }
+
     // `SELECT @@var, ...` / `SELECT VERSION()` and similar introspection.
     if upper.starts_with("SELECT ") || upper.starts_with("SELECT\t") {
         return handle_select(&trimmed[6..]);
@@ -200,6 +209,23 @@ mod tests {
             try_handle("SET NAMES utf8mb4"),
             Some(SessionResponse::Ok)
         ));
+    }
+
+    #[test]
+    fn flush_is_a_noop() {
+        for sql in [
+            "FLUSH TABLES",
+            "FLUSH PRIVILEGES",
+            "flush status;",
+            "FLUSH TABLES WITH READ LOCK",
+        ] {
+            assert!(
+                matches!(try_handle(sql), Some(SessionResponse::Ok)),
+                "expected `{sql}` to be a no-op OK"
+            );
+        }
+        // Bare `FLUSH` (no target) is left to the parser, which rejects it.
+        assert!(try_handle("FLUSH").is_none());
     }
 
     #[test]

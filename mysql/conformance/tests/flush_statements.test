@@ -1,0 +1,47 @@
+# FLUSH statements (server-side cache/state maintenance).
+#
+# `FLUSH <target>` tells a MySQL server to flush internal caches or state
+# (TABLES, PRIVILEGES, STATUS, LOGS, the table cache held under a global read
+# lock, ...). It appears in mysqldump output and DB-admin / import flows. This
+# single-node engine keeps none of that server-side state, so the front-end
+# accepts `FLUSH <target>` as a no-op that reports success, matching MySQL's
+# empty OK. Bare `FLUSH` (no target) stays a syntax error, as in MySQL.
+#
+# Only universally-accepted targets are tested: MySQL 8.4 removed `FLUSH HOSTS`,
+# so that variant is left out. `FLUSH TABLES WITH READ LOCK` takes a global read
+# lock on a real server, so it is released with `UNLOCK TABLES` to avoid blocking
+# later statements.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+statement ok
+FLUSH TABLES
+
+statement ok
+FLUSH PRIVILEGES
+
+statement ok
+FLUSH STATUS
+
+statement ok
+FLUSH LOGS
+
+# Case-insensitive, like every other keyword.
+statement ok
+flush tables
+
+statement ok
+FLUSH TABLES WITH READ LOCK
+
+statement ok
+UNLOCK TABLES
+
+# A normal query still works after the flush/unlock round-trip.
+query
+SELECT 1
+----
+1
+
+# Bare `FLUSH` with no target is rejected on both engines.
+statement error
+FLUSH

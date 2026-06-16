@@ -459,6 +459,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 | LOCK INSTANCE FOR BACKUP / UNLOCK INSTANCE       | ❌     |         |
 | LOCK TABLES / UNLOCK TABLES                      | 🚧     | `LOCK TABLE[S] ... {READ\|WRITE}` (any number of tables) and `UNLOCK TABLE[S]` are accepted as **no-ops** that report success — the engine is a single writer, so the table locks MySQL uses to serialize access are unnecessary. The statements between them run normally. MySQL's side effects are not reproduced: `LOCK TABLES` does not commit an active transaction and does not confine the session to the locked tables (accessing an unlocked table still works). |
 | SET TRANSACTION                                  | ❌     |         |
+| FLUSH *target*                                   | 🚧     | `FLUSH {TABLES \| PRIVILEGES \| STATUS \| LOGS \| TABLES WITH READ LOCK \| ...}` is accepted as a **no-op** that reports success — this single-node engine keeps none of the server-side caches/state (table cache, privilege tables, status counters, binary logs) those targets flush. The target is not parsed beyond requiring one to be present, so any `FLUSH <something>` succeeds, which is more permissive than a real 8.4 server (e.g. it accepts the `FLUSH HOSTS` that 8.4 removed); `FLUSH TABLES WITH READ LOCK` does not actually take a global read lock. Bare `FLUSH` (no target) stays a syntax error, as in MySQL. Appears in mysqldump output and DB-admin / import flows. |
 | XA transactions (XA START/END/PREPARE/COMMIT...) | ❌     |         |
 
 ### Replication Statements
