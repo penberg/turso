@@ -3068,24 +3068,38 @@ impl Parser {
     ///     the engine's own `%` would wrongly truncate them to integers, e.g.
     ///     `5.5 % 2` is `1.5`, not `1`). `%` and `MOD` are synonyms in MySQL.
     fn multiplicative_expr(&mut self) -> Result<ast::Expr> {
-        let mut lhs = self.collate_expr()?;
+        let mut lhs = self.bitxor_expr()?;
         loop {
             if self.is(&Token::Star) {
                 self.advance();
-                let rhs = self.collate_expr()?;
+                let rhs = self.bitxor_expr()?;
                 lhs = ast::Expr::binary(lhs, ast::Operator::Multiply, rhs);
             } else if self.eat(&Token::Other('/')) {
-                let rhs = self.collate_expr()?;
+                let rhs = self.bitxor_expr()?;
                 lhs = float_division(lhs, rhs);
             } else if self.eat_keyword("DIV") {
-                let rhs = self.collate_expr()?;
+                let rhs = self.bitxor_expr()?;
                 lhs = integer_division(lhs, rhs);
             } else if self.eat_keyword("MOD") || self.eat(&Token::Other('%')) {
-                let rhs = self.collate_expr()?;
+                let rhs = self.bitxor_expr()?;
                 lhs = modulo(lhs, rhs);
             } else {
                 break;
             }
+        }
+        Ok(lhs)
+    }
+
+    /// Bitwise-XOR tier: `^`, left-associative. In MySQL's precedence `^` binds
+    /// tighter than `*`/`/` and looser than the unary `-`/`~` prefixes, so it
+    /// sits between [`Self::multiplicative_expr`] and [`Self::collate_expr`]
+    /// (`-a ^ b` is `(-a) ^ b`, and `a * b ^ c` is `a * (b ^ c)`). The engine has
+    /// no `^` operator, so it lowers via [`bitwise_xor`].
+    fn bitxor_expr(&mut self) -> Result<ast::Expr> {
+        let mut lhs = self.collate_expr()?;
+        while self.eat(&Token::Other('^')) {
+            let rhs = self.collate_expr()?;
+            lhs = bitwise_xor(lhs, rhs);
         }
         Ok(lhs)
     }
@@ -6265,6 +6279,19 @@ fn modulo(a: ast::Expr, b: ast::Expr) -> ast::Expr {
     let quotient = integer_division(a.clone(), b.clone());
     let product = ast::Expr::binary(b, ast::Operator::Multiply, quotient);
     ast::Expr::binary(a, ast::Operator::Subtract, product)
+}
+
+/// Lowers MySQL's bitwise XOR `a ^ b`, which the engine has no operator for, to
+/// `(a & ~b) | (~a & b)` using the engine's `&` / `|` / `~`. This is bit-for-bit
+/// MySQL's result; like the other bitwise operators it prints as a signed
+/// integer where MySQL prints the unsigned 64-bit value, but small non-negative
+/// operands match (see `mysql/COMPAT.md`).
+fn bitwise_xor(a: ast::Expr, b: ast::Expr) -> ast::Expr {
+    let not = |e: ast::Expr| ast::Expr::unary(ast::UnaryOperator::BitwiseNot, e);
+    let and = |l: ast::Expr, r: ast::Expr| ast::Expr::binary(l, ast::Operator::BitwiseAnd, r);
+    let left = and(a.clone(), not(b.clone()));
+    let right = and(not(a), b);
+    ast::Expr::binary(left, ast::Operator::BitwiseOr, right)
 }
 
 /// Lowers MySQL's `a / b`, which is always float division (`5 / 2` is `2.5`, not
@@ -10392,14 +10419,20 @@ mod tests {
             )
         );
 
-        // `~` is supported (see `bitwise_not_is_a_tight_unary_prefix`); `^` (XOR)
-        // is still not modeled — the engine has no `^` operator — so `a ^ b` does
-        // not fully parse.
-        let mut p = Parser::new(b"a ^ b").unwrap();
-        assert!(
-            !(p.expr().is_ok() && p.peek().is_none()),
-            "expected `a ^ b` to be rejected"
-        );
+        // `^` (XOR) has no engine operator, so it lowers to `(a & ~b) | (~a & b)`.
+        let ast::Expr::Binary(left, BitwiseOr, right) = parse_expr("a ^ b").unwrap() else {
+            panic!("expected `a ^ b` to lower to a BitwiseOr of two BitwiseAnd terms");
+        };
+        assert!(matches!(left.as_ref(), ast::Expr::Binary(_, BitwiseAnd, _)));
+        assert!(matches!(right.as_ref(), ast::Expr::Binary(_, BitwiseAnd, _)));
+
+        // `^` binds tighter than `*` (`a * b ^ c` is `a * (b ^ c)`).
+        let ast::Expr::Binary(_, ast::Operator::Multiply, rhs) = parse_expr("a * b ^ c").unwrap()
+        else {
+            panic!("expected a multiplication at the top of `a * b ^ c`");
+        };
+        // The right operand is the XOR lowering (a BitwiseOr), not a bare column.
+        assert!(matches!(rhs.as_ref(), ast::Expr::Binary(_, BitwiseOr, _)));
     }
 
     #[test]

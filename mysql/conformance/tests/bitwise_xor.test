@@ -1,0 +1,44 @@
+# The bitwise XOR operator `^`.
+#
+# MySQL's `a ^ b` is bitwise exclusive-or. The engine has no `^` operator, so the
+# front-end lowers it to `(a & ~b) | (~a & b)` using the engine's & / | / ~ --
+# bit-for-bit MySQL's result. Like the other bitwise operators it prints as a
+# signed integer where MySQL prints the unsigned 64-bit value, but small
+# non-negative operands match. `^` binds tighter than `*` and looser than the
+# unary prefixes, as in MySQL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Basic XOR over literals.
+query
+SELECT 5 ^ 3, 255 ^ 0, 7 ^ 7, 0 ^ 12
+----
+6	255	0	12
+
+# `^` binds tighter than `*` (2 * (3 ^ 1) = 4) and is left-associative
+# ((1 ^ 2) ^ 3 = 0).
+query
+SELECT 2 * 3 ^ 1, 1 ^ 2 ^ 3
+----
+4	0
+
+# `^` binds tighter than binary `+` and than `&`.
+query
+SELECT 5 ^ 3 + 1, 5 ^ 3 & 1
+----
+7	0
+
+# Over columns.
+statement ok
+CREATE TABLE IF NOT EXISTS bx (id INT PRIMARY KEY, a INT, b INT)
+
+statement ok
+INSERT INTO bx (id, a, b) VALUES (1, 5, 3), (2, 12, 10), (3, 6, 6)
+
+query
+SELECT id, a ^ b FROM bx ORDER BY id
+----
+1	6
+2	6
+3	0
