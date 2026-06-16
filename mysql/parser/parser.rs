@@ -3620,6 +3620,12 @@ impl Parser {
             return self.atan_call();
         }
 
+        // `COT(x)` (cotangent) has no engine builtin; lower it to `1 / tan(x)`
+        // (see `cot_call`).
+        if upper == "COT" {
+            return self.cot_call();
+        }
+
         // `CHAR(n, ...)` builds a string from character codes, mapping to the
         // engine's `char()` (see `char_call`).
         if upper == "CHAR" {
@@ -4676,6 +4682,23 @@ impl Parser {
             self.expect(&Token::RParen, "`)`")?;
             Ok(unary_fn("atan", first))
         }
+    }
+
+    /// Parses MySQL `COT(x)` (the name and `(` are already consumed) and lowers
+    /// the cotangent to `1 / tan(x)` — the engine has `tan` but no `cot`. The
+    /// engine's real division yields a float (the literal `1` is promoted), and a
+    /// NULL argument makes `tan(x)` NULL, so the quotient is NULL as in MySQL.
+    /// (`COT(0)` divides by zero; MySQL raises an out-of-range error there, while
+    /// the engine yields its own division-by-zero result — an edge that is not
+    /// reached in practice.)
+    fn cot_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(ast::Expr::binary(
+            ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+            ast::Operator::Divide,
+            unary_fn("tan", arg),
+        ))
     }
 
     /// Parses a `LEFT(str, len)` call (the name and `(` are already consumed)
@@ -11531,6 +11554,19 @@ mod tests {
         };
         assert_eq!(name.as_str(), "atan2");
         assert_eq!(args.len(), 2);
+
+        // COT(x) has no engine builtin, so it lowers to 1 / tan(x).
+        let ast::Expr::Binary(one, ast::Operator::Divide, tan) = parse_expr("COT(x)").unwrap()
+        else {
+            panic!("expected COT to lower to a division");
+        };
+        assert_eq!(*one, num("1"));
+        let ast::Expr::FunctionCall { name, args, .. } = tan.as_ref() else {
+            panic!("expected the divisor to be tan(x)");
+        };
+        assert_eq!(name.as_str(), "tan");
+        assert_eq!(args.len(), 1);
+        assert_eq!(*args[0], col("x"));
     }
 
     #[test]
