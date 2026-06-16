@@ -4252,6 +4252,12 @@ impl Parser {
             return self.substring_call();
         }
 
+        // `SUBSTRING_INDEX(str, delim, count)` returns the part of `str` before
+        // the count-th occurrence of `delim` (see `substring_index_call`).
+        if upper == "SUBSTRING_INDEX" {
+            return self.substring_index_call();
+        }
+
         // `GROUP_CONCAT(expr [SEPARATOR 's'])` maps to the engine's
         // `group_concat(expr[, 's'])`, which uses the same default `,` separator.
         if upper == "GROUP_CONCAT" {
@@ -5382,6 +5388,68 @@ impl Parser {
         };
         self.expect(&Token::RParen, "`)`")?;
         Ok(guarded_substr(target, pos, len))
+    }
+
+    /// Parses `SUBSTRING_INDEX(str, delim, count)` (the name and `(` already
+    /// consumed) and lowers it to the part of `str` around the count-th
+    /// occurrence of `delim`. `count = 1` returns the part before the first
+    /// delimiter (`SUBSTRING_INDEX('a.b.c', '.', 1)` → `a`), `count = -1` the part
+    /// after the last (→ `c`), and `count = 0` is the empty string; if the
+    /// delimiter is absent, the whole string is returned. The delimiter match is
+    /// case-sensitive, as in MySQL. NULL arguments propagate.
+    ///
+    /// The `count = 1` case lowers to `CASE WHEN instr(str, delim) = 0 THEN str
+    /// ELSE substr(str, 1, instr(str, delim) - 1) END`, and `count = -1` applies
+    /// that to the reversed string and delimiter and reverses the result back.
+    ///
+    /// `count` must be an integer literal with `|count| <= 1`. A larger count
+    /// would have to count to the n-th delimiter, which has no bounded
+    /// closed-form expression — only an unrolled one whose size grows with the
+    /// count — and the engine's evaluator overflows its stack on the resulting
+    /// deep expression (especially once such calls are nested), so a larger or
+    /// runtime count is rejected rather than risking a crash (see
+    /// `mysql/COMPAT.md`). (Divergence: like the engine's other string lowerings,
+    /// `instr`/`length`/`substr` work on characters, so a multi-byte delimiter is
+    /// matched per character rather than per byte as MySQL does.)
+    fn substring_index_call(&mut self) -> Result<ast::Expr> {
+        let s = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let delim = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let negative = self.eat(&Token::Minus);
+        let Some(Token::Num(raw)) = self.peek() else {
+            return Err(self.unexpected("an integer literal count"));
+        };
+        let raw = raw.clone();
+        self.advance();
+        self.expect(&Token::RParen, "`)`")?;
+
+        let magnitude: i64 = raw.trim().parse().map_err(|_| {
+            ParseError::Unsupported(
+                "SUBSTRING_INDEX count must be an integer literal".to_string(),
+            )
+        })?;
+        // `count = 0` is the empty string.
+        if magnitude == 0 {
+            return Ok(ast::Expr::Literal(ast::Literal::String(requote(""))));
+        }
+        if magnitude != 1 {
+            return Err(ParseError::Unsupported(
+                "SUBSTRING_INDEX with |count| > 1 is not supported yet".to_string(),
+            ));
+        }
+
+        if negative {
+            // SUBSTRING_INDEX(s, d, -1) == reverse(SUBSTRING_INDEX(reverse(s),
+            // reverse(d), 1)) — the field after the last delimiter.
+            let before = substring_index_before_first(
+                unary_fn("string_reverse", s),
+                unary_fn("string_reverse", delim),
+            );
+            Ok(unary_fn("string_reverse", before))
+        } else {
+            Ok(substring_index_before_first(s, delim))
+        }
     }
 
     /// Parses a `GROUP_CONCAT([DISTINCT] expr [SEPARATOR 's'])` call (the name and
@@ -7816,6 +7884,29 @@ fn comma_wrapped_lower(x: ast::Expr) -> ast::Expr {
         comma(),
     );
     call_fn("lower", vec![wrapped])
+}
+
+/// Builds the `SUBSTRING_INDEX(s, d, 1)` lowering — the part of `s` before the
+/// first occurrence of `d`, or the whole of `s` when `d` is absent:
+/// `CASE WHEN instr(s, d) = 0 THEN s ELSE substr(s, 1, instr(s, d) - 1) END`.
+/// `instr` is the engine's case-sensitive search (matching MySQL's delimiter
+/// match), and a NULL argument propagates (the `instr`/`substr` are NULL). The
+/// `count = -1` form reverses `s` and `d`, takes this prefix, and reverses back.
+fn substring_index_before_first(s: ast::Expr, d: ast::Expr) -> ast::Expr {
+    let pos = || call_fn("instr", vec![s.clone(), d.clone()]);
+    // first = substr(s, 1, instr(s, d) - 1) — the part before the first delim.
+    let first = substr_fn(
+        s.clone(),
+        *numeric_expr("1"),
+        ast::Expr::binary(pos(), ast::Operator::Subtract, *numeric_expr("1")),
+    );
+    // The guard: no delimiter (`instr = 0`) returns the whole string.
+    let no_delim = ast::Expr::binary(pos(), ast::Operator::Equals, *numeric_expr("0"));
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(no_delim), Box::new(s))],
+        else_expr: Some(Box::new(first)),
+    }
 }
 
 /// Builds `substr(s, start, len)`.
@@ -13789,6 +13880,47 @@ mod tests {
             *args[2],
             ast::Expr::Literal(ast::Literal::String("'\\Z'".to_string()))
         );
+    }
+
+    #[test]
+    fn substring_index_lowers_to_guarded_substr() {
+        // SUBSTRING_INDEX(s, '.', 1) -> CASE WHEN instr(s,'.')=0 THEN s
+        //                                    ELSE substr(s, 1, instr(s,'.')-1) END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("SUBSTRING_INDEX(s, '.', 1)").unwrap()
+        else {
+            panic!("expected SUBSTRING_INDEX to lower to a CASE");
+        };
+        assert!(base.is_none());
+        // The guard returns the whole string when there is no delimiter.
+        assert_eq!(when_then_pairs.len(), 1);
+        assert_eq!(*when_then_pairs[0].1, col("s"));
+        // The ELSE is substr(s, 1, ...).
+        let else_branch = else_expr.unwrap();
+        let ast::Expr::FunctionCall { name, .. } = else_branch.as_ref() else {
+            panic!("expected the ELSE to be a substr() call");
+        };
+        assert_eq!(name.as_str(), "substr");
+
+        // The `-1` form reverses, takes the prefix, and reverses back.
+        let ast::Expr::FunctionCall { name, .. } =
+            parse_expr("SUBSTRING_INDEX(s, '.', -1)").unwrap()
+        else {
+            panic!("expected the -1 form to lower to a string_reverse() call");
+        };
+        assert_eq!(name.as_str(), "string_reverse");
+
+        // count = 0 is the empty string; a literal is required and |count| <= 1.
+        assert_eq!(
+            parse_expr("SUBSTRING_INDEX(s, '.', 0)").unwrap(),
+            ast::Expr::Literal(ast::Literal::String("''".to_string()))
+        );
+        assert!(parse_expr("SUBSTRING_INDEX(s, '.', 2)").is_err());
+        assert!(parse_expr("SUBSTRING_INDEX(s, '.', -3)").is_err());
+        assert!(parse_expr("SUBSTRING_INDEX(s, '.', n)").is_err());
     }
 
     #[test]

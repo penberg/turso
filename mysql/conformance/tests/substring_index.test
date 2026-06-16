@@ -1,0 +1,67 @@
+# SUBSTRING_INDEX(str, delim, count) — the substring around a delimiter.
+#
+# MySQL's SUBSTRING_INDEX returns the part of `str` before the count-th delimiter
+# (count > 0, from the left) or after it (count < 0, from the right); count = 0 is
+# the empty string, and an absent delimiter returns the whole string. The match
+# is case-sensitive. The front-end supports the two most common forms, `count =
+# 1` (everything before the first delimiter — e.g. the user part of an email) and
+# `count = -1` (everything after the last — e.g. a domain or a path's last
+# segment), lowered to `CASE`/`instr`/`substr` (the `-1` form over the reversed
+# string and delimiter).
+#
+# `count` must be an integer literal with `|count| <= 1`: counting to the n-th
+# delimiter has no bounded closed-form lowering, only an unrolled one deep enough
+# to overflow the engine's evaluator stack, so a larger or runtime count is
+# rejected (see mysql/COMPAT.md) rather than risking a crash.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# count = 1 takes the part before the first delimiter; count = -1, after the last.
+query
+SELECT SUBSTRING_INDEX('a.b.c.d', '.', 1), SUBSTRING_INDEX('a.b.c.d', '.', -1)
+----
+a	d
+
+# The canonical uses: split an email and take a path's final segment.
+query
+SELECT SUBSTRING_INDEX('user@example.com', '@', 1), SUBSTRING_INDEX('user@example.com', '@', -1)
+----
+user	example.com
+
+query
+SELECT SUBSTRING_INDEX('/var/www/html/index.php', '/', -1)
+----
+index.php
+
+# A multi-character delimiter works, matched case-sensitively (lowercase 'x' does
+# not match the uppercase 'X', so the whole string is returned).
+query
+SELECT SUBSTRING_INDEX('x::y::z', '::', 1), SUBSTRING_INDEX('aXbXc', 'x', 1)
+----
+x	aXbXc
+
+# An absent delimiter returns the whole string; count = 0 is the empty string
+# (wrapped in brackets so the empty value is visible).
+query
+SELECT SUBSTRING_INDEX('nodelim', '.', 1), SUBSTRING_INDEX('nodelim', '.', -1), CONCAT('[', SUBSTRING_INDEX('a.b', '.', 0), ']')
+----
+nodelim	nodelim	[]
+
+# A NULL string or delimiter propagates to NULL.
+query
+SELECT SUBSTRING_INDEX(NULL, '.', 1), SUBSTRING_INDEX('a.b.c', NULL, -1)
+----
+NULL	NULL
+
+statement ok
+CREATE TABLE subidx_t (id INT PRIMARY KEY, email VARCHAR(40))
+
+statement ok
+INSERT INTO subidx_t VALUES (1, 'alice@example.com'), (2, 'bob@test.org')
+
+# Applied to a column: split the local part and the domain.
+query
+SELECT id, SUBSTRING_INDEX(email, '@', 1), SUBSTRING_INDEX(email, '@', -1) FROM subidx_t ORDER BY id
+----
+1	alice	example.com
+2	bob	test.org
