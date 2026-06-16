@@ -4101,6 +4101,15 @@ impl Parser {
             return self.quote_call();
         }
 
+        // `UUID_TO_BIN(uuid[, swap])` / `BIN_TO_UUID(bin[, swap])` convert between
+        // a dashed UUID string and its 16-byte form (see `uuid_bin_call`).
+        if upper == "UUID_TO_BIN" {
+            return self.uuid_bin_call(true);
+        }
+        if upper == "BIN_TO_UUID" {
+            return self.uuid_bin_call(false);
+        }
+
         // `ASCII(str)` / `ORD(str)` return the code point of the first character,
         // mapping to the engine's `unicode()` with MySQL's edge cases restored
         // (see `ascii_call`).
@@ -4740,6 +4749,111 @@ impl Parser {
             )],
             else_expr: Some(Box::new(wrapped)),
         })
+    }
+
+    /// Parses `UUID_TO_BIN(uuid[, swap])` (`to_bin` true) or `BIN_TO_UUID(bin[,
+    /// swap])` (`to_bin` false) — the name and `(` already consumed — and lowers
+    /// the conversion between a dashed 36-character UUID string and its packed
+    /// 16-byte form.
+    ///
+    /// `UUID_TO_BIN(u)` is `unhex(replace(u, '-', ''))` — the dashes stripped and
+    /// the 32 hex digits decoded to bytes. `BIN_TO_UUID(b)` is the inverse, the
+    /// 32 hex digits of `b` regrouped `8-4-4-4-12` and lower-cased. The optional
+    /// `swap` flag (a literal; non-zero swaps, as in MySQL) reorders the first
+    /// three time fields — `time-low`, `time-mid`, `time-high` become
+    /// `time-high`, `time-mid`, `time-low` — which makes time-ordered UUIDs sort
+    /// by their binary form. A NULL argument propagates. The `swap` flag must be an
+    /// integer literal (the lowering it selects is fixed at translation time).
+    fn uuid_bin_call(&mut self, to_bin: bool) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        // The optional second argument is the swap flag, a literal whose value
+        // picks the field order at translation time.
+        let swap = if self.eat(&Token::Comma) {
+            // A leading `-` is accepted but irrelevant: any non-zero value swaps.
+            self.eat(&Token::Minus);
+            let Some(Token::Num(n)) = self.peek() else {
+                return Err(self.unexpected("an integer literal UUID swap flag"));
+            };
+            let value: i64 = n.trim().parse().map_err(|_| {
+                ParseError::Unsupported("UUID swap flag must be an integer literal".to_string())
+            })?;
+            self.advance();
+            value != 0
+        } else {
+            false
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        let str_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+        // A `start, len` slice of the 32-hex-digit string.
+        let slice = |s: &ast::Expr, start: &str, len: &str| {
+            substr_fn(s.clone(), *numeric_expr(start), *numeric_expr(len))
+        };
+        let concat = |parts: Vec<ast::Expr>| {
+            parts
+                .into_iter()
+                .reduce(|acc, p| ast::Expr::binary(acc, ast::Operator::Concat, p))
+                .expect("at least one part")
+        };
+
+        if to_bin {
+            // h = replace(uuid, '-', '') — the 32 hex digits.
+            let h = call_fn("replace", vec![arg, str_lit("-"), str_lit("")]);
+            let hex = if swap {
+                // time-high (13,4) | time-mid (9,4) | time-low (1,8) | rest (17,16).
+                concat(vec![
+                    slice(&h, "13", "4"),
+                    slice(&h, "9", "4"),
+                    slice(&h, "1", "8"),
+                    slice(&h, "17", "16"),
+                ])
+            } else {
+                h
+            };
+            Ok(call_fn("unhex", vec![hex]))
+        } else {
+            // x = hex(bin) — the 32 hex digits, in the stored (possibly swapped)
+            // order. The engine's `hex(NULL)` is the empty string rather than
+            // NULL, so a guard restores MySQL's NULL-propagating result.
+            let null_guard = ast::Expr::is_null(arg.clone());
+            let x = call_fn("hex", vec![arg]);
+            let dash = || str_lit("-");
+            let groups = if swap {
+                // Undo the swap: time-low is at 9..16, time-high at 1..4.
+                vec![
+                    slice(&x, "9", "8"),
+                    dash(),
+                    slice(&x, "5", "4"),
+                    dash(),
+                    slice(&x, "1", "4"),
+                    dash(),
+                    slice(&x, "17", "4"),
+                    dash(),
+                    slice(&x, "21", "12"),
+                ]
+            } else {
+                vec![
+                    slice(&x, "1", "8"),
+                    dash(),
+                    slice(&x, "9", "4"),
+                    dash(),
+                    slice(&x, "13", "4"),
+                    dash(),
+                    slice(&x, "17", "4"),
+                    dash(),
+                    slice(&x, "21", "12"),
+                ]
+            };
+            let formatted = call_fn("lower", vec![concat(groups)]);
+            Ok(ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(null_guard),
+                    Box::new(ast::Expr::Literal(ast::Literal::Null)),
+                )],
+                else_expr: Some(Box::new(formatted)),
+            })
+        }
     }
 
     /// Parses an `ASCII(str)` / `ORD(str)` call (the name and `(` are already
@@ -14101,6 +14215,52 @@ mod tests {
             *args[2],
             ast::Expr::Literal(ast::Literal::String("'\\Z'".to_string()))
         );
+    }
+
+    #[test]
+    fn uuid_to_bin_and_bin_to_uuid_lower_to_hex_surgery() {
+        // UUID_TO_BIN(u) -> unhex(replace(u, '-', '')).
+        let ast::Expr::FunctionCall { name, args, .. } =
+            parse_expr("UUID_TO_BIN(u)").unwrap()
+        else {
+            panic!("expected UUID_TO_BIN to lower to a function call");
+        };
+        assert_eq!(name.as_str(), "unhex");
+        let ast::Expr::FunctionCall { name: inner, .. } = args[0].as_ref() else {
+            panic!("expected unhex(replace(...))");
+        };
+        assert_eq!(inner.as_str(), "replace");
+
+        // The swap form reorders the hex groups, so the unhex argument is a
+        // concatenation rather than the bare replace().
+        let ast::Expr::FunctionCall { args: swap_args, .. } =
+            parse_expr("UUID_TO_BIN(u, 1)").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        assert!(matches!(
+            swap_args[0].as_ref(),
+            ast::Expr::Binary(_, ast::Operator::Concat, _)
+        ));
+
+        // BIN_TO_UUID(b) -> CASE WHEN b IS NULL THEN NULL ELSE lower(...) END.
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("BIN_TO_UUID(b)").unwrap()
+        else {
+            panic!("expected BIN_TO_UUID to lower to a guarded CASE");
+        };
+        assert_eq!(*when_then_pairs[0].0, ast::Expr::is_null(col("b")));
+        let else_branch = else_expr.unwrap();
+        let ast::Expr::FunctionCall { name, .. } = else_branch.as_ref() else {
+            panic!("expected the ELSE to be lower(...)");
+        };
+        assert_eq!(name.as_str(), "lower");
+
+        // The swap flag must be an integer literal.
+        assert!(parse_expr("UUID_TO_BIN(u, n)").is_err());
     }
 
     #[test]

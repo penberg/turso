@@ -1,0 +1,47 @@
+# UUID_TO_BIN / BIN_TO_UUID — convert between a dashed UUID and its 16 bytes.
+#
+# MySQL's UUID_TO_BIN(uuid) packs a 36-character dashed UUID into 16 bytes, and
+# BIN_TO_UUID(bin) renders the bytes back as a dashed string. The optional swap
+# flag (non-zero) reorders the first three time fields so that time-ordered UUIDs
+# sort by their binary form. Plugins that store UUIDs as BINARY(16) use these. The
+# front-end lowers UUID_TO_BIN to unhex(replace(uuid, '-', '')) (the swap form
+# reorders the hex groups first) and BIN_TO_UUID to the inverse hex regrouping.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# Pack a UUID to its 16 bytes (shown as hex), without and with the field swap.
+query
+SELECT HEX(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db')), HEX(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db', 1))
+----
+6CCD780CBABA102695645B8C656024DB	1026BABA6CCD780C95645B8C656024DB
+
+# Render bytes back to a dashed string, without and with the swap (the swapped
+# bytes regroup to the original UUID).
+query
+SELECT BIN_TO_UUID(UNHEX('6CCD780CBABA102695645B8C656024DB')), BIN_TO_UUID(UNHEX('1026BABA6CCD780C95645B8C656024DB'), 1)
+----
+6ccd780c-baba-1026-9564-5b8c656024db	6ccd780c-baba-1026-9564-5b8c656024db
+
+# The no-swap pair round-trips a UUID through its binary form.
+query
+SELECT BIN_TO_UUID(UUID_TO_BIN('00112233-4455-6677-8899-aabbccddeeff'))
+----
+00112233-4455-6677-8899-aabbccddeeff
+
+# A NULL argument propagates to NULL on both functions.
+query
+SELECT BIN_TO_UUID(NULL), HEX(UUID_TO_BIN(NULL))
+----
+NULL	NULL
+
+statement ok
+CREATE TABLE uuidbin_t (id INT PRIMARY KEY, g BINARY(16))
+
+statement ok
+INSERT INTO uuidbin_t VALUES (1, UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'))
+
+# Stored as 16 bytes in a BINARY(16) column and read back as a UUID string.
+query
+SELECT id, BIN_TO_UUID(g) FROM uuidbin_t WHERE id = 1
+----
+1	6ccd780c-baba-1026-9564-5b8c656024db
