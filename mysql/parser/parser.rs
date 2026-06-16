@@ -3816,6 +3816,12 @@ impl Parser {
             return self.week_call();
         }
 
+        // `YEARWEEK(d[, mode])` combines the week-owning year and the week number
+        // into `year * 100 + week` (see `yearweek_call`).
+        if upper == "YEARWEEK" {
+            return self.yearweek_call();
+        }
+
         // `DAYNAME(d)` / `MONTHNAME(d)` map the weekday / month to its English
         // name via a CASE over `strftime`.
         if upper == "DAYNAME" {
@@ -5603,6 +5609,95 @@ impl Parser {
             }
         };
         Ok(strftime_int(fmt, arg))
+    }
+
+    /// Lowers `YEARWEEK(d[, mode])` (the name and `(` are already consumed) to the
+    /// `year * 100 + week` value MySQL returns, where the year is the one that
+    /// *owns* the week (which differs from the calendar year for a week that
+    /// straddles a year boundary). The supported modes mirror [`Self::week_call`].
+    ///
+    /// Modes 1 and 3 are the ISO year-week: `strftime('%G', d) * 100 +
+    /// strftime('%V', d)`. ISO `%G` already attributes a straddling week to the
+    /// right year, and YEARWEEK never has a week 0, so the two modes coincide.
+    ///
+    /// Modes 0 (Sunday weeks, `%U`) and 5 (Monday weeks, `%W`) number within the
+    /// calendar year. YEARWEEK pushes a date in "week 0" — before the year's first
+    /// numbered week — into the previous year's last week: when the week number is
+    /// 0, the result is `(year - 1) * 100 + <that week's number>`, taken as the
+    /// week number of the previous year's last day (`date(d, 'start of year',
+    /// '-1 day')`). A NULL argument propagates.
+    fn yearweek_call(&mut self) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        let mode = if self.eat(&Token::Comma) {
+            match self.expr()? {
+                ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<i64>().map_err(|_| {
+                    ParseError::Unsupported("YEARWEEK() mode must be an integer literal".to_string())
+                })?,
+                _ => {
+                    return Err(ParseError::Unsupported(
+                        "YEARWEEK() mode must be an integer literal".to_string(),
+                    ))
+                }
+            }
+        } else {
+            0
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        if mode == 1 || mode == 3 {
+            let year = ast::Expr::binary(
+                strftime_int("%G", arg.clone()),
+                ast::Operator::Multiply,
+                *numeric_expr("100"),
+            );
+            return Ok(ast::Expr::binary(
+                year,
+                ast::Operator::Add,
+                strftime_int("%V", arg),
+            ));
+        }
+
+        let code = match mode {
+            0 => "%U",
+            5 => "%W",
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "YEARWEEK() mode {other} is not supported yet \
+                     (only modes 0, 1, 3, and 5 map to an engine week number)"
+                )))
+            }
+        };
+        let year = strftime_int("%Y", arg.clone());
+        let week = strftime_int(code, arg.clone());
+        let prev_year_end = call_fn(
+            "date",
+            vec![
+                arg,
+                ast::Expr::Literal(ast::Literal::String(requote("start of year"))),
+                ast::Expr::Literal(ast::Literal::String(requote("-1 day"))),
+            ],
+        );
+        let prev_week = strftime_int(code, prev_year_end);
+        let this_yw = ast::Expr::binary(
+            ast::Expr::binary(year.clone(), ast::Operator::Multiply, *numeric_expr("100")),
+            ast::Operator::Add,
+            week.clone(),
+        );
+        let prev_yw = ast::Expr::binary(
+            ast::Expr::binary(
+                ast::Expr::binary(year, ast::Operator::Subtract, *numeric_expr("1")),
+                ast::Operator::Multiply,
+                *numeric_expr("100"),
+            ),
+            ast::Operator::Add,
+            prev_week,
+        );
+        let is_week_zero = ast::Expr::binary(week, ast::Operator::Equals, *numeric_expr("0"));
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(Box::new(is_week_zero), Box::new(prev_yw))],
+            else_expr: Some(Box::new(this_yw)),
+        })
     }
 
     /// Parses `DATE_ADD(x, INTERVAL n unit)` (or `DATE_SUB`, when `subtract` is
@@ -10962,6 +11057,54 @@ mod tests {
         };
         assert_eq!(name.as_str(), "strftime");
         assert!(matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%V'"));
+    }
+
+    #[test]
+    fn yearweek_lowers_by_mode() {
+        // Modes 1 and 3 are the ISO year-week: %G * 100 + %V (an addition whose
+        // left side multiplies the ISO year by 100).
+        for sql in ["YEARWEEK(d, 1)", "YEARWEEK(d, 3)"] {
+            let ast::Expr::Binary(year, ast::Operator::Add, week) = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to be `year + week`");
+            };
+            let ast::Expr::Binary(g, ast::Operator::Multiply, hundred) = year.as_ref() else {
+                panic!("expected `%G * 100` for `{sql}`");
+            };
+            assert!(matches!(hundred.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "100"));
+            // %G inside the cast.
+            let ast::Expr::Cast { expr, .. } = g.as_ref() else { panic!("expected a cast") };
+            let ast::Expr::FunctionCall { args, .. } = expr.as_ref() else { unreachable!() };
+            assert!(matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%G'"));
+            // %V week on the right.
+            let ast::Expr::Cast { expr, .. } = week.as_ref() else { panic!("expected a cast") };
+            let ast::Expr::FunctionCall { args, .. } = expr.as_ref() else { unreachable!() };
+            assert!(matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%V'"));
+        }
+
+        // Modes 0 (default, %U) and 5 (%W) lower to a CASE with the week-zero
+        // backward-push guard.
+        for (sql, code) in [("YEARWEEK(d)", "'%U'"), ("YEARWEEK(d, 0)", "'%U'"), ("YEARWEEK(d, 5)", "'%W'")] {
+            let ast::Expr::Case { when_then_pairs, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            // The guard is `week == 0`, week being CAST(strftime(code, d) AS INTEGER).
+            let ast::Expr::Binary(week, ast::Operator::Equals, zero) = when_then_pairs[0].0.as_ref()
+            else {
+                panic!("expected a `week = 0` guard for `{sql}`");
+            };
+            assert!(matches!(zero.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0"));
+            let ast::Expr::Cast { expr, .. } = week.as_ref() else { panic!("expected a cast") };
+            let ast::Expr::FunctionCall { args, .. } = expr.as_ref() else { unreachable!() };
+            assert!(
+                matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == code),
+                "wrong week code for `{sql}`"
+            );
+        }
+
+        // The unclean modes are rejected, as for WEEK.
+        for mode in [2, 4, 6, 7] {
+            assert!(parse_expr(&format!("YEARWEEK(d, {mode})")).is_err());
+        }
     }
 
     #[test]

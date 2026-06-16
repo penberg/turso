@@ -1,0 +1,68 @@
+# YEARWEEK(d[, mode]) conformance.
+#
+# MySQL's YEARWEEK returns year * 100 + week, where the year is the one that owns
+# the week (which differs from the calendar year for a week straddling a year
+# boundary, since YEARWEEK never has a week 0). The front-end mirrors WEEK's
+# supported modes:
+#   modes 1 and 3 -> the ISO year-week, strftime %G * 100 + %V (they coincide);
+#   mode 0 (Sunday weeks, %U) and mode 5 (Monday weeks, %W) number within the
+#   calendar year, pushing a "week 0" date into the previous year's last week.
+# Modes 2/4/6/7 are rejected, as for WEEK. NULL propagates.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (values from
+# MySQL 8.4), verified across 2014-2031. This test needs no tables.
+
+# A mid-year date: the default mode is 0, and mode 1 (ISO) can differ by a week.
+query
+SELECT YEARWEEK('2026-06-15'), YEARWEEK('2026-06-15', 0), YEARWEEK('2026-06-15', 1)
+----
+202624	202624	202625
+
+# Mode 0 (Sunday): Jan 1 2026 is in "week 0", so it belongs to 2025's last week
+# (52); the first Sunday (Jan 4) starts week 1; Dec 31 2025 is also that week 52.
+query
+SELECT YEARWEEK('2026-01-01', 0), YEARWEEK('2026-01-04', 0), YEARWEEK('2025-12-31', 0)
+----
+202552	202601	202552
+
+# Modes 1 and 3 are the ISO year-week and coincide; an early-January date can
+# belong to the previous ISO year (53rd or 52nd week).
+query
+SELECT YEARWEEK('2026-01-01', 1), YEARWEEK('2023-01-01', 3), YEARWEEK('2021-01-01', 1)
+----
+202601	202252	202053
+
+# Mode 1 and mode 3 give the same result.
+query
+SELECT YEARWEEK('2023-01-01', 1) = YEARWEEK('2023-01-01', 3), YEARWEEK('2021-01-01', 1) = YEARWEEK('2021-01-01', 3)
+----
+1	1
+
+# Mode 5 (Monday weeks): the week-0 backward push uses Monday-based numbering.
+query
+SELECT YEARWEEK('2026-01-01', 5), YEARWEEK('2026-01-05', 5), YEARWEEK('2023-01-01', 5)
+----
+202552	202601	202252
+
+# NULL propagates in every mode.
+query
+SELECT YEARWEEK(NULL) IS NULL, YEARWEEK(NULL, 1) IS NULL, YEARWEEK(NULL, 5) IS NULL
+----
+1	1	1
+
+# Modes without a clean engine week number are rejected.
+statement error
+SELECT YEARWEEK('2026-06-15', 2)
+
+# Usable over a column and in a GROUP BY (the archive-by-week shape).
+statement ok
+CREATE TABLE IF NOT EXISTS yw_demo (id INT PRIMARY KEY, d DATE)
+
+statement ok
+INSERT INTO yw_demo (id, d) VALUES (1, '2026-06-15'), (2, '2026-06-16'), (3, '2026-06-22')
+
+query
+SELECT YEARWEEK(d, 0) yw, COUNT(*) FROM yw_demo GROUP BY yw ORDER BY yw
+----
+202624	2
+202625	1
