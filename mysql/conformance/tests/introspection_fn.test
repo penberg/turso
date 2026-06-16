@@ -3,16 +3,17 @@
 #
 # These return server/connection metadata. The front-end answered a few as
 # standalone queries (e.g. `SELECT VERSION()`); this makes them usable inside
-# any expression too. The values are server-specific and the front-end's are
+# any expression too. Most values are server-specific and the front-end's are
 # fixed placeholders (see mysql/COMPAT.md), so these checks assert only portable
 # properties that hold on both turso-mysql-server and a real mysqld.
 
-# DATABASE() is NULL when no schema is selected (the conformance connection has
-# none), usable inside IS NULL.
+# DATABASE() / SCHEMA() report the connection's current database. The conformance
+# connection selects one, so it is non-NULL and the two are the same; it is
+# usable mid-expression (here wrapped in LENGTH and an equality).
 query
-SELECT DATABASE() IS NULL
+SELECT DATABASE() IS NOT NULL, LENGTH(DATABASE()) > 0, DATABASE() = SCHEMA()
 ----
-1
+1	1	1
 
 # CONNECTION_ID() is a positive integer, usable in a comparison.
 query

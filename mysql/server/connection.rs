@@ -140,7 +140,9 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
     // `SELECT @@SESSION.sql_mode`. Empty until the client sets it.
     let mut sql_mode = String::new();
 
-    perform_handshake(&mut wire, connection_id)?;
+    // The connection's current database (from the handshake or a later `USE`),
+    // reported by `DATABASE()` / `SCHEMA()`.
+    let mut current_db = perform_handshake(&mut wire, connection_id)?;
 
     loop {
         let Some(packet) = wire.read_packet()? else {
@@ -156,12 +158,21 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
             Command::Ping => {
                 send_packet(&mut wire, seq, &OkPacket::default().encode())?;
             }
-            Command::InitDb(_db) => {
-                // Turso has a single schema; acknowledge the switch.
+            Command::InitDb(db) => {
+                // Turso has a single underlying schema, but remember the name so
+                // `DATABASE()` reports it; acknowledge the switch.
+                current_db = Some(db);
                 send_packet(&mut wire, seq, &OkPacket::default().encode())?;
             }
             Command::Query(sql) => {
-                let response = run_query(&conn, &sql, seq, &mut found_rows, &mut sql_mode);
+                let response = run_query(
+                    &conn,
+                    &sql,
+                    seq,
+                    &mut found_rows,
+                    &mut sql_mode,
+                    current_db.as_deref(),
+                );
                 wire.write_frames(&response)?;
             }
             Command::StmtPrepare(sql) => {
@@ -197,7 +208,9 @@ pub fn handle(server: Arc<Server>, stream: TcpStream, connection_id: u32) -> any
 
 /// Sends the greeting, reads the client's response, and acknowledges it. We do
 /// not yet verify credentials — any login is accepted.
-fn perform_handshake(wire: &mut Wire, connection_id: u32) -> anyhow::Result<()> {
+/// Performs the connection handshake and returns the initial database the client
+/// selected (`CLIENT_CONNECT_WITH_DB`), if any — used so `DATABASE()` reports it.
+fn perform_handshake(wire: &mut Wire, connection_id: u32) -> anyhow::Result<Option<String>> {
     let scramble = scramble_for(connection_id);
     let greeting = HandshakeV10::new("8.0.0-turso", connection_id, scramble);
     send_packet(wire, 0, &greeting.encode())?;
@@ -212,7 +225,7 @@ fn perform_handshake(wire: &mut Wire, connection_id: u32) -> anyhow::Result<()> 
     // OK continues at 2.
     let seq = response_packet.seq.wrapping_add(1);
     send_packet(wire, seq, &OkPacket::default().encode())?;
-    Ok(())
+    Ok(response.database)
 }
 
 /// Frames `payload` with `seq` and writes it.
@@ -234,6 +247,7 @@ fn run_query(
     first_seq: u8,
     found_rows: &mut u64,
     sql_mode: &mut String,
+    current_db: Option<&str>,
 ) -> Vec<u8> {
     debug!(%sql, "COM_QUERY");
 
@@ -290,7 +304,7 @@ fn run_query(
         };
     }
 
-    let mut stmts = match turso_mysql_parser::parse_all(sql) {
+    let mut stmts = match turso_mysql_parser::parse_all_in_db(sql, current_db) {
         Ok(stmts) => stmts,
         Err(e) => return parse_error_response(first_seq, &e),
     };

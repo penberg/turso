@@ -49,3 +49,11 @@ pub fn parse(sql: &str) -> Result<ast::Stmt> {
 pub fn parse_all(sql: &str) -> Result<Vec<ast::Stmt>> {
     Parser::new(sql.as_bytes())?.parse_statement_list()
 }
+
+/// Like [`parse_all`], but with the connection's current database name so
+/// `DATABASE()`/`SCHEMA()` fold to it instead of `NULL` (`None` → `NULL`).
+pub fn parse_all_in_db(sql: &str, current_db: Option<&str>) -> Result<Vec<ast::Stmt>> {
+    Parser::new(sql.as_bytes())?
+        .with_current_database(current_db.map(str::to_owned))
+        .parse_statement_list()
+}

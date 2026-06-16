@@ -41,6 +41,9 @@ pub struct Parser {
     /// secondary `KEY`/`INDEX` definitions (the engine's `CREATE TABLE` has no
     /// inline secondary index), drained after the table by `statement_list`.
     pending_indexes: Vec<ast::Stmt>,
+    /// The connection's current database name, threaded in from the server
+    /// session so `DATABASE()`/`SCHEMA()` fold to it (`None` → `NULL`).
+    current_db: Option<String>,
 }
 
 impl Parser {
@@ -59,7 +62,16 @@ impl Parser {
             upsert_row_alias: None,
             upsert_col_aliases: Vec::new(),
             pending_indexes: Vec::new(),
+            current_db: None,
         })
+    }
+
+    /// Sets the connection's current database name (from the server session), so
+    /// `DATABASE()`/`SCHEMA()` fold to it rather than `NULL`. Returns `self` for
+    /// chaining after [`Self::new`].
+    pub fn with_current_database(mut self, db: Option<String>) -> Self {
+        self.current_db = db;
+        self
     }
 
     /// Parses exactly one statement, then ensures only trailing semicolons
@@ -4647,8 +4659,20 @@ impl Parser {
             return self.from_unixtime_call();
         }
 
-        // Server/connection introspection functions (`VERSION()`, `DATABASE()`,
-        // ...) fold to the same canned literal the server reports for the
+        // `DATABASE()` / `SCHEMA()` fold to the connection's current database
+        // name (threaded in from the server session), or `NULL` when none is
+        // selected, matching MySQL. Works inside a larger expression too.
+        if upper == "DATABASE" || upper == "SCHEMA" {
+            self.expect(&Token::RParen, "`)`")?;
+            let literal = match &self.current_db {
+                Some(db) => ast::Literal::String(requote(db)),
+                None => ast::Literal::Null,
+            };
+            return Ok(ast::Expr::Literal(literal));
+        }
+
+        // Other server/connection introspection functions (`VERSION()`,
+        // `USER()`, ...) fold to the canned literal the server reports for the
         // standalone forms, so they also work inside larger expressions. They
         // take no arguments.
         if let Some(literal) = introspection_literal(&upper) {
@@ -9783,12 +9807,12 @@ fn strftime_text(fmt: &str, arg: ast::Expr) -> ast::Expr {
 /// The canned literal a server/connection introspection function folds to, or
 /// `None` if `upper_name` is not one. The values mirror the standalone-query
 /// answers in the server's `session` module (placeholder server identity — see
-/// `mysql/COMPAT.md`); `DATABASE()`/`SCHEMA()` are genuinely `NULL` because the
-/// front-end has no current schema. `upper_name` must already be uppercased.
+/// `mysql/COMPAT.md`). `DATABASE()`/`SCHEMA()` are handled by the caller (they
+/// fold to the session's current database, not a constant). `upper_name` must
+/// already be uppercased.
 fn introspection_literal(upper_name: &str) -> Option<ast::Expr> {
     let literal = match upper_name {
         "VERSION" => ast::Literal::String(requote("8.0.0-turso")),
-        "DATABASE" | "SCHEMA" => ast::Literal::Null,
         "CONNECTION_ID" => ast::Literal::Numeric("1".to_string()),
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
             ast::Literal::String(requote("root@localhost"))
@@ -12791,8 +12815,8 @@ mod tests {
 
     #[test]
     fn introspection_functions_fold_to_literals() {
-        // VERSION()/USER() fold to string literals, DATABASE() to NULL,
-        // CONNECTION_ID() to a number — usable mid-expression.
+        // VERSION()/USER() fold to string literals, DATABASE() to NULL when no
+        // database is selected, CONNECTION_ID() to a number — usable mid-expression.
         assert!(matches!(
             parse_expr("VERSION()").unwrap(),
             ast::Expr::Literal(ast::Literal::String(_))
@@ -12811,6 +12835,33 @@ mod tests {
         ));
         // Usable inside a larger expression (the case that used to error).
         assert!(parse_expr("LENGTH(VERSION()) > 0").is_ok());
+    }
+
+    #[test]
+    fn database_function_folds_to_current_database() {
+        // With a current database threaded in, DATABASE()/SCHEMA() fold to it as
+        // a string literal (rather than NULL), both standalone and mid-expression.
+        let parse_db = |sql: &str| {
+            Parser::new(sql.as_bytes())
+                .unwrap()
+                .with_current_database(Some("wordpress".to_string()))
+                .parse_statement()
+        };
+        let ast::Stmt::Select(select) = parse_db("SELECT DATABASE()").unwrap() else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected an expression column");
+        };
+        assert!(
+            matches!(expr.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'wordpress'"),
+            "DATABASE() should fold to the current database literal"
+        );
+        // SCHEMA() is a synonym, and both work inside a larger expression.
+        assert!(parse_db("SELECT CONCAT(SCHEMA(), '_posts')").is_ok());
     }
 
     #[test]
