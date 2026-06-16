@@ -1,0 +1,51 @@
+# Left-associative chaining of the comparison operators.
+#
+# MySQL's comparison operators -- = <> < <= > >= <=>, IN, LIKE, REGEXP, BETWEEN --
+# share one precedence level and chain left-to-right: `1 = 1 = 1` is `(1 = 1) = 1`,
+# `3 > 2 > 1` is `(3 > 2) > 1`, and a predicate result feeds the next comparison
+# (`x IN (1) = 1`). The front-end builds the chain left-associatively.
+#
+# (MySQL gives BETWEEN a special non-associative treatment in pathological chains
+# like `a = b BETWEEN c AND d` or `a BETWEEN b AND c BETWEEN d AND e`; the
+# front-end chains those left-associatively instead -- a divergence on forms that
+# real queries always parenthesize. They are not exercised here.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# A chain of equality/inequality folds left-to-right: each step compares the 1/0
+# result of the step before.
+query
+SELECT 1 = 1 = 1, 5 = 5 != 0, 'a' = 'a' = 'b'
+----
+1	1	0
+
+# Ordering comparisons chain the same way: `3 > 2 > 1` is `(3 > 2) > 1` = `1 > 1`.
+query
+SELECT 3 > 2 > 1, 1 < 2 < 3, 2 >= 2 >= 1
+----
+0	1	1
+
+# A predicate (IN / LIKE / BETWEEN) result feeds the next comparison.
+query
+SELECT 1 IN (1) = 1, 'a' LIKE 'a' = 1, 1 BETWEEN 0 AND 2 = 1, 1 = 1 IN (1, 2)
+----
+1	1	1	1
+
+# The chain composes with AND and the IS postfix at their own precedence.
+query
+SELECT 1 = 1 AND 2 = 2 = 1, 2 IN (1, 2) = 1 IS TRUE, NULL = 1 IS NULL
+----
+1	1	1
+
+# A chained comparison works in a WHERE predicate over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS cmpchain_demo (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO cmpchain_demo (id, v) VALUES (1, 1), (2, 0), (3, 5)
+
+# `(v = 1) = 1` keeps the rows where v = 1.
+query
+SELECT id FROM cmpchain_demo WHERE v = 1 = 1 ORDER BY id
+----
+1

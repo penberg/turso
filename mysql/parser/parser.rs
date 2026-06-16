@@ -3272,141 +3272,145 @@ impl Parser {
     /// (with their `ANY`/`SOME`/`ALL` quantified forms) — returning the comparison,
     /// or `lhs` unchanged when none follows. The `IS` postfix is applied by the
     /// caller, at the same precedence.
-    fn comparison_ops(&mut self, lhs: ast::Expr) -> Result<ast::Expr> {
-        // Infix `[NOT] IN / BETWEEN / LIKE`. At this point any prefix `NOT` has
-        // already been consumed by `not_expr`, so a `NOT` here is infix.
-        let not = self.eat_keyword("NOT");
-        if self.eat_keyword("IN") {
-            return self.in_list(lhs, not);
-        }
-        if self.eat_keyword("BETWEEN") {
-            return self.between(lhs, not);
-        }
-        if self.eat_keyword("LIKE") {
-            let rhs = self.additive_expr()?;
-            // MySQL's `LIKE` uses backslash as the default escape character (so
-            // `\%` matches a literal `%`), which is what `$wpdb->esc_like()`
-            // relies on. The engine's `LIKE` has no default escape, so supply
-            // `\` unless the query gives an explicit `ESCAPE` clause.
-            let escape = if self.eat_keyword("ESCAPE") {
-                Some(self.additive_expr()?)
-            } else {
-                Some(ast::Expr::Literal(ast::Literal::String(requote("\\"))))
-            };
-            return Ok(ast::Expr::like(
-                lhs,
-                not,
-                ast::LikeOperator::Like,
-                rhs,
-                escape,
-            ));
-        }
-        // `REGEXP` and its synonym `RLIKE` map onto the engine's `REGEXP`
-        // operator (the `regexp` function, backed by the Rust regex crate).
-        // MySQL's REGEXP is case-insensitive under the default collation, while
-        // the engine's is case-sensitive, so prepend the regex crate's inline
-        // `(?i)` flag to the pattern — `pattern` becomes `'(?i)' || pattern`.
-        // `(?i)` at the start of a pattern applies case-insensitivity to the
-        // whole expression (including character classes), and a NULL pattern
-        // stays NULL through `||`.
-        //
-        // A `BINARY` subject (MySQL `CAST(x AS BINARY)`, which lowers to a BLOB
-        // cast) forces a case-sensitive match. Detect it, unwrap the cast so the
-        // match runs on the text value, and skip the `(?i)` flag. WordPress's
-        // `WP_Meta_Query` uses this for case-sensitive `compare_key` REGEXPs.
-        if self.eat_keyword("REGEXP") || self.eat_keyword("RLIKE") {
-            let rhs = self.additive_expr()?;
-            let (subject, case_insensitive) = match lhs {
-                ast::Expr::Cast {
-                    expr,
-                    type_name: Some(ref t),
-                } if t.name == "BLOB" => (*expr, false),
-                other => (other, true),
-            };
-            let pattern = if case_insensitive {
-                ast::Expr::binary(
-                    ast::Expr::Literal(ast::Literal::String(requote("(?i)"))),
-                    ast::Operator::Concat,
-                    rhs,
-                )
-            } else {
-                rhs
-            };
-            return Ok(ast::Expr::like(
-                subject,
-                not,
-                ast::LikeOperator::Regexp,
-                pattern,
-                None,
-            ));
-        }
-        if not {
-            return Err(self.unexpected("`IN`, `BETWEEN`, `LIKE`, or `REGEXP` after `NOT`"));
-        }
+    fn comparison_ops(&mut self, mut lhs: ast::Expr) -> Result<ast::Expr> {
+        // The comparison operators chain left-to-right at one precedence level, as
+        // in MySQL: `1 = 1 = 1` is `(1 = 1) = 1`, `3 > 2 > 1` is `(3 > 2) > 1`, and
+        // a predicate result feeds the next (`x IN (1) = 1`). Each iteration parses
+        // at most one operator applied to the running `lhs`. (`BETWEEN` is left-
+        // associative here; MySQL's special non-associative `BETWEEN` chaining is a
+        // documented divergence on pathological forms — see `mysql/COMPAT.md`.)
+        loop {
+            // Infix `[NOT] IN / BETWEEN / LIKE`. Any prefix `NOT` was consumed by
+            // `not_expr`, so a `NOT` here — including on a later chain step — is
+            // infix.
+            let not = self.eat_keyword("NOT");
+            if self.eat_keyword("IN") {
+                lhs = self.in_list(lhs, not)?;
+                continue;
+            }
+            if self.eat_keyword("BETWEEN") {
+                lhs = self.between(lhs, not)?;
+                continue;
+            }
+            if self.eat_keyword("LIKE") {
+                let rhs = self.additive_expr()?;
+                // MySQL's `LIKE` uses backslash as the default escape character (so
+                // `\%` matches a literal `%`), which is what `$wpdb->esc_like()`
+                // relies on. The engine's `LIKE` has no default escape, so supply
+                // `\` unless the query gives an explicit `ESCAPE` clause.
+                let escape = if self.eat_keyword("ESCAPE") {
+                    Some(self.additive_expr()?)
+                } else {
+                    Some(ast::Expr::Literal(ast::Literal::String(requote("\\"))))
+                };
+                lhs = ast::Expr::like(lhs, not, ast::LikeOperator::Like, rhs, escape);
+                continue;
+            }
+            // `REGEXP` and its synonym `RLIKE` map onto the engine's `REGEXP`
+            // operator (the `regexp` function, backed by the Rust regex crate).
+            // MySQL's REGEXP is case-insensitive under the default collation, while
+            // the engine's is case-sensitive, so prepend the regex crate's inline
+            // `(?i)` flag to the pattern — `pattern` becomes `'(?i)' || pattern`.
+            // `(?i)` at the start of a pattern applies case-insensitivity to the
+            // whole expression (including character classes), and a NULL pattern
+            // stays NULL through `||`.
+            //
+            // A `BINARY` subject (MySQL `CAST(x AS BINARY)`, which lowers to a BLOB
+            // cast) forces a case-sensitive match. Detect it, unwrap the cast so the
+            // match runs on the text value, and skip the `(?i)` flag. WordPress's
+            // `WP_Meta_Query` uses this for case-sensitive `compare_key` REGEXPs.
+            if self.eat_keyword("REGEXP") || self.eat_keyword("RLIKE") {
+                let rhs = self.additive_expr()?;
+                let (subject, case_insensitive) = match lhs {
+                    ast::Expr::Cast {
+                        expr,
+                        type_name: Some(ref t),
+                    } if t.name == "BLOB" => (*expr, false),
+                    other => (other, true),
+                };
+                let pattern = if case_insensitive {
+                    ast::Expr::binary(
+                        ast::Expr::Literal(ast::Literal::String(requote("(?i)"))),
+                        ast::Operator::Concat,
+                        rhs,
+                    )
+                } else {
+                    rhs
+                };
+                lhs = ast::Expr::like(subject, not, ast::LikeOperator::Regexp, pattern, None);
+                continue;
+            }
+            if not {
+                return Err(self.unexpected("`IN`, `BETWEEN`, `LIKE`, or `REGEXP` after `NOT`"));
+            }
 
-        // `a <=> b` — NULL-safe equality, at the comparison tier.
-        if self.is(&Token::Spaceship) {
+            // `a <=> b` — NULL-safe equality, at the comparison tier.
+            if self.is(&Token::Spaceship) {
+                self.advance();
+                let rhs = self.bitor_expr()?;
+                lhs = null_safe_equals(lhs, rhs);
+                continue;
+            }
+
+            let op = match self.peek() {
+                Some(Token::Eq) => ast::Operator::Equals,
+                Some(Token::Ne) => ast::Operator::NotEquals,
+                Some(Token::Lt) => ast::Operator::Less,
+                Some(Token::Le) => ast::Operator::LessEquals,
+                Some(Token::Gt) => ast::Operator::Greater,
+                Some(Token::Ge) => ast::Operator::GreaterEquals,
+                // No comparison operator follows: the chain is complete.
+                _ => return Ok(lhs),
+            };
             self.advance();
-            let rhs = self.bitor_expr()?;
-            return Ok(null_safe_equals(lhs, rhs));
-        }
 
-        let op = match self.peek() {
-            Some(Token::Eq) => ast::Operator::Equals,
-            Some(Token::Ne) => ast::Operator::NotEquals,
-            Some(Token::Lt) => ast::Operator::Less,
-            Some(Token::Le) => ast::Operator::LessEquals,
-            Some(Token::Gt) => ast::Operator::Greater,
-            Some(Token::Ge) => ast::Operator::GreaterEquals,
-            _ => return Ok(lhs),
-        };
-        self.advance();
-
-        // `op {ANY | SOME | ALL} (subquery)` — a quantified comparison. Only the
-        // two forms exactly equivalent to `IN` / `NOT IN` are modeled: `= ANY`
-        // (and its synonym `= SOME`) is `IN (subquery)`, and `<> ALL` / `!= ALL`
-        // is `NOT IN (subquery)`. The other operator/quantifier pairs need
-        // MIN/MAX or EXISTS rewrites with subtle NULL and empty-set semantics, so
-        // they are rejected rather than mistranslated. The quantifier is only
-        // recognized immediately before `(`, so a column named `any` is not
-        // misread.
-        let quantifier_is_all = match (self.peek(), self.peek_nth(1)) {
-            (Some(Token::Word(w)), Some(Token::LParen))
-                if w.eq_ignore_ascii_case("ANY") || w.eq_ignore_ascii_case("SOME") =>
-            {
-                Some(false)
-            }
-            (Some(Token::Word(w)), Some(Token::LParen)) if w.eq_ignore_ascii_case("ALL") => {
-                Some(true)
-            }
-            _ => None,
-        };
-        if let Some(all) = quantifier_is_all {
-            self.advance(); // the quantifier keyword
-            self.expect(&Token::LParen, "`(`")?;
-            self.expect_keyword("SELECT")?;
-            let rhs = self.parse_select()?;
-            self.expect(&Token::RParen, "`)`")?;
-            let not = match (op, all) {
-                (ast::Operator::Equals, false) => false,  // `= ANY` / `= SOME` → IN
-                (ast::Operator::NotEquals, true) => true, // `<> ALL` / `!= ALL` → NOT IN
-                _ => {
-                    return Err(ParseError::Unsupported(
-                        "only the `= ANY` / `= SOME` (as IN) and `<> ALL` (as NOT IN) \
-                         quantified comparisons are supported yet"
-                            .to_string(),
-                    ))
+            // `op {ANY | SOME | ALL} (subquery)` — a quantified comparison. Only the
+            // two forms exactly equivalent to `IN` / `NOT IN` are modeled: `= ANY`
+            // (and its synonym `= SOME`) is `IN (subquery)`, and `<> ALL` / `!= ALL`
+            // is `NOT IN (subquery)`. The other operator/quantifier pairs need
+            // MIN/MAX or EXISTS rewrites with subtle NULL and empty-set semantics, so
+            // they are rejected rather than mistranslated. The quantifier is only
+            // recognized immediately before `(`, so a column named `any` is not
+            // misread.
+            let quantifier_is_all = match (self.peek(), self.peek_nth(1)) {
+                (Some(Token::Word(w)), Some(Token::LParen))
+                    if w.eq_ignore_ascii_case("ANY") || w.eq_ignore_ascii_case("SOME") =>
+                {
+                    Some(false)
                 }
+                (Some(Token::Word(w)), Some(Token::LParen)) if w.eq_ignore_ascii_case("ALL") => {
+                    Some(true)
+                }
+                _ => None,
             };
-            return Ok(ast::Expr::InSelect {
-                lhs: Box::new(lhs),
-                not,
-                rhs,
-            });
-        }
+            if let Some(all) = quantifier_is_all {
+                self.advance(); // the quantifier keyword
+                self.expect(&Token::LParen, "`(`")?;
+                self.expect_keyword("SELECT")?;
+                let rhs = self.parse_select()?;
+                self.expect(&Token::RParen, "`)`")?;
+                let not = match (op, all) {
+                    (ast::Operator::Equals, false) => false,  // `= ANY` / `= SOME` → IN
+                    (ast::Operator::NotEquals, true) => true, // `<> ALL` / `!= ALL` → NOT IN
+                    _ => {
+                        return Err(ParseError::Unsupported(
+                            "only the `= ANY` / `= SOME` (as IN) and `<> ALL` (as NOT IN) \
+                             quantified comparisons are supported yet"
+                                .to_string(),
+                        ))
+                    }
+                };
+                lhs = ast::Expr::InSelect {
+                    lhs: Box::new(lhs),
+                    not,
+                    rhs,
+                };
+                continue;
+            }
 
-        let rhs = self.bitor_expr()?;
-        Ok(ast::Expr::binary(lhs, op, rhs))
+            let rhs = self.bitor_expr()?;
+            lhs = ast::Expr::binary(lhs, op, rhs);
+        }
     }
 
     /// Bitwise-OR tier: `|`, left-associative. Binds looser than `&` and the
