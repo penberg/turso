@@ -4003,14 +4003,25 @@ impl Parser {
 
     /// Parses a `CASE` expression — both the searched form
     /// (`CASE WHEN cond THEN result ... [ELSE result] END`) and the simple form
-    /// (`CASE operand WHEN value THEN result ... [ELSE result] END`). Standard
-    /// SQL, evaluated identically by the engine. `CASE` has already been consumed.
+    /// (`CASE operand WHEN value THEN result ... [ELSE result] END`). `CASE` has
+    /// already been consumed.
+    ///
+    /// The simple form compares the operand to each `WHEN` value. MySQL uses the
+    /// default (case-insensitive) collation for that comparison, but the engine
+    /// compares the bare operand case-sensitively — so `CASE 'b' WHEN 'B'` would
+    /// not match. The operand is wrapped in `COLLATE NOCASE` so a string
+    /// comparison folds ASCII case the way MySQL's default collation does
+    /// (ignored for a numeric operand); the operand is still evaluated once, so
+    /// this is safe even for a non-deterministic operand like `RAND()`.
     fn case_expr(&mut self) -> Result<ast::Expr> {
         // A simple `CASE operand WHEN ...` has an operand before the first WHEN.
         let base = if self.is_keyword("WHEN") {
             None
         } else {
-            Some(Box::new(self.expr()?))
+            Some(Box::new(ast::Expr::collate(
+                self.expr()?,
+                ast::Name::from_string("NOCASE"),
+            )))
         };
 
         let mut when_then_pairs = Vec::new();
@@ -16085,7 +16096,9 @@ mod tests {
         assert_eq!(when_then_pairs.len(), 2);
         assert!(else_expr.is_some());
 
-        // Simple CASE: a base operand, one WHEN/THEN, no ELSE.
+        // Simple CASE: a base operand, one WHEN/THEN, no ELSE. The operand is
+        // wrapped in `COLLATE NOCASE` so its comparison to each WHEN value folds
+        // ASCII case like MySQL's default collation.
         let ast::Expr::Case {
             base,
             when_then_pairs,
@@ -16094,7 +16107,12 @@ mod tests {
         else {
             panic!("expected Case");
         };
-        assert!(base.is_some());
+        let base = base.unwrap();
+        let ast::Expr::Collate(operand, collation) = base.as_ref() else {
+            panic!("expected the simple-CASE operand to be COLLATE-wrapped");
+        };
+        assert_eq!(collation.as_str(), "NOCASE");
+        assert_eq!(operand.as_ref(), &col("status"));
         assert_eq!(when_then_pairs.len(), 1);
         assert!(else_expr.is_none());
 

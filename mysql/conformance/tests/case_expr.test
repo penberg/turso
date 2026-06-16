@@ -30,6 +30,28 @@ SELECT id, CASE status WHEN 'publish' THEN 1 ELSE 0 END FROM casetab ORDER BY id
 3	0
 4	1
 
+# A simple CASE compares the operand to each WHEN value with MySQL's default
+# (case-insensitive) collation, so a string literal operand matches regardless
+# of case -- 'b'/'B', 'Hello'/'HELLO'. A numeric operand compares numerically
+# (the NOCASE fold is inert).
+query
+SELECT CASE 'b' WHEN 'B' THEN 1 ELSE 0 END, CASE 'Hello' WHEN 'hello' THEN 'y' ELSE 'n' END, CASE 2 WHEN 2 THEN 'two' ELSE 'no' END
+----
+1	y	two
+
+# The case-insensitive match picks the right branch among several.
+query
+SELECT CASE 'Trash' WHEN 'draft' THEN 'd' WHEN 'TRASH' THEN 't' WHEN 'publish' THEN 'p' ELSE '?' END
+----
+t
+
+# A string-literal operand matches a column value case-insensitively too.
+query
+SELECT CASE 'PUBLISH' WHEN status THEN id END FROM casetab WHERE id IN (2, 4) ORDER BY id
+----
+2
+4
+
 # CASE with no ELSE yields NULL when nothing matches.
 query
 SELECT id, CASE WHEN n > 10 THEN 'big' END FROM casetab ORDER BY id
