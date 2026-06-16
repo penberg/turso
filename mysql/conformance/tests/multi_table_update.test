@@ -1,0 +1,67 @@
+# Single-target multi-table UPDATE: UPDATE t1, t2, ... SET t1.col = expr WHERE ...
+#
+# MySQL's multi-table UPDATE joins the listed tables and updates the rows of the
+# table named on the SET left-hand sides. The front-end supports the common
+# single-target case where that table is the first one listed, lowering it to the
+# engine's UPDATE t1 SET col = expr FROM <the other tables> WHERE ... -- which
+# joins the sources to t1 and updates only the matching t1 rows (rows with no
+# join match are left unchanged), exactly as MySQL does. The target may be
+# aliased; updating any table other than the first is rejected (see COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+statement ok
+CREATE TABLE IF NOT EXISTS mtu_a (id INT PRIMARY KEY, v INT, n VARCHAR(8))
+
+statement ok
+CREATE TABLE IF NOT EXISTS mtu_b (id INT PRIMARY KEY, bv INT, w INT)
+
+statement ok
+INSERT INTO mtu_a (id, v, n) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+
+statement ok
+INSERT INTO mtu_b (id, bv, w) VALUES (1, 100, 7), (3, 300, 9)
+
+# Copy bv from the matching mtu_b row; mtu_a rows with no match are unchanged.
+statement ok
+UPDATE mtu_a, mtu_b SET mtu_a.v = mtu_b.bv WHERE mtu_a.id = mtu_b.id
+
+query
+SELECT id, v, n FROM mtu_a ORDER BY id
+----
+1	100	a
+2	20	b
+3	300	c
+
+# Aliased tables, a multi-column SET, and an extra source predicate (only the
+# mtu_b row with w > 8, i.e. id = 3, drives an update).
+statement ok
+UPDATE mtu_a a, mtu_b b SET a.v = b.bv + b.w, a.n = 'x' WHERE a.id = b.id AND b.w > 8
+
+query
+SELECT id, v, n FROM mtu_a ORDER BY id
+----
+1	100	a
+2	20	b
+3	309	x
+
+# The AS keyword on the aliases is accepted, and an unqualified SET column is
+# taken as the target's.
+statement ok
+UPDATE mtu_a AS a, mtu_b AS b SET v = b.bv WHERE a.id = b.id
+
+query
+SELECT id, v FROM mtu_a ORDER BY id
+----
+1	100
+2	20
+3	300
+
+# Updating a table other than the first-listed one is rejected.
+statement error
+UPDATE mtu_a, mtu_b SET mtu_b.bv = 0 WHERE mtu_a.id = mtu_b.id
+
+# The explicit-JOIN spelling is not supported (use the comma form).
+statement error
+UPDATE mtu_a a JOIN mtu_b b ON a.id = b.id SET a.v = b.bv

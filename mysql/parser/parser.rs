@@ -2409,8 +2409,9 @@ impl Parser {
     /// Parses `UPDATE tbl SET col = expr [, ...] [WHERE expr] [ORDER BY ...]
     /// [LIMIT n]`. A bare `LIMIT n` caps the affected-row count directly; an
     /// `ORDER BY` (with or without `LIMIT`) is rewritten through a `rowid`
-    /// subquery (see [`Self::rowid_in_ordered_subquery`]). Multi-table updates
-    /// and the `LOW_PRIORITY` modifier are not translated.
+    /// subquery (see [`Self::rowid_in_ordered_subquery`]). The comma form of a
+    /// multi-table update is handled by [`Self::multi_table_update`]; the
+    /// `LOW_PRIORITY` modifier is not translated.
     fn update(&mut self) -> Result<ast::Stmt> {
         // `UPDATE` has already been consumed. `LOW_PRIORITY` is a locking hint
         // with no result effect; consume it. `UPDATE IGNORE` skips a row whose
@@ -2424,9 +2425,31 @@ impl Parser {
         };
 
         let tbl_name = self.qualified_name()?;
-        if self.is(&Token::Comma) || self.is_keyword("JOIN") {
+        // Multi-table comma form, with or without an alias on the target table:
+        //   `UPDATE t1, ...`  |  `UPDATE t1 x, ...`  |  `UPDATE t1 AS x, ...`.
+        // The first table is the update target; the rest are read-only sources.
+        // Look ahead for the comma so a single-table target (whose alias the
+        // existing path does not parse) is left completely untouched.
+        let is_multi = self.is(&Token::Comma)
+            || (self.is_alias_word() && self.peek_nth(1) == Some(&Token::Comma))
+            || (self.is_keyword("AS") && self.peek_nth(2) == Some(&Token::Comma));
+        if is_multi {
+            let target_alias = self.table_alias()?;
+            return self.multi_table_update(tbl_name, target_alias, or_conflict);
+        }
+        // The explicit-JOIN spelling of a multi-table update is not modeled.
+        if self.is_keyword("JOIN")
+            || self.is_keyword("INNER")
+            || self.is_keyword("LEFT")
+            || self.is_keyword("RIGHT")
+            || self.is_keyword("CROSS")
+            || self.is_keyword("STRAIGHT_JOIN")
+            || self.is_keyword("NATURAL")
+        {
             return Err(ParseError::Unsupported(
-                "multi-table UPDATE is not supported yet".to_string(),
+                "multi-table UPDATE with an explicit JOIN is not supported yet \
+                 (use the comma-separated form)"
+                    .to_string(),
             ));
         }
 
@@ -2486,6 +2509,114 @@ impl Parser {
             returning: Vec::new(),
             order_by: Vec::new(),
             limit,
+        }))
+    }
+
+    /// Parses the comma form of a multi-table update,
+    /// `UPDATE t1, t2, ... SET t1.col = expr [, ...] [WHERE ...]`, after `t1`
+    /// (`target`) and before the first comma. MySQL updates the table(s) named on
+    /// the `SET` left-hand sides; this handles the common single-target case
+    /// where that table is the one listed first.
+    ///
+    /// It lowers to the engine's `UPDATE target SET col = expr FROM <the other
+    /// tables> WHERE ...`. The engine joins the source tables to the target and
+    /// updates only the matching target rows — exactly MySQL's multi-table
+    /// semantics (rows of `target` with no join match are left unchanged). A
+    /// `SET` column qualified with any other table (which would update a
+    /// different table) is rejected, as are `ORDER BY`/`LIMIT`, which MySQL does
+    /// not allow on a multi-table update.
+    fn multi_table_update(
+        &mut self,
+        mut target: ast::QualifiedName,
+        target_alias: Option<ast::As>,
+        or_conflict: Option<ast::ResolveType>,
+    ) -> Result<ast::Stmt> {
+        // The target is named in `SET`/`WHERE` by its alias if it has one, else
+        // its table name; carry the alias onto the target so the engine's
+        // `UPDATE <table> AS <alias>` resolves those references.
+        let alias_name = target_alias.map(|a| {
+            let (ast::As::As(n) | ast::As::Elided(n) | ast::As::ImplicitColumnName(n)) = a;
+            n
+        });
+        let target_name = alias_name
+            .as_ref()
+            .map_or_else(|| target.name.as_str().to_string(), |n| n.as_str().to_string());
+        target.alias = alias_name;
+
+        // The remaining comma-separated references are the read-only sources.
+        let mut sources = Vec::new();
+        while self.eat(&Token::Comma) {
+            sources.push(self.table_ref()?);
+        }
+
+        self.expect_keyword("SET")?;
+        let mut sets = Vec::new();
+        loop {
+            // A `SET` target may be written `col` or `target.col`; a qualifier
+            // naming any other table would update it, which this form does not do.
+            let first = self.name()?;
+            let col = if self.eat(&Token::Dot) {
+                let column = self.name()?;
+                if !first.as_str().eq_ignore_ascii_case(&target_name) {
+                    return Err(ParseError::Unsupported(format!(
+                        "multi-table UPDATE only updates the first-listed table \
+                         `{target_name}`, not `{}`",
+                        first.as_str()
+                    )));
+                }
+                column
+            } else {
+                first
+            };
+            self.expect(&Token::Eq, "`=`")?;
+            let expr = self.expr()?;
+            sets.push(ast::Set {
+                col_names: vec![col],
+                expr: Box::new(expr),
+            });
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+
+        let where_clause = if self.eat_keyword("WHERE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+            return Err(ParseError::Unsupported(
+                "ORDER BY / LIMIT on a multi-table UPDATE is not supported".to_string(),
+            ));
+        }
+
+        // The sources become the engine's FROM clause: the first is the primary,
+        // the rest comma-joined (their join conditions live in WHERE, as in MySQL).
+        let mut sources = sources.into_iter();
+        let first_source = sources.next().expect("the comma guaranteed one source");
+        let from = ast::FromClause {
+            select: Box::new(first_source),
+            joins: sources
+                .map(|table| ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::Comma,
+                    table: Box::new(table),
+                    constraint: None,
+                })
+                .collect(),
+        };
+
+        Ok(ast::Stmt::Update(ast::Update {
+            with: None,
+            or_conflict,
+            tbl_name: target,
+            indexed: None,
+            sets,
+            from: Some(from),
+            where_clause,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
         }))
     }
 
@@ -6098,6 +6229,18 @@ impl Parser {
         matches!(self.peek(), Some(Token::Word(w)) if w.eq_ignore_ascii_case(kw))
     }
 
+    /// Whether the current token could begin a bare (non-`AS`) table alias — a
+    /// quoted identifier or a word that is not a clause keyword reserved after a
+    /// table reference. Used to look past a table's alias when deciding whether
+    /// an `UPDATE` is the multi-table comma form.
+    fn is_alias_word(&self) -> bool {
+        match self.peek() {
+            Some(Token::QuotedIdent(_)) => true,
+            Some(Token::Word(w)) => !is_reserved_after_table(w),
+            _ => false,
+        }
+    }
+
     fn eat_keyword(&mut self, kw: &str) -> bool {
         if self.is_keyword(kw) {
             self.advance();
@@ -7167,6 +7310,9 @@ fn is_reserved_after_table(word: &str) -> bool {
             | "LOCK"
             | "WINDOW"
             | "AS"
+            // `SET` ends the table-reference list of a multi-table `UPDATE`, so it
+            // must not be swallowed as the last source table's alias.
+            | "SET"
             // Index-hint keywords (`USE`/`FORCE`/`IGNORE INDEX`) follow a table
             // reference and must not be mistaken for an alias.
             | "USE"
@@ -12339,7 +12485,12 @@ mod tests {
     #[test]
     fn update_unsupported_variants() {
         for sql in [
-            "UPDATE a, b SET a.x = 1",
+            // The explicit-JOIN multi-table form is not modeled (only the comma form).
+            "UPDATE a JOIN b ON a.id = b.id SET a.x = 1",
+            // Updating a table other than the first-listed one is not supported.
+            "UPDATE a, b SET b.x = 1",
+            // ORDER BY / LIMIT are not valid on a multi-table UPDATE.
+            "UPDATE a, b SET a.x = 1 WHERE a.id = b.id LIMIT 2",
             // A LIMIT with an offset stays rejected (MySQL allows only a count).
             "UPDATE t SET a = 1 LIMIT 1, 2",
         ] {
@@ -12355,6 +12506,67 @@ mod tests {
             panic!("expected an Update");
         };
         assert!(update.limit.is_some());
+    }
+
+    #[test]
+    fn multi_table_update_lowers_to_update_from() {
+        // `UPDATE a, b SET a.v = b.v WHERE a.id = b.id` becomes the engine's
+        // `UPDATE a SET v = b.v FROM b WHERE a.id = b.id`.
+        let ast::Stmt::Update(update) =
+            parse("UPDATE a, b SET a.v = b.v WHERE a.id = b.id").unwrap()
+        else {
+            panic!("expected an Update");
+        };
+        // The target is the first table; the SET column has its qualifier stripped.
+        assert_eq!(update.tbl_name.name.as_str(), "a");
+        assert_eq!(update.sets.len(), 1);
+        assert_eq!(update.sets[0].col_names[0].as_str(), "v");
+        // The second table is moved into a FROM clause.
+        let from = update.from.expect("expected a FROM clause");
+        let ast::SelectTable::Table(name, _, _) = from.select.as_ref() else {
+            panic!("expected a table in FROM");
+        };
+        assert_eq!(name.name.as_str(), "b");
+        assert!(from.joins.is_empty());
+        assert!(update.where_clause.is_some());
+
+        // A third source table comma-joins into the FROM clause, and an aliased
+        // source is preserved.
+        let ast::Stmt::Update(update) =
+            parse("UPDATE a, b x, c SET a.v = x.v + c.v WHERE a.id = x.id AND a.k = c.k").unwrap()
+        else {
+            panic!("expected an Update");
+        };
+        let from = update.from.expect("expected a FROM clause");
+        assert_eq!(from.joins.len(), 1);
+        assert!(matches!(from.joins[0].operator, ast::JoinOperator::Comma));
+
+        // An unqualified SET column is taken as the target's.
+        let ast::Stmt::Update(update) =
+            parse("UPDATE a, b SET v = b.v WHERE a.id = b.id").unwrap()
+        else {
+            panic!("expected an Update");
+        };
+        assert_eq!(update.sets[0].col_names[0].as_str(), "v");
+
+        // An aliased target (`UPDATE a x, b y SET x.v = y.v ...`) carries the
+        // alias onto the engine's UPDATE target and matches the SET qualifier
+        // against it.
+        for sql in [
+            "UPDATE a x, b y SET x.v = y.v WHERE x.id = y.id",
+            "UPDATE a AS x, b AS y SET x.v = y.v WHERE x.id = y.id",
+        ] {
+            let ast::Stmt::Update(update) = parse(sql).unwrap() else {
+                panic!("expected an Update for `{sql}`");
+            };
+            assert_eq!(update.tbl_name.name.as_str(), "a", "{sql}");
+            assert_eq!(
+                update.tbl_name.alias.as_ref().map(|n| n.as_str()),
+                Some("x"),
+                "{sql}"
+            );
+            assert_eq!(update.sets[0].col_names[0].as_str(), "v", "{sql}");
+        }
     }
 
     #[test]

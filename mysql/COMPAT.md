@@ -309,7 +309,7 @@ incomplete.
 | UPDATE tbl SET ... [WHERE] (single table) | ✅  |         |
 | UPDATE `... LIMIT n` (single table)    | ✅     | The count-only `LIMIT` caps the rows updated (no `OFFSET`); the affected rows are unspecified without an `ORDER BY`, matching MySQL. |
 | UPDATE `... ORDER BY ... LIMIT n` (single table) | ✅ | Rewritten the same way as the `DELETE` form: `... WHERE rowid IN (SELECT rowid FROM tbl [WHERE ...] ORDER BY ... LIMIT n)`, so the n rows updated are the ones MySQL would pick by sort order. |
-| UPDATE (multi-table)                   | ❌     | **Not supported.** |
+| UPDATE `t1, t2, ... SET t1.col = expr [WHERE]` (multi-table) | 🚧 | The comma form is lowered to the engine's `UPDATE t1 SET col = expr FROM <the other tables> WHERE ...`, which joins the sources to the target and updates only the matching `t1` rows (rows with no join match are unchanged), exactly as MySQL does. The target is the first-listed table and may be aliased (`UPDATE a x, b y SET x.v = y.v`); `SET` columns may be bare or qualified with the target. **Only the first-listed table can be updated** — a `SET` assigning to another table is rejected — and the explicit-`JOIN` spelling (`UPDATE a JOIN b ON ... SET ...`) is not yet translated (use the comma form). `ORDER BY`/`LIMIT` (which MySQL disallows on a multi-table update) are rejected. |
 | VALUES statement                       | ❌     |         |
 | WITH (Common Table Expressions)        | ❌     |         |
 
