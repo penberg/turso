@@ -37,10 +37,12 @@ pub struct Parser {
     /// Column aliases from `AS alias (c1, c2, ...)`, mapped positionally to the
     /// INSERT column list — `(column_alias, actual_column)` pairs.
     upsert_col_aliases: Vec<(String, String)>,
-    /// `CREATE INDEX` statements deferred from a `CREATE TABLE`'s inline
-    /// secondary `KEY`/`INDEX` definitions (the engine's `CREATE TABLE` has no
-    /// inline secondary index), drained after the table by `statement_list`.
-    pending_indexes: Vec<ast::Stmt>,
+    /// Extra statements a single MySQL statement expands into, drained after the
+    /// main one by `statement_list`: the `CREATE INDEX` statements deferred from a
+    /// `CREATE TABLE`'s inline secondary `KEY`/`INDEX` definitions (the engine's
+    /// `CREATE TABLE` has no inline secondary index), and the extra `DEFAULT
+    /// VALUES` inserts a multi-row `INSERT ... VALUES (), ()` expands into.
+    pending_statements: Vec<ast::Stmt>,
     /// The connection's current database name, threaded in from the server
     /// session so `DATABASE()`/`SCHEMA()` fold to it (`None` → `NULL`).
     current_db: Option<String>,
@@ -61,7 +63,7 @@ impl Parser {
             in_upsert_assignment: false,
             upsert_row_alias: None,
             upsert_col_aliases: Vec::new(),
-            pending_indexes: Vec::new(),
+            pending_statements: Vec::new(),
             current_db: None,
         })
     }
@@ -165,15 +167,17 @@ impl Parser {
             return Ok(Vec::new());
         }
 
-        // A `CREATE TABLE` with inline secondary `KEY`/`INDEX` clauses defers them
-        // as `CREATE INDEX` statements (the engine's `CREATE TABLE` has none);
-        // emit them after the table.
+        // A few single statements expand into several (a `CREATE TABLE` with inline
+        // secondary `KEY`/`INDEX` clauses defers them as `CREATE INDEX`; a multi-row
+        // `INSERT ... VALUES (), ()` of all-defaults rows defers the extra rows as
+        // `DEFAULT VALUES` inserts). The statement records them in
+        // `pending_statements`; emit them after the main one.
         let stmt = self.statement()?;
-        if self.pending_indexes.is_empty() {
+        if self.pending_statements.is_empty() {
             Ok(vec![stmt])
         } else {
             let mut stmts = vec![stmt];
-            stmts.append(&mut self.pending_indexes);
+            stmts.append(&mut self.pending_statements);
             Ok(stmts)
         }
     }
@@ -405,7 +409,7 @@ impl Parser {
                 };
                 ast::Name::from_string(format!("{}_{}", tbl_name.name.as_str(), first))
             });
-            self.pending_indexes.push(ast::Stmt::CreateIndex {
+            self.pending_statements.push(ast::Stmt::CreateIndex {
                 unique,
                 if_not_exists,
                 idx_name: ast::QualifiedName::single(name),
@@ -1576,19 +1580,25 @@ impl Parser {
             None
         };
 
-        // `INSERT INTO t () VALUES ()` / `INSERT INTO t VALUES ()` — a single
-        // empty row with no column list inserts one all-defaults row, which is
-        // the engine's `DEFAULT VALUES`. (Multiple empty rows have no
-        // single-statement engine equivalent and fall through.)
-        if columns.is_empty() && upsert.is_none() && rows.len() == 1 && rows[0].is_empty() {
-            return Ok(ast::Stmt::Insert {
+        // `INSERT INTO t () VALUES ()` / `INSERT INTO t VALUES ()` — an empty row
+        // with no column list inserts one all-defaults row, the engine's `DEFAULT
+        // VALUES`. The engine has no multi-row `DEFAULT VALUES`, so a multi-row form
+        // (`VALUES (), ()`) expands to one `DEFAULT VALUES` insert per row: the
+        // extra rows are deferred to `pending_statements` and the first is returned.
+        if columns.is_empty() && upsert.is_none() && !rows.is_empty() && rows.iter().all(Vec::is_empty)
+        {
+            let default_values_insert = || ast::Stmt::Insert {
                 with: None,
                 or_conflict,
-                tbl_name,
-                columns,
+                tbl_name: tbl_name.clone(),
+                columns: Vec::new(),
                 body: ast::InsertBody::DefaultValues,
                 returning: Vec::new(),
-            });
+            };
+            for _ in 1..rows.len() {
+                self.pending_statements.push(default_values_insert());
+            }
+            return Ok(default_values_insert());
         }
 
         Ok(ast::Stmt::Insert {

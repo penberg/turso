@@ -2,8 +2,10 @@
 #
 # MySQL's INSERT INTO t () VALUES () (and the column-list-less INSERT INTO t
 # VALUES ()) inserts a single row using every column's default. The front-end
-# maps the no-column-list, single-empty-row form to the engine's DEFAULT VALUES,
-# which applies the column defaults the same way.
+# maps a no-column-list empty row to the engine's DEFAULT VALUES, which applies
+# the column defaults the same way. The multi-row form (VALUES (), ()) -- which
+# the engine has no single-statement equivalent for -- expands to one DEFAULT
+# VALUES insert per row.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -40,3 +42,27 @@ SELECT id, n, s FROM idv_demo ORDER BY id
 2	7	def
 3	10	x
 4	7	def
+
+# Multiple empty rows in one statement each insert an all-defaults row. The
+# engine has no multi-row DEFAULT VALUES, so the front-end expands them.
+statement ok
+CREATE TABLE IF NOT EXISTS idv_multi (id INT PRIMARY KEY AUTO_INCREMENT, n INT DEFAULT 3, s VARCHAR(8) DEFAULT 'm')
+
+statement ok
+INSERT INTO idv_multi () VALUES (), (), ()
+
+query
+SELECT id, n, s FROM idv_multi ORDER BY id
+----
+1	3	m
+2	3	m
+3	3	m
+
+# The column-list-less multi-row form does the same.
+statement ok
+INSERT INTO idv_multi VALUES (), ()
+
+query
+SELECT COUNT(*), MIN(n), MAX(n) FROM idv_multi
+----
+5	3	3
