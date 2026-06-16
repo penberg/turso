@@ -2062,13 +2062,16 @@ impl Parser {
             other => (where_clause, other),
         };
 
+        // `WINDOW name AS (...)` definitions, referenced by `OVER name`.
+        let window_clause = self.window_clause()?;
+
         Ok(ast::OneSelect::Select {
             distinctness,
             columns,
             from,
             where_clause,
             group_by,
-            window_clause: Vec::new(),
+            window_clause,
         })
     }
 
@@ -4782,22 +4785,31 @@ impl Parser {
         })
     }
 
-    /// Parses an optional `OVER ( [PARTITION BY ...] [ORDER BY ...] )` window
-    /// specification following an aggregate. The engine evaluates windowed
-    /// aggregates, so `SUM(x) OVER ()` (whole-partition total), `... OVER
-    /// (PARTITION BY g)`, and `... OVER (ORDER BY y)` (a running total under the
-    /// default frame, as in MySQL) all work. A named window (`OVER w`, which
-    /// needs a `WINDOW` clause) and an explicit frame (`ROWS`/`RANGE`/`GROUPS
-    /// ...`) are not modeled and are rejected.
+    /// Parses an optional `OVER (...)` / `OVER window_name` clause following an
+    /// aggregate or window function. The engine evaluates windowed aggregates, so
+    /// `SUM(x) OVER ()` (whole-partition total), `... OVER (PARTITION BY g)`, and
+    /// `... OVER (ORDER BY y)` (a running total under the default frame, as in
+    /// MySQL) all work. `OVER window_name` refers to a window defined by the
+    /// `SELECT`'s `WINDOW` clause (see [`Self::window_clause`]). An explicit frame
+    /// (`ROWS`/`RANGE`/`GROUPS ...`) is not modeled and is rejected.
     fn parse_over_clause(&mut self) -> Result<Option<ast::Over>> {
         if !self.eat_keyword("OVER") {
             return Ok(None);
         }
-        if !self.is(&Token::LParen) {
-            return Err(ParseError::Unsupported(
-                "OVER with a named window is not supported yet".to_string(),
-            ));
+        // `OVER (...)` is an inline window definition; `OVER name` references a
+        // window from the `WINDOW` clause.
+        if self.is(&Token::LParen) {
+            return Ok(Some(ast::Over::Window(self.window_spec()?)));
         }
+        Ok(Some(ast::Over::Name(self.name()?)))
+    }
+
+    /// Parses a parenthesized window specification — `( [PARTITION BY ...]
+    /// [ORDER BY ...] )` — shared by an inline `OVER (...)` and a named window's
+    /// `WINDOW w AS (...)` definition. An explicit frame (`ROWS`/`RANGE`/`GROUPS
+    /// ...`) has no engine equivalent (only the default frame is supported) and
+    /// is rejected.
+    fn window_spec(&mut self) -> Result<ast::Window> {
         self.expect(&Token::LParen, "`(`")?;
 
         let mut partition_by = Vec::new();
@@ -4821,12 +4833,34 @@ impl Parser {
         }
         self.expect(&Token::RParen, "`)`")?;
 
-        Ok(Some(ast::Over::Window(ast::Window {
+        Ok(ast::Window {
             base: None,
             partition_by,
             order_by,
             frame_clause: None,
-        })))
+        })
+    }
+
+    /// Parses an optional `WINDOW name AS (spec) [, name AS (spec)]...` clause,
+    /// which names window specifications that `OVER name` references. It follows
+    /// `HAVING` (before `ORDER BY`). The engine resolves the named windows, so
+    /// the definitions pass straight through. Returns an empty list when absent.
+    fn window_clause(&mut self) -> Result<Vec<ast::WindowDef>> {
+        if !self.eat_keyword("WINDOW") {
+            return Ok(Vec::new());
+        }
+        let mut defs = Vec::new();
+        loop {
+            let name = self.name()?;
+            self.expect_keyword("AS")?;
+            let window = self.window_spec()?;
+            defs.push(ast::WindowDef { name, window });
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(defs)
     }
 
     /// Parses the arguments of a `CONCAT(a, b, ...)` call (the name and `(` are
@@ -11814,9 +11848,16 @@ mod tests {
         };
         assert!(matches!(filter_over.over_clause, Some(ast::Over::Window(_))));
 
-        // An explicit frame and a named window are rejected.
+        // An explicit frame is rejected (only the default frame is supported).
         assert!(parse_expr("SUM(amt) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)").is_err());
-        assert!(parse_expr("SUM(amt) OVER w").is_err());
+
+        // `OVER name` references a named window (defined by a WINDOW clause); it
+        // parses to `Over::Name`, leaving the engine to resolve it.
+        let ast::Expr::FunctionCall { filter_over, .. } = parse_expr("SUM(amt) OVER w").unwrap()
+        else {
+            panic!("expected a function call");
+        };
+        assert!(matches!(filter_over.over_clause, Some(ast::Over::Name(n)) if n.as_str() == "w"));
 
         // A scalar function does not take a window (the OVER is left unparsed).
         let mut p = Parser::new(b"ABS(x) OVER ()").unwrap();
@@ -11836,6 +11877,49 @@ mod tests {
         };
         assert_eq!(w.partition_by.len(), 1);
         assert_eq!(w.order_by.len(), 1);
+    }
+
+    #[test]
+    fn select_window_clause_defines_named_windows() {
+        // `WINDOW name AS (spec)` defines a window that `OVER name` references;
+        // both the definition and the reference are kept for the engine.
+        let stmt = parse(
+            "SELECT id, SUM(v) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY id)",
+        )
+        .unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select { window_clause, .. } = &select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert_eq!(window_clause.len(), 1);
+        assert_eq!(window_clause[0].name.as_str(), "w");
+        assert_eq!(window_clause[0].window.partition_by.len(), 1);
+        assert_eq!(window_clause[0].window.order_by.len(), 1);
+
+        // Multiple definitions, comma-separated.
+        let stmt =
+            parse("SELECT SUM(v) OVER a, MAX(v) OVER b FROM t WINDOW a AS (), b AS (ORDER BY id)")
+                .unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select { window_clause, .. } = &select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert_eq!(window_clause.len(), 2);
+        assert_eq!(window_clause[1].name.as_str(), "b");
+
+        // No WINDOW clause leaves the list empty.
+        let stmt = parse("SELECT id FROM t").unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select { window_clause, .. } = &select.body.select else {
+            panic!("expected OneSelect::Select");
+        };
+        assert!(window_clause.is_empty());
     }
 
     #[test]

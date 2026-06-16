@@ -1,12 +1,12 @@
 # Windowed aggregate functions: agg(...) OVER ( [PARTITION BY] [ORDER BY] ).
 #
-# The front-end now parses the OVER clause on an aggregate, and the engine
-# evaluates windowed aggregates, so SUM/COUNT/MIN/MAX/AVG OVER (...) work: a bare
-# OVER () aggregates the whole result, PARTITION BY aggregates per group, and
-# ORDER BY produces a running aggregate under the default frame (as in MySQL).
-# A named window (OVER w) and an explicit frame (ROWS/RANGE) are not supported,
-# and the dedicated window functions (RANK, ROW_NUMBER, ...) are not available in
-# the engine.
+# The front-end parses the OVER clause on an aggregate, and the engine evaluates
+# windowed aggregates, so SUM/COUNT/MIN/MAX/AVG OVER (...) work: a bare OVER ()
+# aggregates the whole result, PARTITION BY aggregates per group, and ORDER BY
+# produces a running aggregate under the default frame (as in MySQL). A named
+# window -- OVER name, defined by a trailing `WINDOW name AS (...)` clause -- is
+# also supported. An explicit frame (ROWS/RANGE) is not supported, and the
+# dedicated window functions (RANK, ROW_NUMBER, ...) are not in the engine.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -25,6 +25,32 @@ SELECT id, SUM(amt) OVER () AS total, COUNT(*) OVER () AS n FROM win ORDER BY id
 2	100	4
 3	100	4
 4	100	4
+
+# A named window (defined by the WINDOW clause) referenced by OVER name behaves
+# like the inline spec; here a partitioned running total and a per-group total.
+query
+SELECT id, SUM(amt) OVER w AS run, MAX(amt) OVER w AS hi FROM win WINDOW w AS (PARTITION BY g ORDER BY id) ORDER BY id
+----
+1	10	10
+2	30	20
+3	30	30
+4	70	40
+
+# Several named windows in one WINDOW clause, each referenced by name.
+query
+SELECT id, SUM(amt) OVER grp AS grp_total, MIN(amt) OVER ord AS running_min FROM win WINDOW grp AS (PARTITION BY g), ord AS (ORDER BY id) ORDER BY id
+----
+1	30	10
+2	30	10
+3	70	10
+4	70	10
+
+# A named window composes with a trailing ORDER BY / LIMIT on the query.
+query
+SELECT id, COUNT(*) OVER w AS c FROM win WINDOW w AS (PARTITION BY g) ORDER BY id DESC LIMIT 2
+----
+4	2
+3	2
 
 # PARTITION BY aggregates within each group.
 query
