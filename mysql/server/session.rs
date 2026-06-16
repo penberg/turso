@@ -119,6 +119,7 @@ pub const SYSTEM_VARIABLES: &[(&str, &str)] = &[
     ("collation_connection", "utf8mb4_general_ci"),
     ("collation_database", "utf8mb4_general_ci"),
     ("collation_server", "utf8mb4_general_ci"),
+    ("foreign_key_checks", "1"),
     ("hostname", "turso"),
     ("init_connect", ""),
     ("interactive_timeout", "28800"),
@@ -137,6 +138,7 @@ pub const SYSTEM_VARIABLES: &[(&str, &str)] = &[
     ("transaction_read_only", "0"),
     ("tx_isolation", "REPEATABLE-READ"),
     ("tx_read_only", "0"),
+    ("unique_checks", "1"),
     ("version", SERVER_VERSION),
     ("version_comment", "Turso MySQL front-end"),
     ("version_compile_os", "Linux"),
@@ -237,6 +239,18 @@ mod tests {
         };
         assert_eq!(columns, vec!["@@max_allowed_packet"]);
         assert_eq!(values, vec![Some("67108864".to_string())]);
+    }
+
+    #[test]
+    fn data_loading_toggle_variables_default_on() {
+        // mysqldump / import flows read these; both default to 1 in MySQL.
+        for var in ["@@foreign_key_checks", "@@unique_checks"] {
+            let Some(SessionResponse::Row { values, .. }) = try_handle(&format!("SELECT {var}"))
+            else {
+                panic!("expected a row for {var}");
+            };
+            assert_eq!(values, vec![Some("1".to_string())], "{var}");
+        }
     }
 
     #[test]

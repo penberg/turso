@@ -1,0 +1,26 @@
+# The foreign_key_checks / unique_checks system variables.
+#
+# mysqldump output and WordPress / plugin import flows toggle and read
+# @@foreign_key_checks and @@unique_checks around a bulk load (`SET
+# foreign_key_checks = 0; ...; SET foreign_key_checks = 1;`). Both default to 1 in
+# MySQL. The front-end now reports that default (it accepts the `SET` as a no-op,
+# since this engine does not enforce foreign keys), so code that reads the
+# variable sees a plausible value instead of an empty string.
+#
+# Only the `SELECT @@var` form is exercised: it renders a boolean as 1/0 on both
+# engines, whereas `SHOW VARIABLES` renders it as ON/OFF on a real server but as
+# the stored 1/0 here (a pre-existing front-end divergence shared with
+# @@autocommit; see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+query
+SELECT @@foreign_key_checks, @@unique_checks
+----
+1	1
+
+# The session and global scopes report the same default.
+query
+SELECT @@session.foreign_key_checks, @@global.unique_checks
+----
+1	1
