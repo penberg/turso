@@ -55,3 +55,46 @@ query
 SELECT COUNT(n) FROM agg_demo
 ----
 5
+
+# A GROUP BY column ordinal references the output column by position, like
+# `ORDER BY 1`: `GROUP BY 1` groups by `cat` (the first select item).
+query
+SELECT cat, SUM(n) FROM agg_demo GROUP BY 1 ORDER BY 1
+----
+a	30
+b	10
+c	7
+
+# Ordinals compose with HAVING and a trailing ORDER BY ordinal.
+query
+SELECT cat, COUNT(*) FROM agg_demo GROUP BY 1 HAVING COUNT(*) > 1 ORDER BY 1
+----
+a	2
+b	2
+
+# Multiple ordinals, and an ordinal mixed with a column name, group by both.
+query
+SELECT cat, n, COUNT(*) FROM agg_demo GROUP BY 1, 2 ORDER BY 1, 2
+----
+a	10	1
+a	20	1
+b	5	2
+c	7	1
+
+query
+SELECT cat, n, COUNT(*) FROM agg_demo GROUP BY cat, 2 ORDER BY 1, 2
+----
+a	10	1
+a	20	1
+b	5	2
+c	7	1
+
+# A non-bare-integer GROUP BY term is an ordinary expression, not an ordinal:
+# `GROUP BY n * 1` groups by the value, not the first column.
+query
+SELECT n * 1 AS v, COUNT(*) FROM agg_demo GROUP BY n * 1 ORDER BY 1
+----
+5	2
+7	1
+10	1
+20	1

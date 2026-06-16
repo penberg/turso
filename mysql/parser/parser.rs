@@ -2491,9 +2491,10 @@ impl Parser {
 
     /// Parses an optional `GROUP BY [HAVING]` clause, or a standalone `HAVING`.
     ///
-    /// GROUP BY terms must be column expressions, not integer ordinals: MySQL
-    /// treats `GROUP BY 1` as "the first output column", but SQLite treats it as
-    /// the constant `1` (one group) — a divergence, so ordinals are rejected.
+    /// A `GROUP BY` term may be a column expression or an integer **ordinal**
+    /// (`GROUP BY 1` groups by the first output column), which the engine resolves
+    /// positionally the way MySQL does — the same as `ORDER BY 1` — so it is passed
+    /// through unchanged.
     ///
     /// `HAVING` without `GROUP BY` treats the whole result as a single group; it
     /// is modeled as an empty `GROUP BY` with a `HAVING`. MySQL and the engine
@@ -2512,13 +2513,10 @@ impl Parser {
         self.expect_keyword("BY")?;
         let mut exprs = Vec::new();
         loop {
+            // A bare integer is a column ordinal (`GROUP BY 1` groups by the first
+            // select-list item), which the engine resolves the way MySQL does — the
+            // same as `ORDER BY 1`. It is passed through unchanged.
             let expr = self.expr()?;
-            if matches!(expr, ast::Expr::Literal(ast::Literal::Numeric(_))) {
-                return Err(ParseError::Unsupported(
-                    "GROUP BY with a column ordinal is not supported (use a column name)"
-                        .to_string(),
-                ));
-            }
             exprs.push(Box::new(expr));
             if self.eat(&Token::Comma) {
                 continue;
@@ -11761,7 +11759,6 @@ mod tests {
             "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
             "SELECT * FROM a LEFT JOIN b",
             "SELECT * FROM (SELECT 1)",
-            "SELECT a FROM t GROUP BY 1",
         ] {
             assert!(
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
@@ -12268,14 +12265,26 @@ mod tests {
     }
 
     #[test]
-    fn group_by_ordinal_is_unsupported() {
-        // `GROUP BY 1` (group by output-column position) is not modeled. (`AVG`
-        // is supported — see `aggregate_distinct`; its result is a plain double
-        // rather than MySQL's fixed-scale DECIMAL, but the value matches.)
+    fn group_by_accepts_column_ordinals() {
+        // `GROUP BY 1` (group by output-column position) passes through to the
+        // engine, which resolves it positionally like MySQL — the bare integer is
+        // kept as the group expression, the same as `ORDER BY 1`.
+        let ast::Stmt::Select(select) = parse("SELECT a, COUNT(*) FROM t GROUP BY 1").unwrap()
+        else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select { group_by, .. } = select.body.select else {
+            panic!("expected a plain SELECT");
+        };
+        let group_by = group_by.expect("a GROUP BY clause");
+        assert_eq!(group_by.exprs.len(), 1);
         assert!(matches!(
-            parse("SELECT a FROM t GROUP BY 1").unwrap_err(),
-            ParseError::Unsupported(_)
+            group_by.exprs[0].as_ref(),
+            ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1"
         ));
+        // A multi-term and mixed name/ordinal GROUP BY also parses.
+        assert!(parse("SELECT a, b FROM t GROUP BY 1, 2").is_ok());
+        assert!(parse("SELECT a, b FROM t GROUP BY a, 2").is_ok());
     }
 
     #[test]
