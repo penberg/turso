@@ -3642,6 +3642,20 @@ impl Parser {
             let negative = self.is(&Token::Minus);
             self.advance();
             let inner = self.collate_expr()?;
+            // A unary sign on a *numeric literal* folds into the literal. This is
+            // reached for the double-sign forms (`- -5`, `+ -5`, …): the inner
+            // `-5` is already folded by `primary_expr` into the literal `"-5"`, so
+            // wrapping it in `Negative` would have the engine negate the text to
+            // `"--5"`, which it cannot parse (it panics). Folding yields the plain
+            // literal `"5"` instead.
+            if let ast::Expr::Literal(ast::Literal::Numeric(n)) = &inner {
+                let folded = if negative {
+                    negate_numeric_literal(n)
+                } else {
+                    n.clone()
+                };
+                return Ok(ast::Expr::Literal(ast::Literal::Numeric(folded)));
+            }
             let op = if negative {
                 ast::UnaryOperator::Negative
             } else {
@@ -8056,6 +8070,17 @@ fn numeric_expr(value: &str) -> Box<ast::Expr> {
     Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())))
 }
 
+/// Negates a numeric-literal's text by toggling a single leading `-`, so
+/// `"-5"` becomes `"5"` and `"5"` becomes `"-5"`. Used to fold a unary minus on
+/// a numeric literal into the literal itself (the engine would otherwise try to
+/// re-parse a doubled-sign text like `"--5"`).
+fn negate_numeric_literal(value: &str) -> String {
+    match value.strip_prefix('-') {
+        Some(rest) => rest.to_string(),
+        None => format!("-{value}"),
+    }
+}
+
 /// MySQL's implicit type default for a `NOT NULL` column with no explicit
 /// `DEFAULT` (see [`Parser::column_def`]): `0` for numeric types and `''` for
 /// string/binary types. Date/time types (whose MySQL implicit default is the
@@ -11351,6 +11376,16 @@ mod tests {
             parse_expr("-5").unwrap(),
             ast::Expr::Literal(ast::Literal::Numeric(ref n)) if n == "-5"
         ));
+        // A unary sign on a numeric literal folds into the literal rather than
+        // wrapping it (the double-sign forms `- -5` / `+ -5` / `- +5`), so the
+        // engine never has to negate an already-signed literal text (which it
+        // cannot parse — it would crash on `--5`).
+        for (sql, want) in [("- -5", "5"), ("+ -5", "-5"), ("- +5", "-5"), ("- - -5", "-5")] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == want),
+                "`{sql}` should fold to the literal `{want}`"
+            );
+        }
         // Unary minus binds tighter than `*`: `-a * b` is `(-a) * b`.
         let ast::Expr::Binary(lhs, ast::Operator::Multiply, _) = parse_expr("-a * b").unwrap()
         else {

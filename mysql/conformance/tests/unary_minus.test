@@ -49,3 +49,12 @@ query
 SELECT -5, -5.5, a * -1 FROM um WHERE id = 1
 ----
 -5	-5.5	-5
+
+# A unary sign on a numeric *literal* folds into the literal: `- -5` is `5`, not
+# a negation of the already-signed literal `-5` (which the engine would try to
+# re-parse as `--5` and crash on). Covers the double- and triple-sign forms and
+# their use in arithmetic.
+query
+SELECT - -5, + -5, - +5, - - -5, - -5.5, - -5 + 1, 3 - -5
+----
+5	-5	-5	-5	5.5	6	8
