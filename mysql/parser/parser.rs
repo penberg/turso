@@ -5233,10 +5233,10 @@ impl Parser {
 
     /// Parses MySQL `STRCMP(a, b)` (the name and `(` are already consumed),
     /// lowering it to a `CASE` that yields `-1` / `0` / `1` for `a < b` / `a = b`
-    /// / `a > b`, and NULL when either argument is NULL. The comparison uses the
-    /// engine's (binary, case-sensitive) collation, so it diverges from MySQL's
-    /// case-insensitive default for strings that differ only in case — the same
-    /// collation divergence noted in `mysql/COMPAT.md`.
+    /// / `a > b`, and NULL when either argument is NULL. The comparison is taken
+    /// under `COLLATE NOCASE` so it folds ASCII case like MySQL's default
+    /// case-insensitive collation (`STRCMP('a', 'A')` is `0`, as in MySQL),
+    /// matching the case-insensitive lowering of `INSTR`/`LOCATE`/`FIND_IN_SET`.
     fn strcmp_call(&mut self) -> Result<ast::Expr> {
         let a = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
@@ -5247,6 +5247,9 @@ impl Parser {
             ast::Operator::Or,
             ast::Expr::is_null(b.clone()),
         );
+        // An explicit `COLLATE NOCASE` on one operand makes the comparison
+        // case-insensitive regardless of the operands' own collations.
+        let a = ast::Expr::collate(a, ast::Name::from_string("NOCASE"));
         let less = ast::Expr::binary(a.clone(), ast::Operator::Less, b.clone());
         let greater = ast::Expr::binary(a, ast::Operator::Greater, b);
         Ok(ast::Expr::Case {
@@ -13386,10 +13389,15 @@ mod tests {
         assert_eq!(*when_then_pairs[1].1, num("-1"));
         assert_eq!(*when_then_pairs[2].1, num("1"));
         assert_eq!(*else_expr.unwrap(), num("0"));
-        assert!(matches!(
-            *when_then_pairs[1].0,
-            ast::Expr::Binary(_, ast::Operator::Less, _)
-        ));
+        // The `<` comparison is taken with a `COLLATE NOCASE` left operand, so
+        // STRCMP folds ASCII case like MySQL's default collation.
+        let ast::Expr::Binary(lhs, ast::Operator::Less, _) = &*when_then_pairs[1].0 else {
+            panic!("expected the second branch to be a `<` comparison");
+        };
+        assert!(
+            matches!(lhs.as_ref(), ast::Expr::Collate(_, name) if name.as_str() == "NOCASE"),
+            "expected the left operand to carry COLLATE NOCASE"
+        );
     }
 
     #[test]

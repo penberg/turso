@@ -2,14 +2,9 @@
 #
 # STRCMP compares two strings and returns -1, 0, or 1 for a < b, a = b, a > b,
 # and NULL if either argument is NULL. The front-end lowers it to a CASE over the
-# `<` / `=` / `>` comparisons.
-#
-# The comparison uses the engine's binary (case-sensitive) collation, so a result
-# for strings differing only in case diverges from MySQL's case-insensitive
-# default (`STRCMP('a', 'A')` is 1 here vs 0 on MySQL -- the same collation
-# divergence documented in mysql/COMPAT.md). This test uses operands that compare
-# the same under both collations, so it passes against both turso-mysql-server
-# and a real mysqld. Uses its own table name.
+# `<` / `=` / `>` comparisons, taken under COLLATE NOCASE so it folds ASCII case
+# like MySQL's default case-insensitive collation. Expected to pass against both
+# turso-mysql-server and a real mysqld. Uses its own table name.
 
 # Ordering of distinct strings.
 query
@@ -28,6 +23,32 @@ query
 SELECT STRCMP(NULL, 'x') IS NULL, STRCMP('x', NULL) IS NULL, STRCMP(NULL, NULL) IS NULL
 ----
 1	1	1
+
+# Case is folded (MySQL's default collation is case-insensitive): operands that
+# differ only in case are equal.
+query
+SELECT STRCMP('a', 'A'), STRCMP('abc', 'ABC'), STRCMP('apple', 'Apple')
+----
+0	0	0
+
+# Case folding still respects letter ordering: 'A' < 'b', 'Z' (folds to 'z') > 'a'.
+query
+SELECT STRCMP('A', 'b'), STRCMP('B', 'a'), STRCMP('Z', 'a')
+----
+-1	1	1
+
+# A case-insensitive comparison over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS scmp_ci (id INT PRIMARY KEY, a VARCHAR(20))
+
+statement ok
+INSERT INTO scmp_ci (id, a) VALUES (1, 'Hello'), (2, 'WORLD')
+
+query
+SELECT id, STRCMP(a, 'hello'), STRCMP(a, 'world') FROM scmp_ci ORDER BY id
+----
+1	0	-1
+2	1	0
 
 # Usable over columns.
 statement ok
