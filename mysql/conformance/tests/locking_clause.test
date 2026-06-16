@@ -58,3 +58,22 @@ query
 SELECT a FROM lock_demo AS d WHERE a = 2 FOR SHARE OF d NOWAIT
 ----
 2
+
+# A locking clause also attaches to a FROM-less select. `LOCK` here begins the
+# locking clause rather than aliasing the expression — MySQL reserves `LOCK`, so
+# `SELECT 1 LOCK ...` reads the clause, not an alias named `LOCK`.
+query
+SELECT 1 LOCK IN SHARE MODE
+----
+1
+
+query
+SELECT 2 + 3 FOR UPDATE
+----
+5
+
+# A column may still be explicitly aliased `lock` when quoted.
+query
+SELECT 9 AS `lock`
+----
+9

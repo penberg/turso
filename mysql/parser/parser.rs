@@ -9310,6 +9310,11 @@ fn is_reserved_select_alias(word: &str) -> bool {
             | "EXCEPT"
             | "INTO"
             | "FOR"
+            // `LOCK` begins the `LOCK IN SHARE MODE` row-locking clause, so — like
+            // `FOR` — it is not a bare column alias (MySQL reserves it too). This
+            // lets `SELECT <expr> LOCK IN SHARE MODE` reach the locking clause in a
+            // FROM-less select instead of consuming `LOCK` as the alias of <expr>.
+            | "LOCK"
             | "WINDOW"
             | "AS"
     )
@@ -10844,6 +10849,12 @@ mod tests {
             "SELECT a FROM t FOR UPDATE OF t",
             "SELECT a FROM t AS x FOR UPDATE OF x, t",
             "SELECT a FROM t FOR UPDATE OF t NOWAIT",
+            // A FROM-less select still reaches the locking clause: `LOCK`/`FOR`
+            // begin the clause rather than aliasing the expression (MySQL
+            // reserves `LOCK`).
+            "SELECT 1 LOCK IN SHARE MODE",
+            "SELECT 1 + 1 FOR UPDATE",
+            "SELECT 1 FOR SHARE",
         ] {
             assert!(
                 matches!(parse(sql).unwrap(), ast::Stmt::Select(_)),
@@ -10855,6 +10866,14 @@ mod tests {
         assert!(parse("SELECT a FROM t FOR somethingelse").is_err());
         // A trailing token after a valid locking clause is still rejected.
         assert!(parse("SELECT a FROM t FOR UPDATE GARBAGE").is_err());
+        // A bare `LOCK` that does not begin `LOCK IN SHARE MODE` is not a valid
+        // alias (as in MySQL): the leftover `LOCK` fails the end-of-input check.
+        assert!(parse("SELECT 1 LOCK").is_err());
+        // `LOCK` is still usable as an explicitly quoted alias.
+        assert!(matches!(
+            parse("SELECT 1 AS `lock`").unwrap(),
+            ast::Stmt::Select(_)
+        ));
     }
 
     #[test]
