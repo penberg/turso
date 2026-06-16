@@ -1,0 +1,56 @@
+# BIT_COUNT(n) conformance.
+#
+# MySQL's BIT_COUNT(n) returns the number of set bits of n, taken as an unsigned
+# 64-bit value. The front-end lowers it to the sum of the 64 bits, each tested as
+# (n >> i) & 1 (the arithmetic shift reads the sign bit, so BIT_COUNT(-1) is 64).
+# The 64 terms are summed in a balanced tree to keep the expression shallow. A
+# NULL argument yields NULL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. This test
+# needs no tables.
+
+# Small values: 7 = 0b111 has three bits, 0 has none, a power of two has one.
+query
+SELECT BIT_COUNT(7), BIT_COUNT(0), BIT_COUNT(1), BIT_COUNT(1024)
+----
+3	0	1	1
+
+# Byte patterns.
+query
+SELECT BIT_COUNT(255), BIT_COUNT(170), BIT_COUNT(29)
+----
+8	4	4
+
+# The full 64-bit range, taken as unsigned: -1 is all bits, the i64 min is just
+# the sign bit, and the i64 max is 63 bits.
+query
+SELECT BIT_COUNT(-1), BIT_COUNT(-9223372036854775808), BIT_COUNT(9223372036854775807)
+----
+64	1	63
+
+# The argument may be any integer expression.
+query
+SELECT BIT_COUNT(5 | 2), BIT_COUNT(255 & 15)
+----
+3	4
+
+# NULL propagates.
+query
+SELECT BIT_COUNT(NULL) IS NULL
+----
+1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS bc_demo (id INT PRIMARY KEY, flags INT)
+
+statement ok
+INSERT INTO bc_demo (id, flags) VALUES (1, 1), (2, 3), (3, 7), (4, 0)
+
+query
+SELECT id, BIT_COUNT(flags) FROM bc_demo ORDER BY id
+----
+1	1
+2	2
+3	3
+4	0

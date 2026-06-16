@@ -3861,6 +3861,11 @@ impl Parser {
             return self.regexp_like_call();
         }
 
+        // `BIT_COUNT(n)` counts the set bits of `n` (see `bit_count_call`).
+        if upper == "BIT_COUNT" {
+            return self.bit_count_call();
+        }
+
         // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
         // comma-separated `strlist`, or 0; synthesized from comma-wrapped
         // string surgery.
@@ -4617,6 +4622,46 @@ impl Parser {
             pattern,
             None,
         ))
+    }
+
+    /// Parses `BIT_COUNT(n)` (the name and `(` are already consumed) and lowers
+    /// it to the number of set bits of `n`, the sum of its 64 bits each tested as
+    /// `(n >> i) & 1` (the shift elided for bit 0). The engine's arithmetic shift
+    /// reads the sign bit, so the count is over the unsigned 64-bit value, as in
+    /// MySQL (`BIT_COUNT(-1)` is 64). A NULL argument makes every bit NULL, so the
+    /// sum is NULL. The 64 terms are folded into a *balanced* tree of additions
+    /// so the expression stays shallow — a left-nested 64-deep sum overflows the
+    /// engine's recursive evaluator.
+    fn bit_count_call(&mut self) -> Result<ast::Expr> {
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        let mut terms: Vec<ast::Expr> = (0..64)
+            .map(|i| {
+                let shifted = if i == 0 {
+                    n.clone()
+                } else {
+                    ast::Expr::binary(
+                        n.clone(),
+                        ast::Operator::RightShift,
+                        ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                    )
+                };
+                ast::Expr::binary(shifted, ast::Operator::BitwiseAnd, one())
+            })
+            .collect();
+        while terms.len() > 1 {
+            let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+            let mut iter = terms.into_iter();
+            while let Some(a) = iter.next() {
+                match iter.next() {
+                    Some(b) => next.push(ast::Expr::binary(a, ast::Operator::Add, b)),
+                    None => next.push(a),
+                }
+            }
+            terms = next;
+        }
+        Ok(terms.pop().expect("64 bit terms reduce to one"))
     }
 
     /// Parses a `FIND_IN_SET(str, strlist)` call (the name and `(` are already
@@ -11443,6 +11488,40 @@ mod tests {
             unreachable!()
         };
         assert_eq!(**low, col("n"));
+    }
+
+    #[test]
+    fn bit_count_lowers_to_balanced_sum_of_bits() {
+        // BIT_COUNT(n) sums 64 bit-tests `(n >> i) & 1` in a balanced tree of
+        // additions, so the top node is an addition and the tree stays shallow.
+        let expr = parse_expr("BIT_COUNT(n)").unwrap();
+        let ast::Expr::Binary(_, ast::Operator::Add, _) = &expr else {
+            panic!("expected the top of BIT_COUNT to be an addition");
+        };
+        // Collect the leaves and the tree depth.
+        fn walk(e: &ast::Expr, depth: usize, leaves: &mut usize, max_depth: &mut usize) {
+            match e {
+                ast::Expr::Binary(l, ast::Operator::Add, r) => {
+                    walk(l, depth + 1, leaves, max_depth);
+                    walk(r, depth + 1, leaves, max_depth);
+                }
+                other => {
+                    *leaves += 1;
+                    *max_depth = (*max_depth).max(depth);
+                    // Each leaf is `<bit> & 1`.
+                    let ast::Expr::Binary(_, ast::Operator::BitwiseAnd, mask) = other else {
+                        panic!("expected a `<bit> & 1` leaf");
+                    };
+                    assert_eq!(**mask, num("1"));
+                }
+            }
+        }
+        let mut leaves = 0;
+        let mut max_depth = 0;
+        walk(&expr, 0, &mut leaves, &mut max_depth);
+        assert_eq!(leaves, 64, "one term per bit");
+        // A balanced tree of 64 leaves is depth 6, far below a 64-deep chain.
+        assert!(max_depth <= 6, "tree should be balanced, got depth {max_depth}");
     }
 
     #[test]
