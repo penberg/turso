@@ -44,6 +44,20 @@ SELECT ROUND(5.678, 2), ROUND(5.678, 0)
 ----
 5.68	6
 
+# A negative d rounds to the left of the decimal point (nearest 10^|d|) and is an
+# integer, as in MySQL.
+query
+SELECT ROUND(1234.5678, -2), ROUND(1250, -2), ROUND(1234.5678, -1), ROUND(1234.5678, -3)
+----
+1200	1300	1230	1000
+
+# Half-away-from-zero applies at the rounding boundary, and a negative value
+# rounds away from zero too.
+query
+SELECT ROUND(5, -1), ROUND(50, -2), ROUND(49, -2), ROUND(-1250, -2)
+----
+10	100	0	-1300
+
 # NULL propagates.
 query
 SELECT CEIL(NULL), FLOOR(NULL), ROUND(NULL)

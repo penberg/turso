@@ -4045,10 +4045,24 @@ impl Parser {
             if self.eat(&Token::Comma) {
                 let digits = self.expr()?;
                 self.expect(&Token::RParen, "`)`")?;
+                // A negative literal `d` rounds to the left of the decimal point
+                // (`ROUND(1234.5, -2)` → `1200`), which the engine's `round` does
+                // not do: scale down by `10^|d|`, round, and scale back, then cast
+                // to an integer (the MySQL result has no fractional part).
+                if let Some(magnitude) = negative_integer_literal(&digits) {
+                    let scale = || {
+                        call_fn(
+                            "pow",
+                            vec![*numeric_expr("10"), *numeric_expr(&magnitude.to_string())],
+                        )
+                    };
+                    let scaled_down = float_division(arg, scale());
+                    let rounded = call_fn("round", vec![scaled_down]);
+                    let scaled_up = ast::Expr::binary(rounded, ast::Operator::Multiply, scale());
+                    return Ok(cast_to_integer(scaled_up));
+                }
                 // `ROUND(x, 0)` is an integer like `ROUND(x)`; `ROUND(x, d)` with
-                // `d > 0` keeps `d` decimals and stays a real. (A negative `d` is
-                // an integer in MySQL but the engine does not round to tens, a
-                // separate pre-existing divergence, so it is left as-is.)
+                // `d > 0` keeps `d` decimals and stays a real.
                 let round = call_fn("round", vec![arg, digits.clone()]);
                 if matches!(&digits, ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0") {
                     return Ok(cast_to_integer(round));
@@ -8095,6 +8109,24 @@ fn crypto_hex_digest(engine_fn: &str, arg: ast::Expr) -> ast::Expr {
             Box::new(ast::Expr::Literal(ast::Literal::Null)),
         )],
         else_expr: Some(Box::new(digest)),
+    }
+}
+
+/// If `expr` is a negative integer literal (the unary-minus form `-2` or a signed
+/// numeric literal `"-2"`), returns its magnitude (`2`), else `None`. Used to
+/// recognize a negative `ROUND` precision at translation time.
+fn negative_integer_literal(expr: &ast::Expr) -> Option<i64> {
+    match expr {
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => match inner.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => {
+                n.trim().parse::<i64>().ok().filter(|&v| v > 0)
+            }
+            _ => None,
+        },
+        ast::Expr::Literal(ast::Literal::Numeric(n)) => {
+            n.trim().parse::<i64>().ok().filter(|&v| v < 0).map(i64::abs)
+        }
+        _ => None,
     }
 }
 
