@@ -1,0 +1,48 @@
+# GET_FORMAT(type, locale) conformance.
+#
+# MySQL's GET_FORMAT(type, locale) returns the constant DATE_FORMAT-style format
+# string for a (type, locale) pair, used with DATE_FORMAT / STR_TO_DATE. The
+# front-end resolves it at parse time to the matching string literal. `type` is a
+# bare keyword (DATE, TIME, DATETIME, or its synonym TIMESTAMP); `locale` is a
+# string literal matched case-insensitively against the five names EUR, USA, JIS,
+# ISO, INTERNAL. An unrecognized locale yields NULL, as in MySQL.
+#
+# Verified against MySQL 8.4. Pure scalar lookups, so no table is needed.
+
+# DATE formats. Note the USA date order is month-first (%m.%d.%Y); JIS and ISO
+# are both the ISO date.
+query
+SELECT GET_FORMAT(DATE, 'EUR'), GET_FORMAT(DATE, 'USA'), GET_FORMAT(DATE, 'JIS'), GET_FORMAT(DATE, 'ISO'), GET_FORMAT(DATE, 'INTERNAL')
+----
+%d.%m.%Y	%m.%d.%Y	%Y-%m-%d	%Y-%m-%d	%Y%m%d
+
+# TIME formats. USA time is the 12-hour AM/PM clock; EUR uses dotted separators.
+query
+SELECT GET_FORMAT(TIME, 'EUR'), GET_FORMAT(TIME, 'USA'), GET_FORMAT(TIME, 'JIS'), GET_FORMAT(TIME, 'ISO'), GET_FORMAT(TIME, 'INTERNAL')
+----
+%H.%i.%s	%h:%i:%s %p	%H:%i:%s	%H:%i:%s	%H%i%s
+
+# DATETIME formats. The EUR and USA datetimes are identical (ISO date + dotted
+# time) -- a MySQL quirk reproduced verbatim.
+query
+SELECT GET_FORMAT(DATETIME, 'EUR'), GET_FORMAT(DATETIME, 'USA'), GET_FORMAT(DATETIME, 'JIS'), GET_FORMAT(DATETIME, 'ISO'), GET_FORMAT(DATETIME, 'INTERNAL')
+----
+%Y-%m-%d %H.%i.%s	%Y-%m-%d %H.%i.%s	%Y-%m-%d %H:%i:%s	%Y-%m-%d %H:%i:%s	%Y%m%d%H%i%s
+
+# TIMESTAMP is a synonym for DATETIME.
+query
+SELECT GET_FORMAT(TIMESTAMP, 'EUR'), GET_FORMAT(TIMESTAMP, 'ISO'), GET_FORMAT(TIMESTAMP, 'INTERNAL')
+----
+%Y-%m-%d %H.%i.%s	%Y-%m-%d %H:%i:%s	%Y%m%d%H%i%s
+
+# The locale name is matched case-insensitively (the type keyword too).
+query
+SELECT GET_FORMAT(date, 'eur'), GET_FORMAT(DateTime, 'Iso')
+----
+%d.%m.%Y	%Y-%m-%d %H:%i:%s
+
+# An unrecognized locale yields NULL.
+query
+SELECT GET_FORMAT(DATE, 'XYZ') IS NULL, GET_FORMAT(TIME, '') IS NULL
+----
+1	1

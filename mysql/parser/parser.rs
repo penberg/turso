@@ -4516,6 +4516,12 @@ impl Parser {
             return self.extract_call();
         }
 
+        // `GET_FORMAT(type, locale)` returns the constant DATE_FORMAT-style
+        // format string MySQL uses for that locale; `type` is a bare keyword.
+        if upper == "GET_FORMAT" {
+            return self.get_format_call();
+        }
+
         // `QUARTER(d)` (1–4) is `(MONTH(d) + 2) / 3` with integer division.
         if upper == "QUARTER" {
             return self.quarter_call();
@@ -6395,6 +6401,56 @@ impl Parser {
             }
         };
         Ok(cast_strftime_int(fmt, arg))
+    }
+
+    /// Parses `GET_FORMAT(type, locale)` (the name and `(` are already consumed)
+    /// and lowers it to the constant `DATE_FORMAT`-style format string MySQL
+    /// returns for that `(type, locale)` pair. `type` is a bare keyword — `DATE`,
+    /// `TIME`, `DATETIME`, or its synonym `TIMESTAMP`; `locale` is a string
+    /// literal matched case-insensitively against MySQL's five names (`EUR`,
+    /// `USA`, `JIS`, `ISO`, `INTERNAL`). An unrecognized locale yields NULL, as
+    /// in MySQL; an unrecognized type keyword is rejected. Values verified
+    /// against MySQL 8.4.
+    fn get_format_call(&mut self) -> Result<ast::Expr> {
+        let Some(Token::Word(w)) = self.peek() else {
+            return Err(self.unexpected("a GET_FORMAT type (DATE, TIME, DATETIME)"));
+        };
+        let typ = w.to_ascii_uppercase();
+        self.advance();
+        self.expect(&Token::Comma, "`,`")?;
+        let Some(Token::Str(loc)) = self.peek() else {
+            return Err(self.unexpected("a string-literal GET_FORMAT locale"));
+        };
+        let loc = loc.to_ascii_uppercase();
+        self.advance();
+        self.expect(&Token::RParen, "`)`")?;
+
+        // TIMESTAMP is a synonym for DATETIME. Note the USA *date* order
+        // (`%m.%d.%Y`) and that the USA *datetime* still uses ISO date order with
+        // a dotted time — MySQL quirks, both reproduced verbatim here.
+        let fmt = match (typ.as_str(), loc.as_str()) {
+            ("DATE", "EUR") => "%d.%m.%Y",
+            ("DATE", "USA") => "%m.%d.%Y",
+            ("DATE", "JIS" | "ISO") => "%Y-%m-%d",
+            ("DATE", "INTERNAL") => "%Y%m%d",
+            ("TIME", "EUR") => "%H.%i.%s",
+            ("TIME", "USA") => "%h:%i:%s %p",
+            ("TIME", "JIS" | "ISO") => "%H:%i:%s",
+            ("TIME", "INTERNAL") => "%H%i%s",
+            ("DATETIME" | "TIMESTAMP", "EUR" | "USA") => "%Y-%m-%d %H.%i.%s",
+            ("DATETIME" | "TIMESTAMP", "JIS" | "ISO") => "%Y-%m-%d %H:%i:%s",
+            ("DATETIME" | "TIMESTAMP", "INTERNAL") => "%Y%m%d%H%i%s",
+            // A recognized type with an unknown locale is NULL, like MySQL.
+            ("DATE" | "TIME" | "DATETIME" | "TIMESTAMP", _) => {
+                return Ok(ast::Expr::Literal(ast::Literal::Null));
+            }
+            (other, _) => {
+                return Err(ParseError::Unsupported(format!(
+                    "GET_FORMAT({other}, ...) is not supported yet"
+                )))
+            }
+        };
+        Ok(ast::Expr::Literal(ast::Literal::String(requote(fmt))))
     }
 
     /// Lowers `QUARTER(d)` (the name and `(` are already consumed) to
@@ -12972,6 +13028,34 @@ mod tests {
         assert!(matches!(month_term.as_ref(), ast::Expr::Cast { .. }));
         // The four-field DAY_SECOND parses too.
         assert!(parse_expr("EXTRACT(DAY_SECOND FROM d)").is_ok());
+    }
+
+    #[test]
+    fn get_format_lowers_to_literal_string() {
+        // GET_FORMAT(type, locale) resolves at parse time to the constant format
+        // literal MySQL returns (the literal carries surrounding quotes).
+        for (sql, want) in [
+            ("GET_FORMAT(DATE, 'EUR')", "'%d.%m.%Y'"),
+            ("GET_FORMAT(DATE, 'USA')", "'%m.%d.%Y'"),
+            ("GET_FORMAT(DATE, 'INTERNAL')", "'%Y%m%d'"),
+            ("GET_FORMAT(TIME, 'USA')", "'%h:%i:%s %p'"),
+            ("GET_FORMAT(DATETIME, 'ISO')", "'%Y-%m-%d %H:%i:%s'"),
+            // TIMESTAMP is a synonym for DATETIME; type and locale are matched
+            // case-insensitively.
+            ("GET_FORMAT(timestamp, 'eur')", "'%Y-%m-%d %H.%i.%s'"),
+        ] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::Literal(ast::Literal::String(s)) if s == want),
+                "wrong GET_FORMAT lowering for `{sql}`"
+            );
+        }
+        // An unrecognized locale yields a NULL literal, like MySQL.
+        assert!(matches!(
+            parse_expr("GET_FORMAT(DATE, 'XYZ')").unwrap(),
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        // An unrecognized type keyword is rejected rather than mistranslated.
+        assert!(parse_expr("GET_FORMAT(WIDGET, 'EUR')").is_err());
     }
 
     #[test]
