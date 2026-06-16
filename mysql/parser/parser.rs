@@ -4253,6 +4253,13 @@ impl Parser {
             return self.right_call();
         }
 
+        // `TIMEDIFF(a, b)` is `a - b` rendered as a MySQL `TIME` string
+        // (`[-]HH:MM:SS`, hours unbounded). The engine's own `timediff` renders a
+        // different (SQLite) format, so the MySQL spelling is synthesized.
+        if upper == "TIMEDIFF" {
+            return self.timediff_call();
+        }
+
         // The MySQL advisory-lock functions. This is a single-node engine with no
         // cross-session lock table, so they fold to constants matching MySQL's
         // result when no lock is actually held — the uncontended flow WordPress
@@ -5083,6 +5090,93 @@ impl Parser {
             ast::Operator::Subtract,
             call_fn("length", vec![without_commas]),
         ))
+    }
+
+    /// Parses a `TIMEDIFF(a, b)` call (the name and `(` are already consumed) and
+    /// lowers it to MySQL's `a - b` rendered as a `TIME` string — `[-]HH:MM:SS`,
+    /// where the hour field is unbounded (e.g. `25:30:00`) and a negative result
+    /// carries a leading `-`. The difference is taken in whole seconds via
+    /// `CAST(ROUND((julianday(a) - julianday(b)) * 86400) AS INTEGER)` — `julianday`
+    /// parses both DATETIME and bare TIME strings, and for two times the implied
+    /// date cancels — then formatted with `printf`. A NULL or unparseable argument
+    /// makes the inner cast NULL, so the guarding `CASE` returns NULL, as in MySQL.
+    ///
+    /// The engine has its own `timediff`, but it renders the SQLite
+    /// `±YYYY-MM-DD HH:MM:SS.SSS` form rather than MySQL's, so the MySQL spelling
+    /// is synthesized here. Divergences from MySQL (see `mysql/COMPAT.md`): the
+    /// result is not clamped to the TIME range `±838:59:59`, mismatched argument
+    /// types (one TIME and one DATETIME) are not detected (MySQL returns NULL),
+    /// and a fractional-second part is truncated to whole seconds.
+    fn timediff_call(&mut self) -> Result<ast::Expr> {
+        let a = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let b = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+
+        // d = CAST(ROUND((julianday(a) - julianday(b)) * 86400) AS INTEGER)
+        let seconds = ast::Expr::binary(
+            ast::Expr::binary(
+                unary_fn("julianday", a),
+                ast::Operator::Subtract,
+                unary_fn("julianday", b),
+            ),
+            ast::Operator::Multiply,
+            *numeric_expr("86400"),
+        );
+        let d = ast::Expr::Cast {
+            expr: Box::new(call_fn("round", vec![seconds])),
+            type_name: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+                array_dimensions: 0,
+            }),
+        };
+
+        // sign = CASE WHEN d < 0 THEN '-' ELSE '' END
+        let sign = ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::binary(
+                    d.clone(),
+                    ast::Operator::Less,
+                    *numeric_expr("0"),
+                )),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("-")))),
+            )],
+            else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::String(requote(""))))),
+        };
+
+        // The HH/MM/SS fields of the absolute second count (hours unbounded).
+        let abs_d = || unary_fn("abs", d.clone());
+        let hh = ast::Expr::binary(abs_d(), ast::Operator::Divide, *numeric_expr("3600"));
+        let mm = ast::Expr::binary(
+            ast::Expr::binary(abs_d(), ast::Operator::Modulus, *numeric_expr("3600")),
+            ast::Operator::Divide,
+            *numeric_expr("60"),
+        );
+        let ss = ast::Expr::binary(abs_d(), ast::Operator::Modulus, *numeric_expr("60"));
+
+        let body = call_fn(
+            "printf",
+            vec![
+                ast::Expr::Literal(ast::Literal::String(requote("%s%02d:%02d:%02d"))),
+                sign,
+                hh,
+                mm,
+                ss,
+            ],
+        );
+
+        // A NULL or unparseable argument makes `d` NULL; return SQL NULL then
+        // (printf would otherwise coerce the NULL fields to zeros).
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(d.clone())),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(body)),
+        })
     }
 
     /// Parses an `ISNULL(x)` call (the name and `(` are already consumed) and
@@ -13455,6 +13549,54 @@ mod tests {
         assert_eq!(
             parse_expr("SPACE(n)").unwrap(),
             parse_expr("REPEAT(' ', n)").unwrap()
+        );
+    }
+
+    #[test]
+    fn timediff_lowers_to_printf_with_null_guard() {
+        // TIMEDIFF(a, b) -> CASE WHEN <secs> IS NULL THEN NULL
+        //                        ELSE printf('%s%02d:%02d:%02d', sign, hh, mm, ss) END,
+        // where <secs> = CAST(ROUND((julianday(a) - julianday(b)) * 86400) AS INTEGER).
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("TIMEDIFF(a, b)").unwrap()
+        else {
+            panic!("expected TIMEDIFF to lower to a CASE");
+        };
+        assert!(base.is_none(), "searched CASE, no base expression");
+
+        // The single WHEN guards a NULL/unparseable difference -> NULL. The
+        // guarded expression is the integer-seconds cast.
+        assert_eq!(when_then_pairs.len(), 1);
+        let ast::Expr::IsNull(guarded) = &*when_then_pairs[0].0 else {
+            panic!("the WHEN guard is an IS NULL check");
+        };
+        assert!(
+            matches!(
+                guarded.as_ref(),
+                ast::Expr::Cast {
+                    type_name: Some(ast::Type { name, .. }),
+                    ..
+                } if name == "INTEGER"
+            ),
+            "the guarded value is the CAST(... AS INTEGER) second count"
+        );
+        assert_eq!(
+            *when_then_pairs[0].1,
+            ast::Expr::Literal(ast::Literal::Null)
+        );
+
+        // The ELSE branch is printf('%s%02d:%02d:%02d', sign, hh, mm, ss).
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected the ELSE branch to be a printf call");
+        };
+        assert_eq!(name.as_str(), "printf");
+        assert_eq!(args.len(), 5);
+        assert_eq!(
+            *args[0],
+            ast::Expr::Literal(ast::Literal::String("'%s%02d:%02d:%02d'".to_string()))
         );
     }
 

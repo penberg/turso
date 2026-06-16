@@ -1,0 +1,64 @@
+# TIMEDIFF(a, b) — the difference of two temporal values as a TIME string.
+#
+# MySQL's TIMEDIFF returns `a - b` formatted as a TIME: `[-]HH:MM:SS`, where the
+# hour field is unbounded (a multi-day span prints as `25:30:00`, `216:00:00`)
+# and a negative difference carries a leading `-`. The front-end synthesizes this
+# from `printf` over `CAST(ROUND((julianday(a) - julianday(b)) * 86400) AS
+# INTEGER)` (the engine's own `timediff` renders a different, SQLite-style form).
+# Both TIME-only and DATETIME arguments work, and a NULL/unparseable argument
+# yields NULL.
+#
+# Not exercised (documented divergences, see mysql/COMPAT.md): mismatched argument
+# types (one TIME, one DATETIME) which MySQL maps to NULL; clamping to the TIME
+# range +/-838:59:59; and fractional-second precision.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# Two TIME values: a positive and a negative difference.
+query
+SELECT TIMEDIFF('10:00:00', '08:30:00'), TIMEDIFF('08:30:00', '10:00:00')
+----
+01:30:00	-01:30:00
+
+# DATETIME values spanning a day boundary: the hour field exceeds 24.
+query
+SELECT TIMEDIFF('2020-01-02 10:00:00', '2020-01-01 08:30:00')
+----
+25:30:00
+
+# The negative of the same span.
+query
+SELECT TIMEDIFF('2020-01-01 08:30:00', '2020-01-02 10:00:00')
+----
+-25:30:00
+
+# A near-full-day TIME difference and an equal pair (zero).
+query
+SELECT TIMEDIFF('23:59:59', '00:00:00'), TIMEDIFF('10:00:00', '10:00:00')
+----
+23:59:59	00:00:00
+
+# One second, and a nine-day span (216 hours) that stays in one HH field.
+query
+SELECT TIMEDIFF('2020-06-15 12:00:00', '2020-06-15 11:59:59'), TIMEDIFF('2020-01-10 00:00:00', '2020-01-01 00:00:00')
+----
+00:00:01	216:00:00
+
+# A NULL (or unparseable) argument propagates to NULL.
+query
+SELECT TIMEDIFF(NULL, '10:00:00'), TIMEDIFF('10:00:00', NULL)
+----
+NULL	NULL
+
+statement ok
+CREATE TABLE timediff_t (id INT PRIMARY KEY, a DATETIME, b DATETIME)
+
+statement ok
+INSERT INTO timediff_t VALUES (1, '2020-01-01 12:00:00', '2020-01-01 10:30:00'), (2, '2020-01-02 00:00:00', '2020-01-01 00:00:00')
+
+# Applied to columns in a real query, including a 24-hour span.
+query
+SELECT id, TIMEDIFF(a, b) FROM timediff_t ORDER BY id
+----
+1	01:30:00
+2	24:00:00
