@@ -1,0 +1,43 @@
+# ANY_VALUE(x).
+#
+# MySQL's ANY_VALUE(x) returns x; it marks a non-aggregated column as
+# intentionally unconstrained so the ONLY_FULL_GROUP_BY check does not reject it,
+# returning a value from some row of each group. The engine already allows a bare
+# column in a GROUP BY query, so the front-end drops the ANY_VALUE wrapper.
+#
+# To stay deterministic across engines, the grouped cases use groups in which the
+# wrapped value is constant. Verified against MySQL 8.4. Uses a file-unique table
+# name.
+
+# As a plain scalar, ANY_VALUE returns its argument.
+query
+SELECT ANY_VALUE(5), ANY_VALUE('hello'), ANY_VALUE(NULL)
+----
+5	hello	NULL
+
+# It passes an arbitrary expression through.
+query
+SELECT ANY_VALUE(3 * 2 + 1)
+----
+7
+
+statement ok
+CREATE TABLE anyval (id INT PRIMARY KEY, g VARCHAR(5), n INT)
+
+statement ok
+INSERT INTO anyval VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 10), (4, 'b', 20)
+
+# Alongside aggregates in a GROUP BY: each group's n is constant here, so the
+# "any" value is deterministic.
+query
+SELECT g, ANY_VALUE(n), COUNT(*) FROM anyval GROUP BY g ORDER BY g
+----
+a	10	2
+b	20	2
+
+# ANY_VALUE on the grouped column itself.
+query
+SELECT g, SUM(n), ANY_VALUE(g) FROM anyval GROUP BY g ORDER BY g
+----
+a	20	a
+b	40	b

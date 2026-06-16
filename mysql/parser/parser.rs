@@ -3941,6 +3941,17 @@ impl Parser {
             return self.base64_call("crypto_decode", false);
         }
 
+        // `ANY_VALUE(x)` is just `x`: in MySQL it marks a non-aggregated column as
+        // intentionally unconstrained, suppressing the `ONLY_FULL_GROUP_BY`
+        // error. The engine already allows a bare column in a `GROUP BY` query
+        // (returning a value from some row of each group, as ANY_VALUE does), so
+        // the wrapper is dropped.
+        if upper == "ANY_VALUE" {
+            let arg = self.expr()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(arg);
+        }
+
         // `HEX(x)` is overloaded: the uppercase hex of a number, or the hex of a
         // string's bytes (see `hex_call`).
         if upper == "HEX" {
@@ -13697,6 +13708,20 @@ mod tests {
         // rejected.
         assert!(parse_expr("SHA2(s, 224)").is_err());
         assert!(parse_expr("SHA2(s, n)").is_err());
+    }
+
+    #[test]
+    fn any_value_is_dropped() {
+        // ANY_VALUE(x) lowers to just x (the engine allows the bare column).
+        assert_eq!(parse_expr("ANY_VALUE(n)").unwrap(), col("n"));
+        assert_eq!(parse_expr("ANY_VALUE(5)").unwrap(), num("5"));
+        assert_eq!(
+            parse_expr("ANY_VALUE(a + 1)").unwrap(),
+            ast::Expr::binary(col("a"), ast::Operator::Add, num("1"))
+        );
+        // It takes exactly one argument.
+        assert!(parse_expr("ANY_VALUE()").is_err());
+        assert!(parse_expr("ANY_VALUE(a, b)").is_err());
     }
 
     #[test]
