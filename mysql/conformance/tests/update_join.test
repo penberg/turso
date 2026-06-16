@@ -1,0 +1,69 @@
+# Multi-table UPDATE with explicit JOIN syntax.
+#
+# `UPDATE t1 JOIN t2 ON t1.x = t2.y SET t1.col = ... WHERE ...` updates the table
+# named on the SET left-hand side, joining the others to choose which rows. It is
+# equivalent to the comma form `UPDATE t1, t2 SET ... WHERE t1.x = t2.y AND ...`,
+# which the front-end already lowered; the explicit-JOIN spelling was rejected.
+# Both WordPress plugins and hand-written maintenance queries use the JOIN form.
+#
+# The front-end now folds each INNER/CROSS join's ON condition into the WHERE and
+# turns the joined tables into the engine's UPDATE ... FROM, matching MySQL. (An
+# outer join would change which target rows update, so it stays unsupported -- not
+# exercised here, since a real mysqld accepts it.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS uj_posts (ID INT PRIMARY KEY, status VARCHAR(20))
+
+statement ok
+CREATE TABLE IF NOT EXISTS uj_meta (mid INT PRIMARY KEY, pid INT, mval VARCHAR(20))
+
+statement ok
+INSERT INTO uj_posts VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+INSERT INTO uj_meta VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 3, 'z')
+
+# JOIN form with a WHERE filter on the source: only the matching target row is
+# updated.
+statement ok
+UPDATE uj_posts JOIN uj_meta ON uj_posts.ID = uj_meta.pid SET uj_posts.status = 'updated' WHERE uj_meta.mval = 'y'
+
+query
+SELECT ID, status FROM uj_posts ORDER BY ID
+----
+1	a
+2	updated
+3	c
+
+# Aliases (AS and elided) and a SET value taken from a source column.
+statement ok
+UPDATE uj_posts AS p JOIN uj_meta m ON p.ID = m.pid SET p.status = m.mval WHERE m.pid = 3
+
+query
+SELECT status FROM uj_posts WHERE ID = 3
+----
+z
+
+# The INNER JOIN keyword, with no WHERE: every join-matched target row updates.
+statement ok
+UPDATE uj_posts INNER JOIN uj_meta ON uj_posts.ID = uj_meta.pid SET uj_posts.status = 'all'
+
+query
+SELECT COUNT(*) FROM uj_posts WHERE status = 'all'
+----
+3
+
+# A target row with no join match is left unchanged (insert one, then a JOIN
+# update that cannot reach it).
+statement ok
+INSERT INTO uj_posts VALUES (9, 'untouched')
+
+statement ok
+UPDATE uj_posts JOIN uj_meta ON uj_posts.ID = uj_meta.pid SET uj_posts.status = 'matched'
+
+query
+SELECT status FROM uj_posts WHERE ID = 9
+----
+untouched

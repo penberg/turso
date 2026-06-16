@@ -2796,7 +2796,9 @@ impl Parser {
             let target_alias = self.table_alias()?;
             return self.multi_table_update(tbl_name, target_alias, or_conflict);
         }
-        // The explicit-JOIN spelling of a multi-table update is not modeled.
+        // The explicit-JOIN spelling of a multi-table update, with an optional
+        // target alias (`UPDATE p JOIN ...`, `UPDATE p x JOIN ...`, `UPDATE p AS x
+        // JOIN ...`), is lowered to the same engine form as the comma version.
         if self.is_keyword("JOIN")
             || self.is_keyword("INNER")
             || self.is_keyword("LEFT")
@@ -2804,12 +2806,10 @@ impl Parser {
             || self.is_keyword("CROSS")
             || self.is_keyword("STRAIGHT_JOIN")
             || self.is_keyword("NATURAL")
+            || (self.is_alias_word() && token_is_join_keyword(self.peek_nth(1)))
+            || (self.is_keyword("AS") && token_is_join_keyword(self.peek_nth(2)))
         {
-            return Err(ParseError::Unsupported(
-                "multi-table UPDATE with an explicit JOIN is not supported yet \
-                 (use the comma-separated form)"
-                    .to_string(),
-            ));
+            return self.multi_table_update_join(tbl_name, or_conflict);
         }
 
         self.expect_keyword("SET")?;
@@ -2908,6 +2908,87 @@ impl Parser {
             sources.push(self.table_ref()?);
         }
 
+        self.finish_multi_table_update(target, target_name, sources, None, or_conflict)
+    }
+
+    /// Parses the explicit-JOIN spelling of a multi-table UPDATE — `UPDATE target
+    /// [alias] [INNER|CROSS] JOIN src [alias] [ON cond] ... SET ...` — after
+    /// `target`. It is equivalent to the comma form: the joined sources become the
+    /// engine's `FROM` and each `ON` condition is ANDed into the `WHERE`,
+    /// preserving the inner-join semantics (a target row updates only where the
+    /// join matches). Only `[INNER]`/plain and `CROSS` joins are modeled; an outer
+    /// (`LEFT`/`RIGHT`), `NATURAL`, or `STRAIGHT_JOIN` join — which would change
+    /// which target rows update, or whose condition cannot move to `WHERE`
+    /// unchanged — is rejected.
+    fn multi_table_update_join(
+        &mut self,
+        mut target: ast::QualifiedName,
+        or_conflict: Option<ast::ResolveType>,
+    ) -> Result<ast::Stmt> {
+        // Carry the optional target alias onto the target, as the comma form does.
+        let alias_name = self.table_alias()?.map(|a| {
+            let (ast::As::As(n) | ast::As::Elided(n) | ast::As::ImplicitColumnName(n)) = a;
+            n
+        });
+        let target_name = alias_name
+            .as_ref()
+            .map_or_else(|| target.name.as_str().to_string(), |n| n.as_str().to_string());
+        target.alias = alias_name;
+
+        let mut sources = Vec::new();
+        let mut conditions: Vec<ast::Expr> = Vec::new();
+        loop {
+            if self.is_keyword("LEFT")
+                || self.is_keyword("RIGHT")
+                || self.is_keyword("FULL")
+                || self.is_keyword("NATURAL")
+                || self.is_keyword("STRAIGHT_JOIN")
+            {
+                return Err(ParseError::Unsupported(
+                    "multi-table UPDATE models only INNER/CROSS joins; an outer, \
+                     natural, or straight join is not supported"
+                        .to_string(),
+                ));
+            }
+            let cross = self.eat_keyword("CROSS");
+            if !cross {
+                self.eat_keyword("INNER");
+            }
+            if !self.eat_keyword("JOIN") {
+                break;
+            }
+            sources.push(self.table_ref()?);
+            if self.eat_keyword("ON") {
+                conditions.push(self.expr()?);
+            } else if self.is_keyword("USING") {
+                return Err(ParseError::Unsupported(
+                    "a USING join condition in a multi-table UPDATE is not supported".to_string(),
+                ));
+            }
+        }
+
+        // AND the join conditions together; the shared finisher folds them into
+        // the WHERE (a CROSS join contributes none).
+        let join_where = conditions
+            .into_iter()
+            .reduce(|acc, c| ast::Expr::binary(acc, ast::Operator::And, c));
+        self.finish_multi_table_update(target, target_name, sources, join_where, or_conflict)
+    }
+
+    /// Shared tail of the comma and explicit-JOIN multi-table UPDATE forms: parses
+    /// `SET ... [WHERE ...]` and builds the engine's `UPDATE target SET ... FROM
+    /// <sources> WHERE ...`. `join_where` (the explicit-JOIN form's `ON`
+    /// conditions, `None` for the comma form) is ANDed into the `WHERE`. A `SET`
+    /// column qualified with a table other than the target, and `ORDER BY`/`LIMIT`
+    /// (which MySQL forbids on a multi-table UPDATE), are rejected.
+    fn finish_multi_table_update(
+        &mut self,
+        target: ast::QualifiedName,
+        target_name: String,
+        sources: Vec<ast::SelectTable>,
+        join_where: Option<ast::Expr>,
+        or_conflict: Option<ast::ResolveType>,
+    ) -> Result<ast::Stmt> {
         self.expect_keyword("SET")?;
         let mut sets = Vec::new();
         loop {
@@ -2918,7 +2999,7 @@ impl Parser {
                 let column = self.name()?;
                 if !first.as_str().eq_ignore_ascii_case(&target_name) {
                     return Err(ParseError::Unsupported(format!(
-                        "multi-table UPDATE only updates the first-listed table \
+                        "multi-table UPDATE only updates the target table \
                          `{target_name}`, not `{}`",
                         first.as_str()
                     )));
@@ -2940,7 +3021,7 @@ impl Parser {
         }
 
         let where_clause = if self.eat_keyword("WHERE") {
-            Some(Box::new(self.expr()?))
+            Some(self.expr()?)
         } else {
             None
         };
@@ -2950,10 +3031,18 @@ impl Parser {
             ));
         }
 
+        // Fold the join conditions into the WHERE clause.
+        let where_clause = match (join_where, where_clause) {
+            (Some(j), Some(w)) => Some(Box::new(ast::Expr::binary(j, ast::Operator::And, w))),
+            (Some(j), None) => Some(Box::new(j)),
+            (None, Some(w)) => Some(Box::new(w)),
+            (None, None) => None,
+        };
+
         // The sources become the engine's FROM clause: the first is the primary,
         // the rest comma-joined (their join conditions live in WHERE, as in MySQL).
         let mut sources = sources.into_iter();
-        let first_source = sources.next().expect("the comma guaranteed one source");
+        let first_source = sources.next().expect("a multi-table UPDATE has a source");
         let from = ast::FromClause {
             select: Box::new(first_source),
             joins: sources
@@ -9795,6 +9884,21 @@ fn unrequote(literal: &str) -> String {
         .and_then(|s| s.strip_suffix('\''))
         .unwrap_or(literal);
     inner.replace("''", "'")
+}
+
+/// Whether `tok` is one of the keywords that introduces a join clause, used to
+/// recognize the explicit-JOIN multi-table UPDATE form past an optional target
+/// alias (`UPDATE p x JOIN ...`).
+fn token_is_join_keyword(tok: Option<&Token>) -> bool {
+    matches!(tok, Some(Token::Word(w)) if
+        w.eq_ignore_ascii_case("JOIN")
+            || w.eq_ignore_ascii_case("INNER")
+            || w.eq_ignore_ascii_case("LEFT")
+            || w.eq_ignore_ascii_case("RIGHT")
+            || w.eq_ignore_ascii_case("CROSS")
+            || w.eq_ignore_ascii_case("STRAIGHT_JOIN")
+            || w.eq_ignore_ascii_case("NATURAL")
+            || w.eq_ignore_ascii_case("FULL"))
 }
 
 /// Whether `word` is a MySQL charset introducer that can precede a string literal:
@@ -17304,9 +17408,10 @@ mod tests {
     #[test]
     fn update_unsupported_variants() {
         for sql in [
-            // The explicit-JOIN multi-table form is not modeled (only the comma form).
-            "UPDATE a JOIN b ON a.id = b.id SET a.x = 1",
-            // Updating a table other than the first-listed one is not supported.
+            // An outer/natural join in the explicit-JOIN multi-table form is not
+            // modeled (only INNER/CROSS, whose ON folds into the WHERE).
+            "UPDATE a LEFT JOIN b ON a.id = b.id SET a.x = 1",
+            // Updating a table other than the target (first) one is not supported.
             "UPDATE a, b SET b.x = 1",
             // ORDER BY / LIMIT are not valid on a multi-table UPDATE.
             "UPDATE a, b SET a.x = 1 WHERE a.id = b.id LIMIT 2",
@@ -17318,6 +17423,17 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+
+        // The INNER-join multi-table form parses, lowering to an UPDATE with a
+        // FROM clause (the join's ON condition folded into the WHERE).
+        let ast::Stmt::Update(update) =
+            parse("UPDATE a JOIN b ON a.id = b.id SET a.x = 1 WHERE b.y = 2").unwrap()
+        else {
+            panic!("expected an Update");
+        };
+        assert_eq!(update.tbl_name.name.as_str(), "a");
+        assert!(update.from.is_some());
+        assert!(update.where_clause.is_some());
 
         // A count-only LIMIT is honored.
         let ast::Stmt::Update(update) = parse("UPDATE t SET a = 1 WHERE b = 2 LIMIT 3").unwrap()

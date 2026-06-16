@@ -58,10 +58,20 @@ SELECT id, v FROM mtu_a ORDER BY id
 2	20
 3	300
 
-# Updating a table other than the first-listed one is rejected.
+# The explicit-JOIN spelling is equivalent to the comma form (the ON condition
+# folds into the WHERE); only mtu_a rows with a matching mtu_b row update.
+statement ok
+UPDATE mtu_a a JOIN mtu_b b ON a.id = b.id SET a.v = b.bv + 1
+
+query
+SELECT id, v FROM mtu_a ORDER BY id
+----
+1	101
+2	20
+3	301
+
+# Updating a table other than the target (first) one is rejected by the
+# front-end. (A real mysqld instead updates mtu_b here, so this row is one of the
+# front-end-specific cases on which the MySQL reference run diverges.)
 statement error
 UPDATE mtu_a, mtu_b SET mtu_b.bv = 0 WHERE mtu_a.id = mtu_b.id
-
-# The explicit-JOIN spelling is not supported (use the comma form).
-statement error
-UPDATE mtu_a a JOIN mtu_b b ON a.id = b.id SET a.v = b.bv
