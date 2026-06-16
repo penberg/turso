@@ -1488,19 +1488,25 @@ impl Parser {
         }
 
         // `INSERT [INTO] tbl [(cols)] SELECT ...`: the rows come from a query,
-        // which the engine runs directly. The SELECT goes through the same
-        // parser as a top-level one, so it supports the same subset. A trailing
-        // `ON DUPLICATE KEY UPDATE` (valid MySQL, but not modeled here) is not
-        // accepted: `ON` is consumed as the final column's alias, so the leftover
-        // `DUPLICATE ...` surfaces as a syntax error.
+        // which the engine runs directly. The SELECT goes through the same parser
+        // as a top-level one, so it supports the same subset. A trailing `ON
+        // DUPLICATE KEY UPDATE` carries through, like the VALUES/SET forms (the
+        // `SELECT`'s rows are the would-be-inserted values). `ON` is reserved as a
+        // select-list alias (see `is_reserved_select_alias`), so the `SELECT` ends
+        // before it.
         if self.eat_keyword("SELECT") {
             let select = self.parse_select()?;
+            let upsert = if or_conflict.is_none() && self.eat_keyword("ON") {
+                Some(Box::new(self.on_duplicate_key_update()?))
+            } else {
+                None
+            };
             return Ok(ast::Stmt::Insert {
                 with: None,
                 or_conflict,
                 tbl_name,
                 columns,
-                body: ast::InsertBody::Select(select, None),
+                body: ast::InsertBody::Select(select, upsert),
                 returning: Vec::new(),
             });
         }
@@ -9775,6 +9781,11 @@ fn is_reserved_select_alias(word: &str) -> bool {
             // FROM-less select instead of consuming `LOCK` as the alias of <expr>.
             | "LOCK"
             | "WINDOW"
+            // `ON` begins an `INSERT ... SELECT ... ON DUPLICATE KEY UPDATE`
+            // clause, so — like `FOR`/`LOCK` — it is not a bare column alias (MySQL
+            // reserves it). This lets the `ON DUPLICATE` reach the INSERT path
+            // instead of consuming `ON` as the alias of the last select item.
+            | "ON"
             | "AS"
     )
 }

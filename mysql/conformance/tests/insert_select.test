@@ -62,3 +62,49 @@ SELECT id, name, n FROM isel_dst ORDER BY id
 2	b	120
 3	c	130
 11	a	20
+
+# A trailing ON DUPLICATE KEY UPDATE on the SELECT form: the query's rows are the
+# would-be-inserted values, updating a row that conflicts and inserting one that
+# does not -- just like the VALUES form.
+statement ok
+CREATE TABLE IF NOT EXISTS iseldup_tgt (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO iseldup_tgt (id, v) VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TABLE IF NOT EXISTS iseldup_src (id INT, v INT)
+
+statement ok
+INSERT INTO iseldup_src (id, v) VALUES (1, 100), (3, 30)
+
+# id=1 conflicts (updated to v + 5), id=3 is inserted as-is.
+statement ok
+INSERT INTO iseldup_tgt (id, v) SELECT id, v FROM iseldup_src ON DUPLICATE KEY UPDATE v = iseldup_tgt.v + 5
+
+query
+SELECT id, v FROM iseldup_tgt ORDER BY id
+----
+1	15
+2	20
+3	30
+
+# VALUES(col) in the UPDATE is the would-be-inserted value (the SELECT's column).
+statement ok
+INSERT INTO iseldup_tgt (id, v) SELECT id, v FROM iseldup_src ON DUPLICATE KEY UPDATE v = VALUES(v)
+
+query
+SELECT id, v FROM iseldup_tgt ORDER BY id
+----
+1	100
+2	20
+3	30
+
+# A literal SELECT (no FROM) with ON DUPLICATE KEY UPDATE also works.
+statement ok
+INSERT INTO iseldup_tgt (id, v) SELECT 2, 7 ON DUPLICATE KEY UPDATE v = v + 1
+
+query
+SELECT v FROM iseldup_tgt WHERE id = 2
+----
+21
