@@ -1,0 +1,48 @@
+# Adjacent string-literal concatenation.
+#
+# MySQL (following the SQL standard) concatenates string literals that are
+# adjacent in the source -- 'a' 'b' is 'ab' -- across whitespace, newlines, and
+# comments. The front-end joins the decoded text of a run of string literals into
+# one literal. A following non-string token (an alias, an operator, a comma) ends
+# the run, so an aliased or comma-separated literal is unaffected.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# Two and three adjacent literals concatenate.
+query
+SELECT 'foo' 'bar', 'a' 'b' 'c'
+----
+foobar	abc
+
+# Extra whitespace between the literals does not matter, and an escaped quote in a
+# piece is preserved.
+query
+SELECT 'one'    'two', 'a''b' 'c'
+----
+onetwo	a'bc
+
+# The combined literal is an ordinary string: it works inside a function and in a
+# comparison, and reports its true length.
+query
+SELECT CONCAT('x', 'a' 'b'), LENGTH('ab' 'cd'), ('x' 'y' = 'xy')
+----
+xab	4	1
+
+# A charset introducer composes with the concatenation.
+query
+SELECT _utf8mb4'a' 'b', N'a' 'b'
+----
+ab	ab
+
+# A trailing alias (with or without AS) ends the run and names the combined value.
+query
+SELECT 'a' 'b' AS lbl
+----
+ab
+
+# A comma separates columns -- it does not concatenate -- so two adjacent select
+# items each keep their own value.
+query
+SELECT 'a', 'b'
+----
+a	b

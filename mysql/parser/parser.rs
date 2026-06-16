@@ -3735,9 +3735,9 @@ impl Parser {
                 Ok(ast::Expr::Literal(ast::Literal::Numeric(n)))
             }
             Some(Token::Str(s)) => {
-                let lit = requote(s);
+                let value = s.clone();
                 self.advance();
-                Ok(ast::Expr::Literal(ast::Literal::String(lit)))
+                Ok(self.concat_adjacent_strings(value))
             }
             // A MySQL hex literal (`0x41` / `X'41'`) is a binary string; lower it
             // to the engine's blob literal, which holds the same hex digits.
@@ -3772,12 +3772,12 @@ impl Parser {
                 // identifier (`_foo`, a column) from being mistaken for one.
                 if is_charset_introducer(w) && matches!(self.peek_nth(1), Some(Token::Str(_))) {
                     self.advance(); // the introducer word
-                    let lit = match self.peek() {
-                        Some(Token::Str(s)) => requote(s),
+                    let value = match self.peek() {
+                        Some(Token::Str(s)) => s.clone(),
                         _ => unreachable!("a string literal follows the introducer"),
                     };
                     self.advance();
-                    return Ok(ast::Expr::Literal(ast::Literal::String(lit)));
+                    return Ok(self.concat_adjacent_strings(value));
                 }
                 match w.to_ascii_uppercase().as_str() {
                     "NULL" => {
@@ -3865,6 +3865,22 @@ impl Parser {
             Some(Token::QuotedIdent(_)) => self.column_ref(),
             _ => Err(self.unexpected("an expression")),
         }
+    }
+
+    /// Appends the decoded text of any string literals immediately following the
+    /// just-consumed first literal (`value` is that first literal's text), forming
+    /// one combined string literal. MySQL concatenates adjacent string literals —
+    /// `'a' 'b'` is `'ab'`, across whitespace, newlines, and comments (which the
+    /// lexer drops) — a SQL-standard quirk; a charset-introduced literal (`_x'a'`)
+    /// concatenates the same way. A following non-string token (e.g. an `AS`
+    /// keyword or an alias identifier) ends the run, so `'a' x` stays `'a'` aliased
+    /// `x`.
+    fn concat_adjacent_strings(&mut self, mut value: String) -> ast::Expr {
+        while let Some(Token::Str(next)) = self.peek() {
+            value.push_str(next);
+            self.advance();
+        }
+        ast::Expr::Literal(ast::Literal::String(requote(&value)))
     }
 
     /// Parses `CAST(expr AS type)`. The engine's `CAST` follows SQLite affinity
@@ -17341,5 +17357,30 @@ mod tests {
             parse_expr("N").unwrap(),
             ast::Expr::Id(_) | ast::Expr::Qualified(..)
         ));
+    }
+
+    #[test]
+    fn adjacent_string_literals_concatenate() {
+        // `'a' 'b' 'c'` is one literal `'abc'`, with the decoded pieces joined
+        // (an escaped quote in a piece is kept). A charset introducer composes.
+        for (sql, value) in [
+            ("'a' 'b'", "'ab'"),
+            ("'foo'  'bar'", "'foobar'"),
+            ("'a' 'b' 'c'", "'abc'"),
+            ("'a''b' 'c'", "'a''bc'"),
+            ("_utf8mb4'a' 'b'", "'ab'"),
+        ] {
+            assert_eq!(
+                parse_expr(sql).unwrap(),
+                ast::Expr::Literal(ast::Literal::String(value.to_string())),
+                "for `{sql}`"
+            );
+        }
+        // A lone literal is unchanged, and a following non-string token (here an
+        // identifier) ends the run rather than concatenating.
+        assert_eq!(
+            parse_expr("'solo'").unwrap(),
+            ast::Expr::Literal(ast::Literal::String("'solo'".to_string()))
+        );
     }
 }
