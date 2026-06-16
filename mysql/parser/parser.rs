@@ -3849,6 +3849,12 @@ impl Parser {
             return self.inet_ntoa_call();
         }
 
+        // `EXPORT_SET(bits, on, off[, sep[, n]])` writes `on`/`off` per bit of
+        // `bits`, separated by `sep` (see `export_set_call`).
+        if upper == "EXPORT_SET" {
+            return self.export_set_call();
+        }
+
         // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
         // comma-separated `strlist`, or 0; synthesized from comma-wrapped
         // string surgery.
@@ -4467,6 +4473,98 @@ impl Parser {
         let result = concat(result, octet(8));
         let result = concat(result, dot());
         Ok(concat(result, octet(0)))
+    }
+
+    /// Parses `EXPORT_SET(bits, on, off[, separator[, number_of_bits]])` (the
+    /// name and `(` are already consumed) and lowers it to the string with one
+    /// entry per low bit of `bits` — `on` where the bit is set, `off` where it is
+    /// not — joined by `separator` (default `,`), for `number_of_bits` bits
+    /// (default 64, clamped to `0..=64`).
+    ///
+    /// The lowering is `CONCAT_WS(sep, CASE WHEN bits & 1 THEN on ELSE off END,
+    /// CASE WHEN bits & 2 THEN on ELSE off END, ...)`. With `on`/`off` non-NULL
+    /// every entry is present, so `CONCAT_WS` joins exactly `number_of_bits` of
+    /// them. An outer guard returns NULL when `bits`, `on`, or `off` is NULL (and
+    /// a NULL `separator` makes `CONCAT_WS` itself NULL) — matching MySQL, which
+    /// returns NULL for a NULL argument. `number_of_bits` must be an integer
+    /// literal so the entry count is fixed at parse time.
+    fn export_set_call(&mut self) -> Result<ast::Expr> {
+        let bits = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let on = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let off = self.expr()?;
+        let sep = if self.eat(&Token::Comma) {
+            self.expr()?
+        } else {
+            ast::Expr::Literal(ast::Literal::String(requote(",")))
+        };
+        // `number_of_bits` (only after a separator) defaults to 64 and must be a
+        // literal so the number of entries is known now; MySQL clamps it to 64.
+        let num_bits = if self.eat(&Token::Comma) {
+            match self.expr()? {
+                ast::Expr::Literal(ast::Literal::Numeric(n)) => {
+                    n.parse::<i64>().unwrap_or(64).clamp(0, 64)
+                }
+                _ => {
+                    return Err(ParseError::Unsupported(
+                        "EXPORT_SET number_of_bits must be an integer literal".to_string(),
+                    ))
+                }
+            }
+        } else {
+            64
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        let mut args = vec![sep];
+        for i in 0..num_bits {
+            // Test bit `i` as `(bits >> i) & 1` rather than `bits & 2^i`, so the
+            // 64th mask (`2^63`) does not overflow the engine's signed 64-bit
+            // integer; the arithmetic shift still reads the sign bit correctly.
+            let shifted = if i == 0 {
+                bits.clone()
+            } else {
+                ast::Expr::binary(
+                    bits.clone(),
+                    ast::Operator::RightShift,
+                    ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                )
+            };
+            let test = ast::Expr::binary(shifted, ast::Operator::BitwiseAnd, one());
+            args.push(ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(Box::new(test), Box::new(on.clone()))],
+                else_expr: Some(Box::new(off.clone())),
+            });
+        }
+        // With no bits the result is empty (CONCAT_WS needs at least one value).
+        let joined = if num_bits == 0 {
+            ast::Expr::Literal(ast::Literal::String(requote("")))
+        } else {
+            call_fn("concat_ws", args)
+        };
+
+        // A NULL `bits`/`on`/`off` yields NULL (a NULL separator already makes
+        // CONCAT_WS NULL).
+        let guard = ast::Expr::binary(
+            ast::Expr::binary(
+                ast::Expr::is_null(bits),
+                ast::Operator::Or,
+                ast::Expr::is_null(on),
+            ),
+            ast::Operator::Or,
+            ast::Expr::is_null(off),
+        );
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(guard),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(joined)),
+        })
     }
 
     /// Parses a `FIND_IN_SET(str, strlist)` call (the name and `(` are already
@@ -11223,6 +11321,65 @@ mod tests {
             unreachable!()
         };
         assert_eq!(**low, col("n"));
+    }
+
+    #[test]
+    fn export_set_lowers_to_guarded_concat_ws() {
+        // EXPORT_SET(bits, on, off, sep, n) -> CASE WHEN <null guard> THEN NULL
+        // ELSE concat_ws(sep, CASE WHEN bits&1 THEN on ELSE off END, ... n ...).
+        let ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } = parse_expr("EXPORT_SET(bits, 'Y', 'N', '-', 4)").unwrap()
+        else {
+            panic!("expected EXPORT_SET to lower to a guard CASE");
+        };
+        assert_eq!(when_then_pairs.len(), 1);
+        assert_eq!(*when_then_pairs[0].1, ast::Expr::Literal(ast::Literal::Null));
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected concat_ws");
+        };
+        assert_eq!(name.as_str(), "concat_ws");
+        assert_eq!(args.len(), 5); // separator + four bit entries
+        // Each entry is `CASE WHEN (bits >> i) & 1 THEN on ELSE off END` (the
+        // shift is elided for bit 0), with the `off` value as the ELSE.
+        for (i, arg) in args[1..].iter().enumerate() {
+            let ast::Expr::Case { when_then_pairs, else_expr, .. } = arg.as_ref() else {
+                panic!("expected a bit CASE");
+            };
+            let ast::Expr::Binary(left, ast::Operator::BitwiseAnd, mask) = &*when_then_pairs[0].0
+            else {
+                panic!("expected `<bit> & 1`");
+            };
+            assert_eq!(**mask, num("1"));
+            if i == 0 {
+                assert_eq!(**left, col("bits"));
+            } else {
+                assert!(matches!(
+                    left.as_ref(),
+                    ast::Expr::Binary(_, ast::Operator::RightShift, _)
+                ));
+            }
+            assert!(else_expr.is_some(), "the off value is the ELSE");
+        }
+
+        // The separator and bit count default (',' and 64 entries).
+        let ast::Expr::Case { else_expr, .. } = parse_expr("EXPORT_SET(b, 'Y', 'N')").unwrap()
+        else {
+            unreachable!()
+        };
+        let ast::Expr::FunctionCall { args, .. } = else_expr.unwrap().as_ref().clone() else {
+            unreachable!()
+        };
+        assert_eq!(args.len(), 65); // separator + 64 entries
+        assert_eq!(*args[0], ast::Expr::Literal(ast::Literal::String("','".to_string())));
+
+        // A non-literal bit count is rejected.
+        assert!(matches!(
+            parse_expr("EXPORT_SET(b, 'Y', 'N', ',', c)").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
     }
 
     #[test]

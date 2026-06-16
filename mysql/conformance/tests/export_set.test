@@ -1,0 +1,55 @@
+# EXPORT_SET(bits, on, off[, separator[, number_of_bits]]) conformance.
+#
+# MySQL's EXPORT_SET writes one entry per low bit of `bits` -- `on` where the bit
+# is set, `off` where it is not -- joined by `separator` (default ','), for
+# `number_of_bits` bits (default 64, clamped to 0..64). The front-end lowers it
+# to CONCAT_WS(sep, CASE WHEN (bits >> 0) & 1 THEN on ELSE off END, ...), with an
+# outer guard returning NULL when bits/on/off is NULL (a NULL separator makes
+# CONCAT_WS itself NULL). number_of_bits must be an integer literal.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Brackets
+# make the empty result visible. This test needs no tables.
+
+# Bits are read from the least significant: 5 = 0b101 -> on,off,on,off.
+query
+SELECT EXPORT_SET(5, 'Y', 'N', ',', 4)
+----
+Y,N,Y,N
+
+# An empty separator concatenates the entries; 6 = 0b110 over 8 bits.
+query
+SELECT EXPORT_SET(6, '1', '0', '', 8), EXPORT_SET(170, '1', '0', '', 8)
+----
+01100000	01010101
+
+# A custom separator and a width of 3, and the all-zero case.
+query
+SELECT EXPORT_SET(5, 'on', 'off', '|', 3), EXPORT_SET(0, 'Y', 'N', '-', 4)
+----
+on|off|on	N-N-N-N
+
+# -1 has every bit set, so all entries are the `on` value.
+query
+SELECT EXPORT_SET(-1, '1', '0', '', 8)
+----
+11111111
+
+# The separator defaults to ',' and the width to 64 bits.
+query
+SELECT EXPORT_SET(5, 'Y', 'N') = EXPORT_SET(5, 'Y', 'N', ',', 64)
+----
+1
+
+# A NULL bits / on / off / separator yields NULL.
+query
+SELECT EXPORT_SET(NULL, 'Y', 'N', ',', 4) IS NULL,
+       EXPORT_SET(5, NULL, 'N', ',', 4) IS NULL,
+       EXPORT_SET(5, 'Y', 'N', NULL, 4) IS NULL
+----
+1	1	1
+
+# A width of 0 yields the empty string.
+query
+SELECT CONCAT('[', EXPORT_SET(5, 'Y', 'N', ',', 0), ']')
+----
+[]
