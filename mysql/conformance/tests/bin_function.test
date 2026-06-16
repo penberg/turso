@@ -1,0 +1,62 @@
+# BIN(n) conformance.
+#
+# MySQL's BIN(n) returns the base-2 string of n (taken as an unsigned 64-bit
+# value), with no leading zeros. The front-end builds the 64 bit characters
+# most-significant first -- each CASE WHEN (n >> i) & 1 THEN '1' ELSE '0' END
+# (the arithmetic shift reads the sign bit, so BIN(-1) is 64 ones) -- joins them
+# with the engine's flat concat() and strips the leading zeros via ltrim(.,'0').
+# A guard returns '0' for n = 0 and NULL for a NULL argument.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. This test
+# needs no tables.
+
+# Small values and powers of two.
+query
+SELECT BIN(0), BIN(1), BIN(5), BIN(12), BIN(1024)
+----
+0	1	101	1100	10000000000
+
+# A full byte and an alternating pattern.
+query
+SELECT BIN(255), BIN(170), BIN(64)
+----
+11111111	10101010	1000000
+
+# The full 64-bit range as unsigned: -1 is 64 ones, the i64 min is a 1 then 63
+# zeros, and the i64 max is 63 ones.
+query
+SELECT BIN(-1)
+----
+1111111111111111111111111111111111111111111111111111111111111111
+
+query
+SELECT BIN(-9223372036854775808), BIN(9223372036854775807)
+----
+1000000000000000000000000000000000000000000000000000000000000000	111111111111111111111111111111111111111111111111111111111111111
+
+# The argument may be any integer expression.
+query
+SELECT BIN(3 << 2), BIN(255 & 9)
+----
+1100	1001
+
+# NULL propagates.
+query
+SELECT BIN(NULL) IS NULL
+----
+1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS binstr_demo (id INT PRIMARY KEY, n INT)
+
+statement ok
+INSERT INTO binstr_demo (id, n) VALUES (1, 2), (2, 6), (3, 10), (4, 0)
+
+query
+SELECT id, BIN(n) FROM binstr_demo ORDER BY id
+----
+1	10
+2	110
+3	1010
+4	0

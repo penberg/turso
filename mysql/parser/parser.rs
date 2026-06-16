@@ -3866,6 +3866,11 @@ impl Parser {
             return self.bit_count_call();
         }
 
+        // `BIN(n)` is the binary string of `n` (see `bin_call`).
+        if upper == "BIN" {
+            return self.bin_call();
+        }
+
         // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
         // comma-separated `strlist`, or 0; synthesized from comma-wrapped
         // string surgery.
@@ -4662,6 +4667,65 @@ impl Parser {
             terms = next;
         }
         Ok(terms.pop().expect("64 bit terms reduce to one"))
+    }
+
+    /// Parses `BIN(n)` (the name and `(` are already consumed) and lowers it to
+    /// the base-2 string of `n` (taken as unsigned 64-bit), with no leading
+    /// zeros. It builds the 64 bit characters most-significant first — each
+    /// `CASE WHEN (n >> i) & 1 THEN '1' ELSE '0' END` (the arithmetic shift reads
+    /// the sign bit, so `BIN(-1)` is 64 ones, as in MySQL) — joins them with the
+    /// engine's flat `concat` (not the front-end `CONCAT`, whose `||` chain would
+    /// nest 64 deep and overflow the evaluator), and strips the leading zeros with
+    /// `ltrim(..., '0')`. A guard returns `'0'` for `n = 0` (where the trim would
+    /// leave the empty string) and NULL for a NULL argument.
+    fn bin_call(&mut self) -> Result<ast::Expr> {
+        let n = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let bit_char = |c: &str| ast::Expr::Literal(ast::Literal::String(requote(c)));
+        let bits: Vec<ast::Expr> = (0..64)
+            .rev()
+            .map(|i| {
+                let shifted = if i == 0 {
+                    n.clone()
+                } else {
+                    ast::Expr::binary(
+                        n.clone(),
+                        ast::Operator::RightShift,
+                        ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                    )
+                };
+                let test = ast::Expr::binary(
+                    shifted,
+                    ast::Operator::BitwiseAnd,
+                    ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+                );
+                ast::Expr::Case {
+                    base: None,
+                    when_then_pairs: vec![(Box::new(test), Box::new(bit_char("1")))],
+                    else_expr: Some(Box::new(bit_char("0"))),
+                }
+            })
+            .collect();
+        let joined = call_fn("concat", bits);
+        let trimmed = call_fn("ltrim", vec![joined, bit_char("0")]);
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![
+                (
+                    Box::new(ast::Expr::is_null(n.clone())),
+                    Box::new(ast::Expr::Literal(ast::Literal::Null)),
+                ),
+                (
+                    Box::new(ast::Expr::binary(
+                        n,
+                        ast::Operator::Equals,
+                        ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+                    )),
+                    Box::new(bit_char("0")),
+                ),
+            ],
+            else_expr: Some(Box::new(trimmed)),
+        })
     }
 
     /// Parses a `FIND_IN_SET(str, strlist)` call (the name and `(` are already
@@ -11522,6 +11586,39 @@ mod tests {
         assert_eq!(leaves, 64, "one term per bit");
         // A balanced tree of 64 leaves is depth 6, far below a 64-deep chain.
         assert!(max_depth <= 6, "tree should be balanced, got depth {max_depth}");
+    }
+
+    #[test]
+    fn bin_lowers_to_trimmed_flat_concat_of_bits() {
+        // BIN(n) -> CASE WHEN n IS NULL THEN NULL WHEN n = 0 THEN '0'
+        //           ELSE ltrim(concat(<64 bit CASEs>), '0') END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("BIN(n)").unwrap()
+        else {
+            panic!("expected BIN to lower to a guard CASE");
+        };
+        assert!(base.is_none());
+        assert_eq!(when_then_pairs.len(), 2);
+        // Guards: NULL -> NULL, 0 -> '0'.
+        assert_eq!(*when_then_pairs[0].1, ast::Expr::Literal(ast::Literal::Null));
+        assert_eq!(
+            *when_then_pairs[1].1,
+            ast::Expr::Literal(ast::Literal::String("'0'".to_string()))
+        );
+        // ELSE is ltrim(concat(...), '0') — a flat 64-arg concat (no `||` nest).
+        let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone() else {
+            panic!("expected ltrim()");
+        };
+        assert_eq!(name.as_str(), "ltrim");
+        assert_eq!(args.len(), 2);
+        let ast::Expr::FunctionCall { name, args, .. } = args[0].as_ref() else {
+            panic!("expected concat()");
+        };
+        assert_eq!(name.as_str(), "concat");
+        assert_eq!(args.len(), 64, "one bit char per bit, flat");
     }
 
     #[test]
