@@ -1,0 +1,57 @@
+# Double-quoted string literals (MySQL default sql_mode).
+#
+# In MySQL's default sql_mode (no ANSI_QUOTES, which WordPress runs under) a
+# double-quoted token is a string literal, identical to a single-quoted one;
+# identifiers use backticks. The lexer treats "..." as a string, with the
+# delimiter doubled ("") and the usual backslash escapes.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (in its
+# default mode). Uses a file-unique table name.
+
+# A double-quoted token is a string value, the same as single-quoted.
+query
+SELECT "hello", "hello" = 'hello'
+----
+hello	1
+
+# The delimiter is escaped by doubling it, and `\"` is a backslash escape.
+query
+SELECT "a""b", "c\"d"
+----
+a"b	c"d
+
+# Single quotes inside a double-quoted string are literal (and vice versa).
+query
+SELECT "it's here", 'say "hi"'
+----
+it's here	say "hi"
+
+# A backslash escape (\n is a newline) works as in a single-quoted string.
+query
+SELECT "x\ny" = CONCAT('x', CHAR(10), 'y')
+----
+1
+
+# Usable anywhere a string is — function arguments and comparisons.
+query
+SELECT CONCAT("foo", "bar"), LENGTH("café")
+----
+foobar	5
+
+statement ok
+CREATE TABLE dqstr (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO dqstr VALUES (1, "apple"), (2, "banana")
+
+# A double-quoted string in WHERE compares as a value, not a column name.
+query
+SELECT id FROM dqstr WHERE s = "apple"
+----
+1
+
+# Backticks remain the identifier quote (unaffected by the change).
+query
+SELECT `id` FROM `dqstr` WHERE `s` = "banana"
+----
+2

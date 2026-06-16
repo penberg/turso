@@ -3,8 +3,9 @@
 //! A small hand-written lexer for MySQL SQL.
 //!
 //! It recognizes the token vocabulary needed by the supported grammar:
-//! identifiers (bare, backtick-, and double-quoted), string and numeric
-//! literals, and the handful of punctuation characters used by
+//! identifiers (bare and backtick-quoted), string literals (single- or, in
+//! MySQL's default mode, double-quoted), numeric literals, and the handful of
+//! punctuation characters used by
 //! `CREATE TABLE`. Comments (`-- ...`, `# ...`, and `/* ... */`) and whitespace
 //! are skipped.
 
@@ -87,8 +88,11 @@ impl<'a> Lexer<'a> {
             b'+' => self.single(Token::Plus),
             b'?' => self.single(Token::Param),
             b'`' => self.read_delimited(b'`', "identifier")?,
-            b'"' => self.read_delimited(b'"', "identifier")?,
-            b'\'' => self.read_string()?,
+            // In MySQL's default `sql_mode` a double-quoted token is a string
+            // literal, not an identifier (which uses backticks); `ANSI_QUOTES`
+            // would make it an identifier, but WordPress does not set it.
+            b'"' => self.read_string(b'"')?,
+            b'\'' => self.read_string(b'\'')?,
             // MySQL hex-string literal `X'41'` / `x'41'` — checked before the
             // identifier path, which `x` would otherwise take.
             b'x' | b'X' if self.peek_at(1) == Some(b'\'') => self.read_hex_string()?,
@@ -233,8 +237,8 @@ impl<'a> Lexer<'a> {
         Ok(Token::Blob(hex))
     }
 
-    /// Reads a delimited identifier (backtick or double quote). The delimiter is
-    /// escaped by doubling it.
+    /// Reads a backtick-delimited identifier. The delimiter is escaped by
+    /// doubling it.
     fn read_delimited(&mut self, delim: u8, kind: &'static str) -> Result<Token> {
         let start = self.pos;
         self.pos += 1; // opening delimiter
@@ -267,9 +271,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Reads a single-quoted string literal. Handles `''` doubling and the
-    /// common backslash escapes.
-    fn read_string(&mut self) -> Result<Token> {
+    /// Reads a string literal delimited by `delim` — a single `'` or, in MySQL's
+    /// default `sql_mode` (no `ANSI_QUOTES`), a double `"`. Handles the delimiter
+    /// doubled (`''` / `""`) and the common backslash escapes.
+    fn read_string(&mut self, delim: u8) -> Result<Token> {
         let start = self.pos;
         self.pos += 1; // opening quote
 
@@ -284,9 +289,9 @@ impl<'a> Lexer<'a> {
                         kind: "string literal",
                     })
                 }
-                Some(b'\'') => {
-                    if self.peek_at(1) == Some(b'\'') {
-                        value.push(b'\'');
+                Some(c) if c == delim => {
+                    if self.peek_at(1) == Some(delim) {
+                        value.push(delim);
                         self.pos += 2;
                     } else {
                         self.pos += 1; // closing quote
@@ -372,6 +377,21 @@ mod tests {
         // Escapes and doubled quotes still work.
         assert_eq!(first_string(r"SELECT 'a\tb'"), "a\tb");
         assert_eq!(first_string("SELECT 'it''s'"), "it's");
+    }
+
+    #[test]
+    fn double_quoted_token_is_a_string_not_an_identifier() {
+        // In MySQL's default mode `"..."` is a string literal (Str), while a
+        // backtick token stays an identifier (QuotedIdent).
+        assert_eq!(tokens(r#""hi""#), vec![Token::Str("hi".into())]);
+        assert_eq!(tokens("`hi`"), vec![Token::QuotedIdent("hi".into())]);
+        // The delimiter is escaped by doubling (`""`) or a backslash (`\"`).
+        assert_eq!(first_string(r#"SELECT "a""b""#), "a\"b");
+        assert_eq!(first_string(r#"SELECT "a\"b""#), "a\"b");
+        // Backslash escapes and embedded single quotes behave as in a
+        // single-quoted string.
+        assert_eq!(first_string(r#"SELECT "a\tb""#), "a\tb");
+        assert_eq!(first_string(r#"SELECT "it's""#), "it's");
     }
 
     fn tokens(sql: &str) -> Vec<Token> {
