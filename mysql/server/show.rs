@@ -704,7 +704,14 @@ fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResu
          AND name NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\'"
         .to_string();
     if let Some(pat) = &show.like {
-        query.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
+        // MySQL's `LIKE` uses backslash as the default escape character, so a
+        // WordPress table-existence check (`SHOW TABLES LIKE 'wp\_options'`, from
+        // `$wpdb->esc_like()`) matches a literal underscore; the engine's `LIKE`
+        // has none, so supply `ESCAPE '\'` (as the `SHOW TABLE STATUS` path does).
+        query.push_str(&format!(
+            " AND name LIKE '{}' ESCAPE '\\'",
+            pat.replace('\'', "''")
+        ));
     }
     query.push_str(" ORDER BY name");
 

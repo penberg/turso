@@ -1,0 +1,55 @@
+# SHOW TABLES LIKE — MySQL's default backslash escape.
+#
+# MySQL's LIKE uses backslash as the default escape character, so `\_` matches a
+# literal underscore and `\%` a literal percent. WordPress checks whether a table
+# exists with `SHOW TABLES LIKE` of `$wpdb->esc_like($table)`, which escapes every
+# `_` -- e.g. `SHOW TABLES LIKE 'wp\_options'`. The engine's LIKE has no escape
+# character, so without `ESCAPE '\'` the pattern matched nothing (the `\` was
+# literal) and WordPress concluded the table was missing. The front-end now
+# supplies `ESCAPE '\'` on the SHOW TABLES filter, as it already did for SHOW
+# TABLE STATUS.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses
+# lowercase names so identifier-case / ORDER-BY-collation differences between the
+# engine and a real server do not affect the comparison.
+
+statement ok
+CREATE TABLE IF NOT EXISTS escq_one (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE IF NOT EXISTS escq_two (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE IF NOT EXISTS escqzone (id INT PRIMARY KEY)
+
+# An escaped underscore matches a literal underscore, so it matches `escq_one`
+# but not `escqzone` (where an unescaped `_` wildcard would match both).
+query
+SHOW TABLES LIKE 'escq\_one'
+----
+escq_one
+
+# Escaped underscore followed by a wildcard matches only the underscore-named
+# tables.
+query
+SHOW TABLES LIKE 'escq\_%'
+----
+escq_one
+escq_two
+
+# SHOW FULL TABLES applies the escape identically.
+query
+SHOW FULL TABLES LIKE 'escq\_two'
+----
+escq_two	BASE TABLE
+
+# A plain name with no wildcard matches exactly.
+query
+SHOW TABLES LIKE 'escqzone'
+----
+escqzone
+
+# A non-matching escaped pattern returns nothing.
+query
+SHOW TABLES LIKE 'zzz\_none'
+----
