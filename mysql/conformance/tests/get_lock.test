@@ -1,14 +1,17 @@
-# GET_LOCK / RELEASE_LOCK conformance (single-node no-op model).
+# Advisory-lock functions (single-node no-op model).
 #
-# MySQL's GET_LOCK(name, timeout) / RELEASE_LOCK(name) are cooperative advisory
-# locks. This is a single-node engine with no cross-session lock table, so the
-# front-end folds both to the constant 1 ("acquired" / "released"). For the
-# uncontended acquire-then-release flow WordPress uses, that is exactly MySQL's
-# result, so these queries match a real mysqld.
+# MySQL's GET_LOCK / RELEASE_LOCK / IS_FREE_LOCK / IS_USED_LOCK /
+# RELEASE_ALL_LOCKS are cooperative advisory locks. This is a single-node engine
+# with no cross-session lock table, so the front-end folds them to the constants
+# MySQL returns when no lock is held: GET_LOCK / RELEASE_LOCK / IS_FREE_LOCK are
+# 1, IS_USED_LOCK is NULL, and RELEASE_ALL_LOCKS is 0. For the uncontended
+# acquire-then-release flow WordPress uses, that matches a real mysqld.
 #
 # NOT modeled (see mysql/COMPAT.md): contention (MySQL GET_LOCK can return 0 on
-# timeout) and releasing a lock this session never held (MySQL returns 0). Those
-# cases are avoided here, and a NULL/error case is not asserted.
+# timeout), and the held-lock cases — after GET_LOCK, MySQL's IS_FREE_LOCK is 0,
+# IS_USED_LOCK is the connection id, and RELEASE_ALL_LOCKS is the count released.
+# Those are avoided here: every lock acquired is released in the same statement,
+# so no lock is ever held when IS_FREE_LOCK / RELEASE_ALL_LOCKS run.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -19,14 +22,22 @@ SELECT GET_LOCK('conf_lock', 0), RELEASE_LOCK('conf_lock')
 ----
 1	1
 
-# A non-zero timeout argument is accepted and ignored.
+# A non-zero timeout argument is accepted and ignored; release to leave no lock
+# held.
 query
-SELECT GET_LOCK('conf_lock_2', 10)
-----
-1
-
-# Lock names are arbitrary strings; a second distinct lock also succeeds.
-query
-SELECT GET_LOCK('another', 0), RELEASE_LOCK('another')
+SELECT GET_LOCK('conf_lock_2', 10), RELEASE_LOCK('conf_lock_2')
 ----
 1	1
+
+# With no lock held: a lock is free (1), has no holder (NULL), and there is
+# nothing to release (0).
+query
+SELECT IS_FREE_LOCK('conf_free'), IS_USED_LOCK('conf_free'), RELEASE_ALL_LOCKS()
+----
+1	NULL	0
+
+# The companions take an arbitrary name and compose in expressions.
+query
+SELECT IS_FREE_LOCK('a') + IS_FREE_LOCK('b'), IS_USED_LOCK('a') IS NULL
+----
+2	1

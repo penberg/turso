@@ -4253,14 +4253,23 @@ impl Parser {
             return self.right_call();
         }
 
-        // `GET_LOCK(name[, timeout])` / `RELEASE_LOCK(name)` are MySQL advisory
-        // locks. This is a single-node engine with no cross-session lock table,
-        // so they fold to a constant `1` ("acquired" / "released") — matching
-        // MySQL for the uncontended acquire/release flow WordPress uses. The lock
-        // name and timeout are parsed and discarded. The contended/not-held cases
-        // (where MySQL returns 0 or NULL) are not modeled (see `mysql/COMPAT.md`).
-        if upper == "GET_LOCK" || upper == "RELEASE_LOCK" {
-            return self.advisory_lock_call();
+        // The MySQL advisory-lock functions. This is a single-node engine with no
+        // cross-session lock table, so they fold to constants matching MySQL's
+        // result when no lock is actually held — the uncontended flow WordPress
+        // uses: `GET_LOCK` (acquired) and `RELEASE_LOCK` (released) and
+        // `IS_FREE_LOCK` (free) are `1`, `IS_USED_LOCK` (no holder) is NULL, and
+        // `RELEASE_ALL_LOCKS` (nothing to release) is `0`. The lock name and
+        // timeout are parsed and discarded. The contended/held cases (where MySQL
+        // would return 0, a connection id, or a non-zero count) are not modeled
+        // (see `mysql/COMPAT.md`).
+        if upper == "GET_LOCK" || upper == "RELEASE_LOCK" || upper == "IS_FREE_LOCK" {
+            return self.advisory_lock_call(*numeric_expr("1"));
+        }
+        if upper == "IS_USED_LOCK" {
+            return self.advisory_lock_call(ast::Expr::Literal(ast::Literal::Null));
+        }
+        if upper == "RELEASE_ALL_LOCKS" {
+            return self.advisory_lock_call(*numeric_expr("0"));
         }
 
         // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
@@ -5298,12 +5307,13 @@ impl Parser {
         ))
     }
 
-    /// Parses a `GET_LOCK(name[, timeout])` / `RELEASE_LOCK(name)` advisory-lock
-    /// call (the name and `(` are already consumed), discards its arguments, and
-    /// folds it to the literal `1`. This single-node engine has no cross-session
-    /// lock table, so the no-op model always reports success; the contended and
-    /// not-held cases (where MySQL returns 0 or NULL) are not reproduced.
-    fn advisory_lock_call(&mut self) -> Result<ast::Expr> {
+    /// Parses an advisory-lock call (the name and `(` are already consumed),
+    /// discards its arguments, and folds it to `result` — the constant the no-op
+    /// lock model reports (chosen per function at the call site). This
+    /// single-node engine has no cross-session lock table, so the held/contended
+    /// cases (where MySQL returns 0, a connection id, or a non-zero count) are not
+    /// reproduced.
+    fn advisory_lock_call(&mut self, result: ast::Expr) -> Result<ast::Expr> {
         if !self.is(&Token::RParen) {
             loop {
                 let _ = self.expr()?;
@@ -5314,7 +5324,7 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen, "`)`")?;
-        Ok(ast::Expr::Literal(ast::Literal::Numeric("1".to_string())))
+        Ok(result)
     }
 
     /// Parses `TRUNCATE(x, d)` (the name and `(` are already consumed) and lowers
@@ -12463,14 +12473,27 @@ mod tests {
     }
 
     #[test]
-    fn advisory_locks_fold_to_one() {
-        // GET_LOCK / RELEASE_LOCK fold to the literal 1 regardless of arguments.
-        for sql in ["GET_LOCK('x', 0)", "GET_LOCK('x', 10)", "RELEASE_LOCK('x')"] {
+    fn advisory_locks_fold_to_constants() {
+        // GET_LOCK / RELEASE_LOCK / IS_FREE_LOCK fold to 1 regardless of arguments.
+        for sql in [
+            "GET_LOCK('x', 0)",
+            "GET_LOCK('x', 10)",
+            "RELEASE_LOCK('x')",
+            "IS_FREE_LOCK('x')",
+        ] {
             assert!(
                 matches!(parse_expr(sql).unwrap(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1"),
                 "expected `{sql}` to fold to 1"
             );
         }
+        // IS_USED_LOCK folds to NULL, RELEASE_ALL_LOCKS to 0.
+        assert!(matches!(
+            parse_expr("IS_USED_LOCK('x')").unwrap(),
+            ast::Expr::Literal(ast::Literal::Null)
+        ));
+        assert!(
+            matches!(parse_expr("RELEASE_ALL_LOCKS()").unwrap(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0")
+        );
     }
 
     #[test]
