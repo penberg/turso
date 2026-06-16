@@ -30,6 +30,13 @@ pub struct Parser {
     /// right-hand side, where the `VALUES(col)` pseudo-function refers to the
     /// would-be-inserted value and lowers to the engine's `excluded.col`.
     in_upsert_assignment: bool,
+    /// The MySQL 8.0.19+ `INSERT ... VALUES (...) AS alias` row-alias name, if
+    /// given: inside `ON DUPLICATE KEY UPDATE`, `alias.col` is the would-be-
+    /// inserted value (like `VALUES(col)`) and lowers to `excluded.col`.
+    upsert_row_alias: Option<String>,
+    /// Column aliases from `AS alias (c1, c2, ...)`, mapped positionally to the
+    /// INSERT column list — `(column_alias, actual_column)` pairs.
+    upsert_col_aliases: Vec<(String, String)>,
 }
 
 impl Parser {
@@ -45,6 +52,8 @@ impl Parser {
             eof: input.len(),
             params: 0,
             in_upsert_assignment: false,
+            upsert_row_alias: None,
+            upsert_col_aliases: Vec::new(),
         })
     }
 
@@ -1252,6 +1261,9 @@ impl Parser {
     /// inserting, which is exactly the engine's `INSERT OR REPLACE`. The keyword
     /// has already been consumed.
     fn insert(&mut self, or_conflict: Option<ast::ResolveType>) -> Result<ast::Stmt> {
+        // Reset any row-alias state from a previous INSERT in the same batch.
+        self.upsert_row_alias = None;
+        self.upsert_col_aliases.clear();
         // MySQL's priority modifiers (`LOW_PRIORITY`/`DELAYED`/`HIGH_PRIORITY`) are
         // locking/scheduling hints with no bearing on the result, and `DELAYED` is
         // deprecated and treated as a normal insert by modern MySQL too; consume
@@ -1339,6 +1351,37 @@ impl Parser {
                 continue;
             }
             break;
+        }
+
+        // MySQL 8.0.19+ row alias: `VALUES (...) AS alias [(col, ...)]` names the
+        // new row so `ON DUPLICATE KEY UPDATE` can reference it as `alias.col`
+        // instead of the deprecated `VALUES(col)`. Capture the alias (and any
+        // column aliases, mapped positionally to the INSERT column list) so the
+        // upsert assignment can rewrite `alias.col` to the engine's `excluded.col`.
+        if or_conflict.is_none() && self.eat_keyword("AS") {
+            let alias = self.name()?;
+            self.upsert_row_alias = Some(alias.as_str().to_string());
+            if self.eat(&Token::LParen) {
+                let mut col_aliases = Vec::new();
+                loop {
+                    col_aliases.push(self.name()?);
+                    if self.eat(&Token::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(&Token::RParen, "`)`")?;
+                if columns.is_empty() || col_aliases.len() != columns.len() {
+                    return Err(ParseError::Unsupported(
+                        "INSERT ... AS alias (cols) needs a matching INSERT column list".to_string(),
+                    ));
+                }
+                self.upsert_col_aliases = col_aliases
+                    .iter()
+                    .zip(&columns)
+                    .map(|(a, c)| (a.as_str().to_string(), c.as_str().to_string()))
+                    .collect();
+            }
         }
 
         // `ON DUPLICATE KEY UPDATE` is an INSERT-only clause; REPLACE has its
@@ -5698,8 +5741,46 @@ impl Parser {
         let first = self.name()?;
         if self.eat(&Token::Dot) {
             let second = self.name()?;
+            // Inside `ON DUPLICATE KEY UPDATE`, a reference qualified by the
+            // VALUES row alias (`alias.col`, MySQL 8.0.19+) is the would-be-
+            // inserted value — the same as `VALUES(col)` — and lowers to the
+            // engine's `excluded.col`. A column alias is mapped to the actual
+            // column it stands for.
+            if self.in_upsert_assignment
+                && self
+                    .upsert_row_alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(first.as_str()))
+            {
+                let actual = self
+                    .upsert_col_aliases
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(second.as_str()))
+                    .map(|(_, c)| ast::Name::from_string(c))
+                    .unwrap_or(second);
+                return Ok(ast::Expr::Qualified(
+                    ast::Name::from_string("excluded"),
+                    actual,
+                ));
+            }
             Ok(ast::Expr::Qualified(first, second))
         } else {
+            // A bare reference to a VALUES column alias (`AS alias (c1, c2)`)
+            // inside the upsert is the new row's value, lowered to the engine's
+            // `excluded.<actual column>`. (The unqualified spelling is how MySQL
+            // exposes column aliases; the `alias.col` spelling is handled above.)
+            if self.in_upsert_assignment {
+                if let Some((_, actual)) = self
+                    .upsert_col_aliases
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(first.as_str()))
+                {
+                    return Ok(ast::Expr::Qualified(
+                        ast::Name::from_string("excluded"),
+                        ast::Name::from_string(actual),
+                    ));
+                }
+            }
             Ok(ast::Expr::Id(first))
         }
     }
@@ -8764,6 +8845,48 @@ mod tests {
         // `VALUES(col)` outside an upsert assignment is still rejected (the flag
         // is scoped to the assignment RHS).
         assert!(parse("SELECT VALUES(n) FROM t").is_err());
+    }
+
+    #[test]
+    fn insert_row_alias_lowers_to_excluded() {
+        // Returns the single upsert assignment's RHS expression.
+        fn upsert_rhs(sql: &str) -> ast::Expr {
+            let ast::Stmt::Insert {
+                body: ast::InsertBody::Select(_, Some(upsert)),
+                ..
+            } = parse(sql).unwrap()
+            else {
+                panic!("expected an upsert for `{sql}`");
+            };
+            let ast::UpsertDo::Set { sets, .. } = upsert.do_clause else {
+                panic!("expected DO UPDATE SET");
+            };
+            *sets.into_iter().next().unwrap().expr
+        }
+
+        // The MySQL 8.0.19+ row alias: `... AS new ... new.a` -> `excluded.a`.
+        assert!(matches!(
+            upsert_rhs("INSERT INTO t (a) VALUES (1) AS new ON DUPLICATE KEY UPDATE a = new.a"),
+            ast::Expr::Qualified(tbl, col) if tbl.as_str() == "excluded" && col.as_str() == "a"
+        ));
+
+        // Column aliases: `AS new (na) ... na` maps to the actual column `a`.
+        assert!(matches!(
+            upsert_rhs("INSERT INTO t (a) VALUES (1) AS new (na) ON DUPLICATE KEY UPDATE a = na"),
+            ast::Expr::Qualified(tbl, col) if tbl.as_str() == "excluded" && col.as_str() == "a"
+        ));
+
+        // A column-alias list must match the INSERT column count.
+        assert!(parse(
+            "INSERT INTO t (a, b) VALUES (1, 2) AS new (x) ON DUPLICATE KEY UPDATE a = x"
+        )
+        .is_err());
+
+        // The alias does not leak: a later plain INSERT's `new.a` is unchanged.
+        let stmt = parse("INSERT INTO t (a) VALUES (new.a)");
+        // (References `new.a` outside any upsert — parses as a normal qualified
+        // column, not rewritten to `excluded`.)
+        assert!(stmt.is_ok());
     }
 
     #[test]

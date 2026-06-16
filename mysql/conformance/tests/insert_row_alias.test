@@ -1,0 +1,49 @@
+# INSERT ... VALUES (...) AS alias ON DUPLICATE KEY UPDATE (MySQL 8.0.19+).
+#
+# The row alias names the would-be-inserted row so the UPDATE can reference its
+# values as `alias.col` (or, with a column-alias list `AS alias (c1, ...)`, as
+# the bare aliases) -- the modern replacement for the deprecated VALUES(col).
+# The front-end lowers such a reference to the engine's `excluded.col`, the same
+# as VALUES(col). It previously rejected the `AS alias` syntax.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS ira (id INT PRIMARY KEY, a INT, b VARCHAR(10))
+
+statement ok
+INSERT INTO ira (id, a, b) VALUES (1, 5, 'x')
+
+# Conflict on the primary key: the UPDATE uses the row alias to read the new
+# values, and the table name to read the existing row.
+statement ok
+INSERT INTO ira (id, a, b) VALUES (1, 9, 'z') AS new
+  ON DUPLICATE KEY UPDATE a = new.a, b = CONCAT(ira.b, new.b)
+
+query
+SELECT id, a, b FROM ira ORDER BY id
+----
+1	9	xz
+
+# A column-alias list: the bare aliases stand for the new row's columns.
+statement ok
+INSERT INTO ira (id, a, b) VALUES (1, 100, 'q') AS new (ni, na, nb)
+  ON DUPLICATE KEY UPDATE a = na + 1, b = nb
+
+query
+SELECT id, a, b FROM ira ORDER BY id
+----
+1	101	q
+
+# No conflict (new id): the row is inserted and the ON DUPLICATE clause is not
+# applied, so the alias is harmless.
+statement ok
+INSERT INTO ira (id, a, b) VALUES (2, 7, 'w') AS new
+  ON DUPLICATE KEY UPDATE a = new.a
+
+query
+SELECT id, a, b FROM ira ORDER BY id
+----
+1	101	q
+2	7	w
