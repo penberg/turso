@@ -6347,11 +6347,19 @@ fn guarded_substr(target: ast::Expr, pos: ast::Expr, len: Option<ast::Expr>) -> 
 /// goes non-positive, contributing no padding). NULL in any argument propagates,
 /// because the padding is always concatenated with `target` before truncation.
 /// `length()` here is the engine's character count, matching MySQL's per-char
-/// padding. (A negative `len` yields the empty string rather than MySQL's NULL,
-/// and an empty `pad` yields `target` unchanged — minor documented edges.)
+/// padding.
+///
+/// Two guards match MySQL's edge semantics, which the bare `substr`/`REPEAT`
+/// lowering gets wrong: a negative `len` yields `NULL` (not the empty string),
+/// and an empty `pad` when padding is actually needed (`len > length(target)`)
+/// yields the empty string (not `target` unchanged — with no fill characters
+/// MySQL cannot reach the requested length). Both guards fall through to the
+/// `ELSE` body on a NULL operand (`len < 0`, `length(pad) = 0`, and the
+/// comparisons all evaluate to NULL, never true), so NULL still propagates.
 fn pad_expr(left: bool, target: ast::Expr, len: ast::Expr, pad: ast::Expr) -> ast::Expr {
     let one = || ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
-    let filler = repeat_expr(pad, len.clone());
+    let zero = || ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+    let filler = repeat_expr(pad.clone(), len.clone());
     let body = if left {
         let fill_len = ast::Expr::binary(
             len.clone(),
@@ -6359,11 +6367,32 @@ fn pad_expr(left: bool, target: ast::Expr, len: ast::Expr, pad: ast::Expr) -> as
             unary_fn("length", target.clone()),
         );
         let fill = substr_fn(filler, one(), fill_len);
-        ast::Expr::binary(fill, ast::Operator::Concat, target)
+        ast::Expr::binary(fill, ast::Operator::Concat, target.clone())
     } else {
-        ast::Expr::binary(target, ast::Operator::Concat, filler)
+        ast::Expr::binary(target.clone(), ast::Operator::Concat, filler)
     };
-    substr_fn(body, one(), len)
+    let body = substr_fn(body, one(), len.clone());
+
+    // len < 0 -> NULL, like MySQL.
+    let len_negative = ast::Expr::binary(len.clone(), ast::Operator::Less, zero());
+    // length(pad) = 0 AND len > length(target) -> '' (cannot pad with nothing).
+    let pad_empty = ast::Expr::binary(unary_fn("length", pad), ast::Operator::Equals, zero());
+    let needs_pad = ast::Expr::binary(len, ast::Operator::Greater, unary_fn("length", target));
+    let unpaddable = ast::Expr::binary(pad_empty, ast::Operator::And, needs_pad);
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![
+            (
+                Box::new(len_negative),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            ),
+            (
+                Box::new(unpaddable),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("")))),
+            ),
+        ],
+        else_expr: Some(Box::new(body)),
+    }
 }
 
 /// Builds the lowering for MySQL's `a XOR b`: `(a <> 0) <> (b <> 0)` — the
@@ -11085,11 +11114,24 @@ mod tests {
 
     #[test]
     fn pad_lowers_to_substr_of_repeat() {
-        // Both LPAD and RPAD lower to an outer substr(..., 1, len) over a
-        // concatenation involving REPEAT(pad, len).
+        // Both LPAD and RPAD lower to a guard CASE whose ELSE is the outer
+        // substr(..., 1, len) over a concatenation involving REPEAT(pad, len).
         for sql in ["LPAD(s, n, p)", "RPAD(s, n, p)"] {
-            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
-                panic!("expected `{sql}` to lower to a function call");
+            let ast::Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } = parse_expr(sql).unwrap()
+            else {
+                panic!("expected `{sql}` to lower to a guard CASE");
+            };
+            assert!(base.is_none(), "{sql}");
+            // Two guards: negative len -> NULL, unpaddable empty pad -> ''.
+            assert_eq!(when_then_pairs.len(), 2, "{sql}");
+            assert_eq!(*when_then_pairs[0].1, ast::Expr::Literal(ast::Literal::Null), "{sql}");
+            let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone()
+            else {
+                panic!("expected `{sql}` ELSE to be a function call");
             };
             assert_eq!(name.as_str(), "substr", "{sql}");
             assert_eq!(args.len(), 3, "{sql}");

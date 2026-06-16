@@ -1,0 +1,76 @@
+# LPAD(str, len, pad) / RPAD(str, len, pad) conformance.
+#
+# WordPress uses LPAD/RPAD when formatting fixed-width values. The front-end
+# lowers them to substr() over a REPEAT()-built fill, with two guards that match
+# MySQL's edge semantics the bare lowering would get wrong: a negative len
+# returns NULL (not ''), and an empty pad string when padding is actually needed
+# (len > length(str)) returns '' (MySQL cannot reach the requested length with no
+# fill characters), rather than the unpadded string.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses '['
+# and ']' brackets so trailing/leading spaces are visible and the empty string
+# stays representable in the harness.
+
+# Ordinary padding: pad on the left / right up to the requested width.
+query
+SELECT CONCAT('[', LPAD('ab', 5, '*'), ']'), CONCAT('[', RPAD('ab', 5, '*'), ']')
+----
+[***ab]	[ab***]
+
+# A multi-character pad repeats and is truncated to fit.
+query
+SELECT CONCAT('[', LPAD('ab', 5, 'XY'), ']'), CONCAT('[', RPAD('ab', 5, 'XY'), ']')
+----
+[XYXab]	[abXYX]
+
+# When len is shorter than the string, both truncate to the left len chars.
+query
+SELECT CONCAT('[', LPAD('abcde', 3, '*'), ']'), CONCAT('[', RPAD('abcde', 3, '*'), ']')
+----
+[abc]	[abc]
+
+# len = 0 yields the empty string.
+query
+SELECT CONCAT('[', LPAD('abc', 0, '*'), ']'), CONCAT('[', RPAD('abc', 0, '*'), ']')
+----
+[]	[]
+
+# A negative len yields NULL, like MySQL (not the empty string SQLite's substr
+# would give).
+query
+SELECT LPAD('abc', -1, '*') IS NULL, RPAD('abc', -1, '*') IS NULL
+----
+1	1
+
+# An empty pad string when padding is needed (len > length(str)) yields '',
+# since no fill characters can reach the requested width.
+query
+SELECT CONCAT('[', LPAD('ab', 5, ''), ']'), CONCAT('[', RPAD('ab', 5, ''), ']')
+----
+[]	[]
+
+# An empty pad is harmless when len <= length(str): the result is just the
+# truncation, no padding required.
+query
+SELECT CONCAT('[', LPAD('ab', 1, ''), ']'), CONCAT('[', RPAD('ab', 1, ''), ']')
+----
+[a]	[a]
+
+# NULL in any argument propagates.
+query
+SELECT LPAD(NULL, 3, '*') IS NULL, LPAD('ab', NULL, '*') IS NULL, LPAD('ab', 3, NULL) IS NULL
+----
+1	1	1
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS lrpad_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO lrpad_demo (id, s) VALUES (1, '7'), (2, '42')
+
+query
+SELECT id, LPAD(s, 4, '0') FROM lrpad_demo ORDER BY id
+----
+1	0007
+2	0042
