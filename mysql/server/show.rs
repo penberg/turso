@@ -67,10 +67,86 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     if let Some(result) = parse_show_warnings(sql) {
         return Some(Ok(ShowOutcome::Columns(result)));
     }
+    if let Some(result) = parse_show_empty_enumeration(sql) {
+        return Some(Ok(ShowOutcome::Columns(result)));
+    }
     if let Some(result) = parse_maintenance(sql) {
         return Some(Ok(ShowOutcome::Columns(result)));
     }
     None
+}
+
+/// Handles the object-enumeration statements `SHOW TRIGGERS`, `SHOW EVENTS`,
+/// `SHOW PROCEDURE STATUS`, and `SHOW FUNCTION STATUS`. This engine has no
+/// triggers, scheduled events, or stored routines, so each is always empty — the
+/// result is MySQL's column set with no rows, which matches a real mysqld on a
+/// schema that has none of those objects. WordPress backup / migration plugins
+/// enumerate these while exporting a database, so answering with an empty set (as
+/// opposed to an error) lets that flow proceed. Any trailing `FROM db` /
+/// `LIKE 'pat'` / `WHERE ...` filter is accepted and irrelevant on an empty set.
+/// Returns `None` for any other statement (notably plain `SHOW STATUS`, whose
+/// runtime counters are not modeled).
+fn parse_show_empty_enumeration(sql: &str) -> Option<ColumnsResult> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let kw = |i: usize, k: &str| toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case(k));
+    if !kw(0, "SHOW") {
+        return None;
+    }
+    let columns = if kw(1, "TRIGGERS") {
+        vec![
+            "Trigger",
+            "Event",
+            "Table",
+            "Statement",
+            "Timing",
+            "Created",
+            "sql_mode",
+            "Definer",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]
+    } else if kw(1, "EVENTS") {
+        vec![
+            "Db",
+            "Name",
+            "Definer",
+            "Time zone",
+            "Type",
+            "Execute at",
+            "Interval value",
+            "Interval field",
+            "Starts",
+            "Ends",
+            "Status",
+            "Originator",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]
+    } else if (kw(1, "PROCEDURE") || kw(1, "FUNCTION")) && kw(2, "STATUS") {
+        vec![
+            "Db",
+            "Name",
+            "Type",
+            "Language",
+            "Definer",
+            "Modified",
+            "Created",
+            "Security_type",
+            "Comment",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]
+    } else {
+        return None;
+    };
+    Some(ColumnsResult {
+        columns,
+        rows: Vec::new(),
+    })
 }
 
 /// Handles the table-maintenance statements `{ANALYZE | CHECK | OPTIMIZE |
@@ -1575,6 +1651,31 @@ mod tests {
         // The `COUNT(*)` form and unrelated SHOWs fall through.
         assert!(parse_show_warnings("SHOW COUNT(*) WARNINGS").is_none());
         assert!(parse_show_warnings("SHOW TABLES").is_none());
+    }
+
+    #[test]
+    fn parses_show_empty_enumeration() {
+        // Each enumerates objects this engine never has, so it is always empty.
+        for (sql, first_col, ncols) in [
+            ("SHOW TRIGGERS", "Trigger", 11),
+            ("SHOW EVENTS", "Db", 15),
+            ("SHOW PROCEDURE STATUS", "Db", 12),
+            ("SHOW FUNCTION STATUS", "Db", 12),
+            // A trailing filter is accepted and irrelevant on an empty set.
+            ("SHOW TRIGGERS FROM conf", "Trigger", 11),
+            ("SHOW PROCEDURE STATUS LIKE 'wp_%'", "Db", 12),
+            ("show function status where db = 'conf';", "Db", 12),
+        ] {
+            let result =
+                parse_show_empty_enumeration(sql).unwrap_or_else(|| panic!("`{sql}` should parse"));
+            assert_eq!(result.columns.len(), ncols, "column count for `{sql}`");
+            assert_eq!(result.columns[0], first_col);
+            assert!(result.rows.is_empty(), "`{sql}` should have no rows");
+        }
+        // Plain `SHOW STATUS` (runtime counters) and unrelated SHOWs fall through.
+        assert!(parse_show_empty_enumeration("SHOW STATUS").is_none());
+        assert!(parse_show_empty_enumeration("SHOW STATUS LIKE 'Uptime'").is_none());
+        assert!(parse_show_empty_enumeration("SHOW TABLES").is_none());
     }
 
     #[test]

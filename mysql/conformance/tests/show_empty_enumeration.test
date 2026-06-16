@@ -1,0 +1,36 @@
+# SHOW {TRIGGERS | EVENTS | PROCEDURE STATUS | FUNCTION STATUS} — object lists.
+#
+# This engine has no triggers, scheduled events, or stored routines, so each of
+# these enumeration statements returns an empty result set (the MySQL column set
+# with no rows). WordPress backup / migration plugins run these while exporting a
+# database, so answering with an empty set instead of an error lets that flow
+# proceed. A trailing FROM / LIKE / WHERE filter is accepted and irrelevant.
+#
+# SHOW TRIGGERS and SHOW EVENTS are empty on a real mysqld too (no such objects in
+# any schema). SHOW PROCEDURE/FUNCTION STATUS, however, lists a real server's
+# bundled `sys`-schema routines when unfiltered, so only the `WHERE Db = ...` form
+# WordPress uses — scoped to the connected schema, which has none — is empty on
+# both (see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+query
+SHOW TRIGGERS
+----
+
+query
+SHOW EVENTS
+----
+
+query
+SHOW PROCEDURE STATUS WHERE Db = DATABASE()
+----
+
+query
+SHOW FUNCTION STATUS WHERE Db = DATABASE()
+----
+
+# A trailing FROM clause on SHOW TRIGGERS is accepted and changes nothing.
+query
+SHOW TRIGGERS FROM information_schema
+----
