@@ -1,0 +1,40 @@
+# SLEEP and BENCHMARK (no-op timing functions).
+#
+# MySQL's SLEEP(seconds) pauses, and BENCHMARK(count, expr) evaluates expr count
+# times for timing; both return 0. The engine models neither the delay nor the
+# repeated evaluation, so the front-end folds them to 0 -- the value matches
+# MySQL, and a time-based probe (... OR SLEEP(10)) cannot stall the server.
+#
+# Verified against MySQL 8.4. (SLEEP(0) is used so the test does not pause a real
+# mysqld.)
+
+# Both return 0.
+query
+SELECT SLEEP(0), BENCHMARK(1, 1 + 1)
+----
+0	0
+
+# BENCHMARK with a small count and a non-trivial expression still returns 0.
+query
+SELECT BENCHMARK(5, MD5('x'))
+----
+0
+
+# They compose in expressions like any 0.
+query
+SELECT SLEEP(0) + BENCHMARK(1, 1), SLEEP(0) = 0
+----
+0	1
+
+# A SLEEP in a WHERE predicate does not change which rows match (it is 0, i.e.
+# false), so the id = 1 branch alone selects the row.
+statement ok
+CREATE TABLE sleepb (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO sleepb VALUES (1), (2)
+
+query
+SELECT id FROM sleepb WHERE id = 1 OR SLEEP(0) ORDER BY id
+----
+1

@@ -4263,13 +4263,22 @@ impl Parser {
         // would return 0, a connection id, or a non-zero count) are not modeled
         // (see `mysql/COMPAT.md`).
         if upper == "GET_LOCK" || upper == "RELEASE_LOCK" || upper == "IS_FREE_LOCK" {
-            return self.advisory_lock_call(*numeric_expr("1"));
+            return self.noop_constant_call(*numeric_expr("1"));
         }
         if upper == "IS_USED_LOCK" {
-            return self.advisory_lock_call(ast::Expr::Literal(ast::Literal::Null));
+            return self.noop_constant_call(ast::Expr::Literal(ast::Literal::Null));
         }
         if upper == "RELEASE_ALL_LOCKS" {
-            return self.advisory_lock_call(*numeric_expr("0"));
+            return self.noop_constant_call(*numeric_expr("0"));
+        }
+
+        // `SLEEP(seconds)` pauses, and `BENCHMARK(count, expr)` evaluates `expr`
+        // `count` times for timing; both return `0` in MySQL. The engine models
+        // neither the delay nor the repeated evaluation, so they fold to `0` —
+        // which also keeps a time-based probe (`... OR SLEEP(10)`) from stalling
+        // the server.
+        if upper == "SLEEP" || upper == "BENCHMARK" {
+            return self.noop_constant_call(*numeric_expr("0"));
         }
 
         // `DATE_ADD` / `DATE_SUB(x, INTERVAL n unit)` lower to the engine's
@@ -5307,13 +5316,12 @@ impl Parser {
         ))
     }
 
-    /// Parses an advisory-lock call (the name and `(` are already consumed),
-    /// discards its arguments, and folds it to `result` — the constant the no-op
-    /// lock model reports (chosen per function at the call site). This
-    /// single-node engine has no cross-session lock table, so the held/contended
-    /// cases (where MySQL returns 0, a connection id, or a non-zero count) are not
-    /// reproduced.
-    fn advisory_lock_call(&mut self, result: ast::Expr) -> Result<ast::Expr> {
+    /// Parses a no-op function call (the name and `(` are already consumed),
+    /// discards its arguments, and folds it to the constant `result` — the value
+    /// MySQL returns once its (unmodeled) side effect would have run. Used for the
+    /// advisory locks and the timing functions (`SLEEP`/`BENCHMARK`); the constant
+    /// is chosen per function at the call site.
+    fn noop_constant_call(&mut self, result: ast::Expr) -> Result<ast::Expr> {
         if !self.is(&Token::RParen) {
             loop {
                 let _ = self.expr()?;
@@ -12494,6 +12502,17 @@ mod tests {
         assert!(
             matches!(parse_expr("RELEASE_ALL_LOCKS()").unwrap(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0")
         );
+    }
+
+    #[test]
+    fn sleep_and_benchmark_fold_to_zero() {
+        // The timing functions are no-ops folding to 0, regardless of arguments.
+        for sql in ["SLEEP(0)", "SLEEP(10)", "BENCHMARK(1, 1 + 1)", "BENCHMARK(1000, x)"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0"),
+                "expected `{sql}` to fold to 0"
+            );
+        }
     }
 
     #[test]
