@@ -4851,10 +4851,22 @@ impl Parser {
     /// from Unicode code points, matching MySQL's default `utf8mb4`). At least
     /// one argument is required.
     fn char_call(&mut self) -> Result<ast::Expr> {
-        let mut args = Vec::new();
+        let mut pieces = Vec::new();
         loop {
-            // MySQL rounds/parses each code to an integer before building the byte.
-            args.push(integer_arg(self.expr()?));
+            let arg = self.expr()?;
+            // MySQL **skips** a NULL code rather than emitting a NUL `0x00` byte
+            // (`CHAR(65, NULL, 66)` is `'AB'`, not `'A\0B'`), so each code becomes
+            // `''` when NULL and `char(<rounded code>)` otherwise — MySQL rounds /
+            // parses each code to an integer — and the pieces are concatenated.
+            let code = call_fn("char", vec![integer_arg(arg.clone())]);
+            pieces.push(ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(ast::Expr::is_null(arg)),
+                    Box::new(ast::Expr::Literal(ast::Literal::String(requote("")))),
+                )],
+                else_expr: Some(Box::new(code)),
+            });
             if self.eat(&Token::Comma) {
                 continue;
             }
@@ -4868,7 +4880,7 @@ impl Parser {
             let _ = self.name()?;
         }
         self.expect(&Token::RParen, "`)`")?;
-        Ok(call_fn("char", args))
+        Ok(balanced_concat(pieces))
     }
 
     /// Parses a `QUOTE(str)` call (the name and `(` are already consumed) and
@@ -8390,6 +8402,25 @@ fn call_fn(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             over_clause: None,
         },
     }
+}
+
+/// Concatenates `pieces` with a *balanced* `||` tree, so the AST stays shallow
+/// (depth ~log₂ n) instead of the depth-n chain a left-linear fold builds —
+/// keeping a long argument list under the engine's expression-evaluator stack
+/// limit. `pieces` must be non-empty.
+fn balanced_concat(mut pieces: Vec<ast::Expr>) -> ast::Expr {
+    while pieces.len() > 1 {
+        let mut next = Vec::with_capacity(pieces.len().div_ceil(2));
+        let mut it = pieces.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(ast::Expr::binary(a, ast::Operator::Concat, b)),
+                None => next.push(a),
+            }
+        }
+        pieces = next;
+    }
+    pieces.into_iter().next().expect("non-empty pieces")
 }
 
 /// Builds `CAST(strftime(fmt, arg) AS INTEGER)` — a single `strftime` field as
@@ -14878,26 +14909,38 @@ mod tests {
     }
 
     #[test]
-    fn char_lowers_to_engine_char() {
-        // CHAR(72, 73) -> char(<int 72>, <int 73>), each code coerced to an
-        // integer like CAST(code AS SIGNED) so a numeric/string code rounds/parses.
-        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("CHAR(72, 73)").unwrap() else {
-            panic!("expected CHAR to lower to a function call");
-        };
-        assert_eq!(name.as_str(), "char");
-        assert_eq!(args.len(), 2);
-        assert_eq!(*args[0], parse_expr("CAST(72 AS SIGNED)").unwrap());
-
-        // A trailing `USING charset` clause is parsed and ignored; the call
-        // still lowers to `char()` with the same code-point arguments.
-        let ast::Expr::FunctionCall { name, args, .. } =
-            parse_expr("CHAR(72, 105 USING utf8mb4)").unwrap()
+    fn char_lowers_to_per_code_concat_skipping_null() {
+        // Each code becomes `CASE WHEN code IS NULL THEN '' ELSE char(<int>) END`
+        // (so a NULL is skipped, as in MySQL, rather than emitting a NUL byte),
+        // and the pieces are concatenated — so CHAR(72, 73) tops out as a `||`.
+        let ast::Expr::Binary(left, ast::Operator::Concat, right) =
+            parse_expr("CHAR(72, 73)").unwrap()
         else {
-            panic!("expected CHAR ... USING to lower to a function call");
+            panic!("expected CHAR(72, 73) to lower to a concatenation");
         };
-        assert_eq!(name.as_str(), "char");
-        assert_eq!(args.len(), 2);
-        assert_eq!(*args[1], parse_expr("CAST(105 AS SIGNED)").unwrap());
+        // Each side is the NULL-guarding CASE; the ELSE is char(CAST(code AS SIGNED)).
+        for (side, code) in [(left.as_ref(), 72), (right.as_ref(), 73)] {
+            let ast::Expr::Case { else_expr, .. } = side else {
+                panic!("expected each code to be a NULL-guarding CASE");
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = else_expr.as_ref().unwrap().as_ref()
+            else {
+                panic!("expected the CASE ELSE to be a char() call");
+            };
+            assert_eq!(name.as_str(), "char");
+            assert_eq!(*args[0], parse_expr(&format!("CAST({code} AS SIGNED)")).unwrap());
+        }
+
+        // A single code is just its guarding CASE (no concatenation), and a
+        // trailing `USING charset` clause is parsed and ignored.
+        assert!(matches!(
+            parse_expr("CHAR(72)").unwrap(),
+            ast::Expr::Case { .. }
+        ));
+        assert!(matches!(
+            parse_expr("CHAR(72, 105 USING utf8mb4)").unwrap(),
+            ast::Expr::Binary(_, ast::Operator::Concat, _)
+        ));
     }
 
     #[test]

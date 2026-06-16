@@ -1,16 +1,16 @@
 # CHAR(n1, n2, ...) conformance.
 #
 # CHAR builds a string from the character codes of its integer arguments. The
-# front-end maps it to the engine's char(), which is exact for the ASCII and
-# control-character codes that are the common use (e.g. CHAR(10) newline,
-# CHAR(72, 73) -> 'HI'). Each code is coerced to an integer the way
+# front-end builds each code as `CASE WHEN code IS NULL THEN '' ELSE char(code)
+# END` and concatenates them, which is exact for the ASCII and control-character
+# codes that are the common use (e.g. CHAR(10) newline, CHAR(72, 73) -> 'HI') and
+# skips NULL arguments as MySQL does. Each code is coerced to an integer the way
 # CAST(... AS SIGNED) is, so a numeric code rounds and a string parses its leading
 # integer, matching MySQL.
 #
-# Two divergences, not exercised here: MySQL skips NULL arguments whereas the
-# engine stops at the first NULL, and for codes above 127 MySQL emits raw bytes
+# One divergence, not exercised here: for codes above 127 MySQL emits raw bytes
 # (one number can span several) while the engine emits a single UTF-8 code point.
-# The CHAR(... USING charset) form is rejected.
+# The CHAR(... USING charset) form is parsed and the charset ignored.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -45,6 +45,19 @@ query
 SELECT LENGTH(CHAR(10)), LENGTH(CHAR(9, 10, 13))
 ----
 1	3
+
+# A NULL code is skipped, not turned into a NUL byte: CHAR(65, NULL, 66) is
+# 'AB', and an all-NULL CHAR is the empty string (length 0), not a NUL run.
+query
+SELECT CHAR(65, NULL, 66), HEX(CHAR(72, NULL, NULL, 73)), CHAR(NULL) = '', LENGTH(CHAR(NULL, NULL))
+----
+AB	4849	1	0
+
+# Skipping holds mid-expression and with all-but-one NULL.
+query
+SELECT CONCAT('[', CHAR(65, NULL, 66), ']'), CHAR(NULL, 67, NULL)
+----
+[AB]	C
 
 # CHAR composes with CONCAT (here joining with code 124, a pipe).
 query
