@@ -3855,6 +3855,12 @@ impl Parser {
             return self.export_set_call();
         }
 
+        // `REGEXP_LIKE(str, pattern[, match_type])` is the functional form of the
+        // `REGEXP` operator (see `regexp_like_call`).
+        if upper == "REGEXP_LIKE" {
+            return self.regexp_like_call();
+        }
+
         // `FIND_IN_SET(str, strlist)` — the 1-based index of `str` in the
         // comma-separated `strlist`, or 0; synthesized from comma-wrapped
         // string surgery.
@@ -4566,6 +4572,51 @@ impl Parser {
             )],
             else_expr: Some(Box::new(joined)),
         })
+    }
+
+    /// Parses `REGEXP_LIKE(str, pattern[, match_type])` (the name and `(` already
+    /// consumed) and lowers it to the same `str REGEXP pattern` the operator
+    /// produces — the engine's `REGEXP` over a pattern carrying the inline flags.
+    /// Like the operator, the match defaults to case-insensitive (MySQL's default
+    /// under the standard collation), realized by prepending `(?i)` to the
+    /// pattern. An optional `match_type` string literal overrides the flags:
+    /// `c` case-sensitive, `i` case-insensitive, `m` multi-line (`^`/`$` at line
+    /// breaks), `n` dot-matches-newline; `u` (Unix line endings) is accepted and
+    /// ignored. A NULL `str` or `pattern` yields NULL. The `match_type` must be a
+    /// literal so the flags are known at parse time.
+    fn regexp_like_call(&mut self) -> Result<ast::Expr> {
+        let subject = self.expr()?;
+        self.expect(&Token::Comma, "`,`")?;
+        let pattern_arg = self.expr()?;
+        let match_type = if self.eat(&Token::Comma) {
+            let Some(Token::Str(mt)) = self.peek() else {
+                return Err(self.unexpected("a string-literal REGEXP_LIKE match type"));
+            };
+            let mt = mt.clone();
+            self.advance();
+            Some(mt)
+        } else {
+            None
+        };
+        self.expect(&Token::RParen, "`)`")?;
+
+        let prefix = regexp_flag_prefix(match_type.as_deref())?;
+        let pattern = if prefix.is_empty() {
+            pattern_arg
+        } else {
+            ast::Expr::binary(
+                ast::Expr::Literal(ast::Literal::String(requote(&prefix))),
+                ast::Operator::Concat,
+                pattern_arg,
+            )
+        };
+        Ok(ast::Expr::like(
+            subject,
+            false,
+            ast::LikeOperator::Regexp,
+            pattern,
+            None,
+        ))
     }
 
     /// Parses a `FIND_IN_SET(str, strlist)` call (the name and `(` are already
@@ -7355,6 +7406,49 @@ fn period_to_months(p: ast::Expr) -> ast::Expr {
         ast::Expr::Literal(ast::Literal::Numeric("12".to_string())),
     );
     ast::Expr::binary(year_months, ast::Operator::Add, month)
+}
+
+/// Builds the inline-flag prefix (`(?…)`, or empty) for a `REGEXP_LIKE`
+/// `match_type`, translating MySQL's flag letters to the Rust regex crate's: `i`
+/// case-insensitive, `c` case-sensitive, `m` multi-line, `n` dot-matches-newline
+/// (the crate's `s`); `u` (Unix line endings) is accepted and ignored. The match
+/// defaults to case-insensitive (MySQL's default under the standard collation),
+/// so `i` is on unless `c` turns it off. An unknown flag is rejected.
+fn regexp_flag_prefix(match_type: Option<&str>) -> Result<String> {
+    let mut case_insensitive = true;
+    let mut multi_line = false;
+    let mut dot_newline = false;
+    if let Some(mt) = match_type {
+        for flag in mt.chars() {
+            match flag {
+                'i' => case_insensitive = true,
+                'c' => case_insensitive = false,
+                'm' => multi_line = true,
+                'n' => dot_newline = true,
+                'u' => {}
+                other => {
+                    return Err(ParseError::Unsupported(format!(
+                        "REGEXP_LIKE match type `{other}` is not supported"
+                    )))
+                }
+            }
+        }
+    }
+    let mut flags = String::new();
+    if case_insensitive {
+        flags.push('i');
+    }
+    if multi_line {
+        flags.push('m');
+    }
+    if dot_newline {
+        flags.push('s');
+    }
+    Ok(if flags.is_empty() {
+        String::new()
+    } else {
+        format!("(?{flags})")
+    })
 }
 
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
@@ -12721,6 +12815,46 @@ mod tests {
             matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'^a'"),
             "BINARY REGEXP pattern should not get the (?i) flag"
         );
+
+        // REGEXP_LIKE(str, pat) is the functional form: a Regexp Like, case-
+        // insensitive by default like the operator.
+        let ast::Expr::Like { op, lhs, rhs, .. } = parse_expr("REGEXP_LIKE(name, '^a')").unwrap()
+        else {
+            panic!("expected REGEXP_LIKE to parse as a Regexp expression");
+        };
+        assert_eq!(op, ast::LikeOperator::Regexp);
+        assert_eq!(*lhs, col("name"));
+        let ast::Expr::Binary(flag, ast::Operator::Concat, _) = rhs.as_ref() else {
+            panic!("expected `'(?i)' || <pattern>`");
+        };
+        assert!(matches!(flag.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'(?i)'"));
+
+        // A `c` match type forces case-sensitivity: no flag prefix, bare pattern.
+        let ast::Expr::Like { rhs, .. } = parse_expr("REGEXP_LIKE(name, '^a', 'c')").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(
+            matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'^a'"),
+            "case-sensitive REGEXP_LIKE should not prefix `(?i)`"
+        );
+
+        // A multi-line match type adds `m` to the inline flags (`(?im)`).
+        let ast::Expr::Like { rhs, .. } = parse_expr("REGEXP_LIKE(name, '^a', 'm')").unwrap()
+        else {
+            unreachable!()
+        };
+        let ast::Expr::Binary(flag, ast::Operator::Concat, _) = rhs.as_ref() else {
+            panic!("expected a flag-prefixed pattern");
+        };
+        assert!(matches!(flag.as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'(?im)'"));
+
+        // An unknown match type and a non-literal match type are rejected.
+        assert!(matches!(
+            parse_expr("REGEXP_LIKE(name, 'a', 'z')").unwrap_err(),
+            ParseError::Unsupported(_)
+        ));
+        assert!(parse_expr("REGEXP_LIKE(name, 'a', flags)").is_err());
 
         let expr = parse_expr("name LIKE 'a%'").unwrap();
         let ast::Expr::Like {

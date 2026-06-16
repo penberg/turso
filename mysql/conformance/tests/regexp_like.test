@@ -1,0 +1,68 @@
+# REGEXP_LIKE(str, pattern[, match_type]) conformance.
+#
+# MySQL 8.0's REGEXP_LIKE is the functional form of the REGEXP operator. The
+# front-end lowers it to the same `str REGEXP pattern` -- the engine's REGEXP
+# over a pattern carrying inline flags. Like the operator, the match defaults to
+# case-insensitive (MySQL's default under the standard collation), realized by a
+# leading (?i). An optional match_type string literal overrides the flags: c
+# case-sensitive, i case-insensitive, m multi-line, n dot-matches-newline (u is
+# accepted and ignored). NULL in str or pattern yields NULL.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Default is case-insensitive, like the REGEXP operator: 'B' matches 'abc', '^a'
+# anchors at the start, and 'x' is absent.
+query
+SELECT REGEXP_LIKE('abc', 'B'), REGEXP_LIKE('abc', '^a'), REGEXP_LIKE('abc', 'x')
+----
+1	1	0
+
+# The 'c' match type forces case-sensitivity; 'i' restores insensitivity.
+query
+SELECT REGEXP_LIKE('abc', 'B', 'c'), REGEXP_LIKE('abc', 'B', 'i'), REGEXP_LIKE('ABC', 'b', 'c')
+----
+0	1	0
+
+# Anchors and quantifiers in the pattern.
+query
+SELECT REGEXP_LIKE('hello world', '^h.*d$'), REGEXP_LIKE('Cat', '^[a-z]+$', 'c'), REGEXP_LIKE('Cat', '^[a-z]+$', 'i')
+----
+1	0	1
+
+# NULL in either argument yields NULL.
+query
+SELECT REGEXP_LIKE(NULL, 'a') IS NULL, REGEXP_LIKE('abc', NULL) IS NULL
+----
+1	1
+
+# An unsupported match type is rejected.
+statement error
+SELECT REGEXP_LIKE('abc', 'a', 'z')
+
+# A value spanning two lines: the 'm' flag makes ^ match at the line break, and
+# the 'n' flag makes . match the newline. Without them the anchored/dotted
+# patterns do not match.
+statement ok
+CREATE TABLE IF NOT EXISTS rl_demo (id INT PRIMARY KEY, s VARCHAR(20))
+
+statement ok
+INSERT INTO rl_demo (id, s) VALUES (1, CONCAT('a', CHAR(10), 'b'))
+
+query
+SELECT REGEXP_LIKE(s, '^b', 'm'), REGEXP_LIKE(s, '^b'), REGEXP_LIKE(s, 'a.b', 'n'), REGEXP_LIKE(s, 'a.b') FROM rl_demo WHERE id = 1
+----
+1	0	1	0
+
+# Usable as a WHERE predicate (the WordPress meta-query compare=REGEXP shape).
+statement ok
+CREATE TABLE IF NOT EXISTS rl_meta (id INT PRIMARY KEY, mval VARCHAR(20))
+
+statement ok
+INSERT INTO rl_meta (id, mval) VALUES (1, 'rss_12ab'), (2, 'other'), (3, 'RSS_99ff')
+
+query
+SELECT id FROM rl_meta WHERE REGEXP_LIKE(mval, '^rss_[0-9a-f]+$') ORDER BY id
+----
+1
+3
