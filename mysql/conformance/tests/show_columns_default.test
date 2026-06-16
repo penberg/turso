@@ -1,0 +1,24 @@
+# SHOW COLUMNS reports a string default as its bare value, not the SQL literal.
+#
+# The engine's PRAGMA table_info reports a string column default as the SQL
+# literal it stored (`'hi'`, `''`), but MySQL's SHOW COLUMNS reports the bare
+# value (`hi`, the empty string). The front-end strips the surrounding single
+# quotes and unescapes `''` -> `'`. Numeric and NULL defaults are unchanged.
+# WordPress columns use DEFAULT '' / DEFAULT 0, and dbDelta compares Default.
+#
+# Rows are tab-separated with a trailing tab for the empty Extra column. Expected
+# to pass against both turso-mysql-server and a real mysqld. Uses its own table.
+
+statement ok
+CREATE TABLE IF NOT EXISTS defcol (a VARCHAR(10) DEFAULT 'hi', b VARCHAR(20) DEFAULT '', c INT DEFAULT 5, d VARCHAR(10) DEFAULT 'a''b', e INT)
+
+# 'hi' -> hi, '' -> the empty string, 5 stays 5, 'a''b' -> a'b, and a column with
+# no default reports NULL.
+query
+SHOW COLUMNS FROM defcol
+----
+a	varchar(10)	YES		hi	
+b	varchar(20)	YES			
+c	int	YES		5	
+d	varchar(10)	YES		a'b	
+e	int	YES		NULL	

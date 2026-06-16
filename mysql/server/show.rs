@@ -307,6 +307,20 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
 /// it with SQLite-isms (e.g. `PRIMARY KEY (ID AUTOINCREMENT)`) that the MySQL
 /// front-end parser rejects, and only each column's leading `name type(size)` is
 /// needed, so the rest of every definition is ignored.
+/// Normalizes a column default for `SHOW COLUMNS`. The engine's
+/// `PRAGMA table_info` reports a string default as its SQL literal (`'hi'`,
+/// `''`), while MySQL reports the bare value (`hi`, the empty string), so strip
+/// the surrounding single quotes and unescape `''` → `'`. Numeric, keyword
+/// (`CURRENT_TIMESTAMP`), and `NULL` defaults pass through unchanged.
+fn normalize_default(default: Option<String>) -> Option<String> {
+    let value = default?;
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        Some(value[1..value.len() - 1].replace("''", "'"))
+    } else {
+        Some(value)
+    }
+}
+
 /// Normalizes a column type for `SHOW COLUMNS`, matching MySQL 8.0's display:
 /// the type is lowercased, `integer` is rendered as `int`, and the **display
 /// width** of an integer type is stripped (`int(11)` → `int`, `bigint(20)
@@ -900,6 +914,9 @@ impl ColumnInfo {
         // MySQL lowercases the type and strips the display width of integer
         // types (`int(11)` → `int`), which WordPress's dbDelta compares.
         let ty = Some(normalize_column_type(&self.ty));
+        // MySQL reports a string default as its bare value (`hi`), where the
+        // engine stores the SQL literal (`'hi'`); strip the quotes.
+        let default = normalize_default(self.default);
         let field = Some(self.name);
         if full {
             vec![
@@ -908,7 +925,7 @@ impl ColumnInfo {
                 collation,
                 Some(null.to_string()),
                 Some(key.to_string()),
-                self.default,
+                default,
                 Some(String::new()), // Extra
                 Some(PRIVILEGES.to_string()),
                 Some(String::new()), // Comment
@@ -919,7 +936,7 @@ impl ColumnInfo {
                 ty,
                 Some(null.to_string()),
                 Some(key.to_string()),
-                self.default,
+                default,
                 Some(String::new()), // Extra
             ]
         }
@@ -1462,6 +1479,25 @@ mod tests {
         let p = parse_show_columns("SHOW FULL COLUMNS FROM `wptests_options`").unwrap();
         assert!(p.full);
         assert_eq!(p.table, "wptests_options");
+    }
+
+    #[test]
+    fn normalizes_string_default() {
+        // String defaults lose their surrounding quotes; `''` → empty.
+        assert_eq!(normalize_default(Some("'hi'".to_string())), Some("hi".to_string()));
+        assert_eq!(normalize_default(Some("''".to_string())), Some(String::new()));
+        assert_eq!(
+            normalize_default(Some("'a''b'".to_string())),
+            Some("a'b".to_string())
+        );
+        // Numeric, keyword, and NULL defaults are unchanged.
+        assert_eq!(normalize_default(Some("0".to_string())), Some("0".to_string()));
+        assert_eq!(normalize_default(Some("5".to_string())), Some("5".to_string()));
+        assert_eq!(
+            normalize_default(Some("CURRENT_TIMESTAMP".to_string())),
+            Some("CURRENT_TIMESTAMP".to_string())
+        );
+        assert_eq!(normalize_default(None), None);
     }
 
     #[test]
