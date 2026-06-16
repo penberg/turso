@@ -4847,6 +4847,33 @@ impl Parser {
                     ast::Expr::Literal(ast::Literal::Numeric("3".to_string())),
                 ));
             }
+            // Compound units combine their fields into one integer (e.g.
+            // `YEAR_MONTH` is `year*100 + month`, `DAY_SECOND` is
+            // `day*1000000 + hour*10000 + minute*100 + second`). Verified against
+            // MySQL 8.4. The `*_MICROSECOND` units are omitted (the engine's
+            // strftime has only millisecond, not microsecond, precision).
+            "YEAR_MONTH" => return Ok(extract_compound(arg, &[("%Y", 100), ("%m", 1)])),
+            "DAY_HOUR" => return Ok(extract_compound(arg, &[("%d", 100), ("%H", 1)])),
+            "DAY_MINUTE" => {
+                return Ok(extract_compound(
+                    arg,
+                    &[("%d", 10000), ("%H", 100), ("%M", 1)],
+                ))
+            }
+            "DAY_SECOND" => {
+                return Ok(extract_compound(
+                    arg,
+                    &[("%d", 1000000), ("%H", 10000), ("%M", 100), ("%S", 1)],
+                ))
+            }
+            "HOUR_MINUTE" => return Ok(extract_compound(arg, &[("%H", 100), ("%M", 1)])),
+            "HOUR_SECOND" => {
+                return Ok(extract_compound(
+                    arg,
+                    &[("%H", 10000), ("%M", 100), ("%S", 1)],
+                ))
+            }
+            "MINUTE_SECOND" => return Ok(extract_compound(arg, &[("%M", 100), ("%S", 1)])),
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "EXTRACT({other} FROM ...) is not supported yet"
@@ -6618,6 +6645,31 @@ fn cast_strftime_int(fmt: &str, arg: ast::Expr) -> ast::Expr {
             array_dimensions: 0,
         }),
     }
+}
+
+/// Builds a MySQL compound `EXTRACT` value as the weighted sum of its date-part
+/// fields — e.g. `EXTRACT(YEAR_MONTH FROM d)` is `year*100 + month` — from a list
+/// of `(strftime_code, multiplier)` pairs. `arg` is cloned for each field; a NULL
+/// `arg` makes every term NULL, so the whole result is NULL, as in MySQL.
+fn extract_compound(arg: ast::Expr, parts: &[(&str, i64)]) -> ast::Expr {
+    let mut result: Option<ast::Expr> = None;
+    for (code, mult) in parts {
+        let part = cast_strftime_int(code, arg.clone());
+        let term = if *mult == 1 {
+            part
+        } else {
+            ast::Expr::binary(
+                part,
+                ast::Operator::Multiply,
+                ast::Expr::Literal(ast::Literal::Numeric(mult.to_string())),
+            )
+        };
+        result = Some(match result {
+            None => term,
+            Some(acc) => ast::Expr::binary(acc, ast::Operator::Add, term),
+        });
+    }
+    result.expect("at least one field")
 }
 
 /// Re-quotes a lexed (unescaped) string as a SQL single-quoted literal.
@@ -9832,13 +9884,29 @@ mod tests {
             parse_expr("QUARTER(d)").unwrap()
         );
 
-        // MICROSECOND and the compound units remain rejected.
-        for sql in ["EXTRACT(MICROSECOND FROM d)", "EXTRACT(YEAR_MONTH FROM d)"] {
+        // MICROSECOND and the `*_MICROSECOND` compound units remain rejected
+        // (the engine's strftime has no microsecond precision).
+        for sql in ["EXTRACT(MICROSECOND FROM d)", "EXTRACT(DAY_MICROSECOND FROM d)"] {
             assert!(
                 parse_expr(sql).is_err(),
                 "expected `{sql}` to be unsupported"
             );
         }
+
+        // The non-microsecond compound units combine their fields into one
+        // integer, e.g. YEAR_MONTH is `year*100 + month`.
+        let ast::Expr::Binary(year_term, ast::Operator::Add, month_term) =
+            parse_expr("EXTRACT(YEAR_MONTH FROM d)").unwrap()
+        else {
+            panic!("expected YEAR_MONTH to be year*100 + month");
+        };
+        assert!(matches!(
+            year_term.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::Multiply, _)
+        ));
+        assert!(matches!(month_term.as_ref(), ast::Expr::Cast { .. }));
+        // The four-field DAY_SECOND parses too.
+        assert!(parse_expr("EXTRACT(DAY_SECOND FROM d)").is_ok());
     }
 
     #[test]

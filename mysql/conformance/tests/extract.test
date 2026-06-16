@@ -7,9 +7,10 @@
 #
 # YEAR/MONTH/DAY/HOUR/MINUTE/SECOND map to a strftime code; WEEK uses the default
 # Sunday-first mode (like WEEK(d)) and QUARTER is (month + 2) / 3 (like
-# QUARTER(d)). MICROSECOND and the compound units (YEAR_MONTH, DAY_HOUR, …) are
-# rejected by the front-end and covered by a parser unit test, not here, because
-# a real mysqld accepts them.
+# QUARTER(d)). The compound units (YEAR_MONTH, DAY_HOUR, DAY_MINUTE, DAY_SECOND,
+# HOUR_MINUTE, HOUR_SECOND, MINUTE_SECOND) combine their fields into one integer.
+# MICROSECOND and the `*_MICROSECOND` compound units stay rejected (the engine's
+# strftime has only millisecond precision) and are covered by a parser unit test.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name and ORDER BY-deterministic queries.
@@ -67,3 +68,27 @@ query
 SELECT EXTRACT(QUARTER FROM d) = QUARTER(d), EXTRACT(WEEK FROM d) = WEEK(d) FROM ex_demo WHERE a = 1
 ----
 1	1
+
+# The compound units combine date/time fields into one integer (values from
+# MySQL 8.4): YEAR_MONTH is year*100 + month, DAY_SECOND is
+# day*1000000 + hour*10000 + minute*100 + second, and so on.
+query
+SELECT EXTRACT(YEAR_MONTH FROM '2026-06-15 10:30:45'),
+       EXTRACT(DAY_HOUR FROM '2026-06-15 10:30:45'),
+       EXTRACT(HOUR_MINUTE FROM '2026-06-15 10:30:45'),
+       EXTRACT(MINUTE_SECOND FROM '2026-06-15 10:30:45')
+----
+202606	1510	1030	3045
+
+query
+SELECT EXTRACT(DAY_MINUTE FROM '2026-06-15 10:30:45'),
+       EXTRACT(DAY_SECOND FROM '2026-06-15 10:30:45'),
+       EXTRACT(HOUR_SECOND FROM '2026-06-15 10:30:45')
+----
+151030	15103045	103045
+
+# A NULL argument propagates through the combination.
+query
+SELECT EXTRACT(YEAR_MONTH FROM NULL) IS NULL
+----
+1
