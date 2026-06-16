@@ -1,13 +1,17 @@
 # UNIX_TIMESTAMP / FROM_UNIXTIME conformance.
 #
 # UNIX_TIMESTAMP(d) returns the Unix epoch seconds of a datetime; FROM_UNIXTIME(n)
-# returns the 'YYYY-MM-DD HH:MM:SS' datetime for an epoch. The front-end lowers
-# them to the engine's unixepoch(d) and datetime(n, 'unixepoch').
+# returns the 'YYYY-MM-DD HH:MM:SS' datetime for an epoch, and the two-argument
+# FROM_UNIXTIME(n, fmt) is DATE_FORMAT(FROM_UNIXTIME(n), fmt). The front-end lowers
+# them to the engine's unixepoch(d) and datetime(n, 'unixepoch'), routing the
+# format form through the DATE_FORMAT lowering.
 #
 # The engine has no session time zone, so absolute conversions are UTC — a
 # documented divergence from MySQL's session-local behavior (see mysql/COMPAT.md).
-# These checks are timezone-independent: a round trip cancels the zone, and
-# FROM_UNIXTIME's shape is fixed. They pass against both targets.
+# These checks are timezone-independent: a round trip cancels the zone, the
+# two-argument form is checked against its DATE_FORMAT identity (the same zone
+# applies to both sides), and FROM_UNIXTIME's shape is fixed. They pass against
+# both targets.
 
 # A round trip cancels the time zone (UNIX_TIMESTAMP and FROM_UNIXTIME are
 # inverses on both targets).
@@ -26,6 +30,33 @@ query
 SELECT LENGTH(FROM_UNIXTIME(1609459200))
 ----
 19
+
+# The two-argument form equals DATE_FORMAT applied to the one-argument form (the
+# MySQL definition). This identity holds on both targets whatever the session
+# zone, since the same zone applies to FROM_UNIXTIME(n) on each side.
+query
+SELECT FROM_UNIXTIME(1592222400, '%Y-%m-%d %H:%i:%s') = DATE_FORMAT(FROM_UNIXTIME(1592222400), '%Y-%m-%d %H:%i:%s')
+----
+1
+
+# It works with arbitrary specifiers and literal text, still matching the
+# DATE_FORMAT identity.
+query
+SELECT FROM_UNIXTIME(1700000000, 'wk %v of %x, %W') = DATE_FORMAT(FROM_UNIXTIME(1700000000), 'wk %v of %x, %W')
+----
+1
+
+# A fixed-width format yields a fixed-length result (here %Y-%m-%d -> 10 chars).
+query
+SELECT LENGTH(FROM_UNIXTIME(1609459200, '%Y-%m-%d'))
+----
+10
+
+# NULL epoch propagates through the format form.
+query
+SELECT FROM_UNIXTIME(NULL, '%Y') IS NULL
+----
+1
 
 # UNIX_TIMESTAMP() with no argument is the current epoch (> 0).
 query

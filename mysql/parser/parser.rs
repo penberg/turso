@@ -7602,16 +7602,20 @@ impl Parser {
         })
     }
 
-    /// Lowers `FROM_UNIXTIME(n)` to the engine's `datetime(n, 'unixepoch')`,
+    /// Lowers `FROM_UNIXTIME(n[, fmt])` (the name and `(` are already consumed).
+    /// The one-argument form becomes the engine's `datetime(n, 'unixepoch')`,
     /// which renders the epoch as a `'YYYY-MM-DD HH:MM:SS'` UTC datetime. The
-    /// two-argument formatting form is not supported. The name and `(` are
-    /// already consumed.
+    /// two-argument form is MySQL's `DATE_FORMAT(FROM_UNIXTIME(n), fmt)`, so the
+    /// format string literal is applied to that datetime through the shared
+    /// [`date_format_expr`] lowering (same specifier support, and NULL still
+    /// propagates from a NULL `n`). As with `DATE_FORMAT`, `fmt` must be a string
+    /// literal. The engine has no session time zone, so the result is UTC — a
+    /// documented divergence from MySQL's session-local `FROM_UNIXTIME`.
     // Named after the MySQL `FROM_UNIXTIME` function, not a conversion constructor.
     #[allow(clippy::wrong_self_convention)]
     fn from_unixtime_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
-        self.expect(&Token::RParen, "`)`")?;
-        Ok(ast::Expr::FunctionCall {
+        let datetime = ast::Expr::FunctionCall {
             name: ast::Name::from_string("datetime"),
             distinctness: None,
             args: vec![
@@ -7626,7 +7630,19 @@ impl Parser {
                 filter_clause: None,
                 over_clause: None,
             },
-        })
+        };
+        // FROM_UNIXTIME(n, fmt) == DATE_FORMAT(FROM_UNIXTIME(n), fmt).
+        if self.eat(&Token::Comma) {
+            let Some(Token::Str(fmt)) = self.peek() else {
+                return Err(self.unexpected("a string-literal FROM_UNIXTIME format"));
+            };
+            let fmt = fmt.clone();
+            self.advance();
+            self.expect(&Token::RParen, "`)`")?;
+            return date_format_expr(&fmt, datetime);
+        }
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(datetime)
     }
 
     /// Parses a column reference: `col` or `tbl.col`.
@@ -12590,6 +12606,17 @@ mod tests {
         assert!(
             matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'unixepoch'")
         );
+
+        // The two-argument FROM_UNIXTIME(n, fmt) is exactly
+        // DATE_FORMAT(FROM_UNIXTIME(n), fmt) — it lowers to the same AST.
+        assert_eq!(
+            parse_expr("FROM_UNIXTIME(n, '%Y-%m-%d')").unwrap(),
+            parse_expr("DATE_FORMAT(FROM_UNIXTIME(n), '%Y-%m-%d')").unwrap()
+        );
+        // A non-literal format and a format with an unsupported specifier are
+        // rejected, as for DATE_FORMAT.
+        assert!(parse_expr("FROM_UNIXTIME(n, fmt)").is_err());
+        assert!(parse_expr("FROM_UNIXTIME(n, '%Q')").is_err());
     }
 
     #[test]
