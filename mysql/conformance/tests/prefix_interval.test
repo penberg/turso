@@ -1,0 +1,66 @@
+# Prefix INTERVAL arithmetic: `INTERVAL n unit + date`.
+#
+# MySQL accepts the interval on either side of `+`, so `INTERVAL n unit + date`
+# is equivalent to the postfix `date + INTERVAL n unit` (both are the operator
+# form of DATE_ADD). The front-end now parses the prefix form and lowers it to
+# the same `datetime(date, '+n unit')` modifier — so it shares the postfix form's
+# behaviour exactly, including month-end clamping. The interval must be followed
+# by `+` (a standalone `INTERVAL n unit`, or the `- INTERVAL` prefix, is not a
+# valid value, as in MySQL). `INTERVAL(n, n1, ...)` remains the separate
+# comparison function.
+#
+# DATETIME-shaped inputs are used so the result is a DATETIME on both engines
+# (the bare-DATE form keeps the engine's `00:00:00`, a documented DATE-vs-DATETIME
+# divergence shared with the postfix form; see mysql/COMPAT.md).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (8.4).
+
+# Day, hour, and minute steps.
+query
+SELECT INTERVAL 3 DAY + '2020-01-01 10:00:00', INTERVAL 1 HOUR + '2020-01-01 10:00:00'
+----
+2020-01-04 10:00:00	2020-01-01 11:00:00
+
+# A minute step crossing midnight into the next day.
+query
+SELECT INTERVAL 30 MINUTE + '2020-06-15 23:50:00'
+----
+2020-06-16 00:20:00
+
+# MONTH arithmetic clamps an overflowed shorter month, just like the postfix form
+# (Jan 31 + 2 months is Mar 31; the leap day clamps to Feb 28 a year later).
+query
+SELECT INTERVAL 2 MONTH + '2020-01-31 12:00:00', INTERVAL 1 YEAR + '2024-02-29 08:00:00'
+----
+2020-03-31 12:00:00	2025-02-28 08:00:00
+
+# A WEEK is seven days, and a compound `HOUR_MINUTE` string works as a prefix too.
+query
+SELECT INTERVAL 1 WEEK + '2020-03-01 00:00:00', INTERVAL '1:30' HOUR_MINUTE + '2020-01-01 10:00:00'
+----
+2020-03-08 00:00:00	2020-01-01 11:30:00
+
+# The prefix form is exactly equal to the postfix form.
+query
+SELECT (INTERVAL 5 DAY + '2020-01-01 09:00:00') = ('2020-01-01 09:00:00' + INTERVAL 5 DAY)
+----
+1
+
+# `INTERVAL(n, n1, ...)` — the count-of-bounds function — is unaffected.
+query
+SELECT INTERVAL(5, 1, 10, 100)
+----
+1
+
+statement ok
+CREATE TABLE prefix_iv_t (id INT PRIMARY KEY, d DATETIME)
+
+statement ok
+INSERT INTO prefix_iv_t VALUES (1, '2020-01-31 12:00:00'), (2, '2020-06-15 23:50:00')
+
+# Applied to a column value in a real query.
+query
+SELECT id, INTERVAL 1 MONTH + d FROM prefix_iv_t ORDER BY id
+----
+1	2020-02-29 12:00:00
+2	2020-07-15 23:50:00

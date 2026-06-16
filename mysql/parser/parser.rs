@@ -3398,7 +3398,23 @@ impl Parser {
 
     /// Additive tier: `+` and `-`, left-associative.
     fn additive_expr(&mut self) -> Result<ast::Expr> {
-        let mut lhs = self.multiplicative_expr()?;
+        // Prefix interval: `INTERVAL n unit + date` is the mirror of the postfix
+        // `date + INTERVAL n unit` (MySQL accepts the interval on either side of
+        // `+`), lowered identically. `INTERVAL` followed by `(` is instead the
+        // `INTERVAL(n, n1, ...)` function, which is left to the primary tier.
+        let mut lhs = if self.is_keyword("INTERVAL")
+            && !matches!(self.peek_nth(1), Some(Token::LParen))
+        {
+            self.advance(); // `INTERVAL`
+            let spec = self.parse_interval_spec()?;
+            // MySQL only allows `INTERVAL ... + expr`; the interval is not a
+            // standalone value, and `INTERVAL ... - expr` is not a valid form.
+            self.expect(&Token::Plus, "`+`")?;
+            let target = self.multiplicative_expr()?;
+            build_interval(target, &spec, false)?
+        } else {
+            self.multiplicative_expr()?
+        };
         loop {
             let op = match self.peek() {
                 Some(Token::Plus) => ast::Operator::Add,
@@ -6349,10 +6365,18 @@ impl Parser {
     /// number or a quoted numeric string (which MySQL coerces); `WEEK` is
     /// expanded to days, and other units are rejected.
     fn apply_interval(&mut self, target: ast::Expr, subtract: bool) -> Result<ast::Expr> {
+        let spec = self.parse_interval_spec()?;
+        build_interval(target, &spec, subtract)
+    }
+
+    /// Parses an interval `[-]value unit` (the `INTERVAL` keyword already
+    /// consumed) into an [`IntervalSpec`], without applying it to a target — so
+    /// the spec can be applied to a target that appears either after the interval
+    /// (the prefix `INTERVAL n unit + date` form) or before it (the postfix
+    /// `date + INTERVAL n unit` form). The value may be a number or a quoted
+    /// numeric string (which MySQL coerces).
+    fn parse_interval_spec(&mut self) -> Result<IntervalSpec> {
         let negative = self.eat(&Token::Minus);
-        // MySQL takes the interval amount either as a number or as a quoted
-        // string; a simple unit coerces it to an integer, a compound unit splits
-        // it into fields (see below).
         let raw = match self.peek() {
             Some(Token::Num(n) | Token::Str(n)) => n.clone(),
             _ => return Err(self.unexpected("an integer interval value")),
@@ -6365,47 +6389,11 @@ impl Parser {
         let unit = u.to_ascii_uppercase();
         self.advance();
 
-        // A compound unit (`HOUR_MINUTE`, `DAY_SECOND`, ...) takes a multi-field
-        // string like `'1:30'`; WordPress's GMT-offset upgrade uses
-        // `INTERVAL '<h>:<m>' HOUR_MINUTE`.
-        if let Some(fields) = compound_interval_units(&unit) {
-            return build_compound_interval(target, &raw, &unit, fields, negative ^ subtract);
-        }
-
-        let value: i64 = raw.trim().parse().map_err(|_| {
-            ParseError::Unsupported("INTERVAL value must be an integer literal".to_string())
-        })?;
-        // Map the MySQL unit onto the engine's modifier unit (`WEEK`/`QUARTER`
-        // are expanded to days/months).
-        let (engine_unit, multiplier) = interval_unit_modifier(&unit).ok_or_else(|| {
-            ParseError::Unsupported(format!("INTERVAL unit {unit} is not supported yet"))
-        })?;
-
-        let mut amount = value.saturating_mul(multiplier);
-        if negative {
-            amount = -amount;
-        }
-        if subtract {
-            amount = -amount;
-        }
-        // `{:+}` renders an explicit sign, e.g. `+5 days` / `-1 days`.
-        let modifier = format!("{amount:+} {engine_unit}");
-
-        // A month or year step can overflow a shorter target month — the engine
-        // rolls `Jan 31 + 1 month` into March, but MySQL clamps to the last day
-        // of the month (`Feb 28`). Wrap those with the clamp; day/time steps never
-        // overflow and pass through as a plain `datetime(target, '<modifier>')`.
-        if engine_unit == "months" || engine_unit == "years" {
-            Ok(clamp_month_overflow(target, &modifier))
-        } else {
-            Ok(call_fn(
-                "datetime",
-                vec![
-                    target,
-                    ast::Expr::Literal(ast::Literal::String(requote(&modifier))),
-                ],
-            ))
-        }
+        Ok(IntervalSpec {
+            negative,
+            raw,
+            unit,
+        })
     }
 
     /// Parses `DATE_FORMAT(x, 'fmt')` / `TIME_FORMAT(x, 'fmt')` (the name in
@@ -7437,6 +7425,73 @@ fn make_drop_table(
         if_exists,
         tbl_name,
     })
+}
+
+/// A parsed `[-]value unit` interval, separated from the target it shifts so the
+/// same spec can be applied whether the target precedes the interval (postfix
+/// `date + INTERVAL n unit`) or follows it (prefix `INTERVAL n unit + date`).
+/// See [`Parser::parse_interval_spec`] and [`build_interval`].
+struct IntervalSpec {
+    negative: bool,
+    raw: String,
+    unit: String,
+}
+
+/// Lowers `target ± interval` to the engine's `datetime(target, '<signed-amount>
+/// <engine-unit>')` modifier. `subtract` is true for `DATE_SUB` and the `-`
+/// operator. A simple unit coerces the value to an integer; a compound unit
+/// (`HOUR_MINUTE`, `DAY_SECOND`, ...) splits a multi-field string like `'1:30'`
+/// into fields. A month/year step that overflows a shorter target month is
+/// clamped to that month's last day, matching MySQL (the engine would otherwise
+/// roll over).
+fn build_interval(target: ast::Expr, spec: &IntervalSpec, subtract: bool) -> Result<ast::Expr> {
+    // A compound unit (`HOUR_MINUTE`, `DAY_SECOND`, ...) takes a multi-field
+    // string like `'1:30'`; WordPress's GMT-offset upgrade uses
+    // `INTERVAL '<h>:<m>' HOUR_MINUTE`.
+    if let Some(fields) = compound_interval_units(&spec.unit) {
+        return build_compound_interval(
+            target,
+            &spec.raw,
+            &spec.unit,
+            fields,
+            spec.negative ^ subtract,
+        );
+    }
+
+    let value: i64 = spec.raw.trim().parse().map_err(|_| {
+        ParseError::Unsupported("INTERVAL value must be an integer literal".to_string())
+    })?;
+    // Map the MySQL unit onto the engine's modifier unit (`WEEK`/`QUARTER`
+    // are expanded to days/months).
+    let (engine_unit, multiplier) = interval_unit_modifier(&spec.unit).ok_or_else(|| {
+        ParseError::Unsupported(format!("INTERVAL unit {} is not supported yet", spec.unit))
+    })?;
+
+    let mut amount = value.saturating_mul(multiplier);
+    if spec.negative {
+        amount = -amount;
+    }
+    if subtract {
+        amount = -amount;
+    }
+    // `{:+}` renders an explicit sign, e.g. `+5 days` / `-1 days`.
+    let modifier = format!("{amount:+} {engine_unit}");
+
+    // A month or year step can overflow a shorter target month — the engine
+    // rolls `Jan 31 + 1 month` into March, but MySQL clamps to the last day
+    // of the month (`Feb 28`). Wrap those with the clamp; day/time steps never
+    // overflow and pass through as a plain `datetime(target, '<modifier>')`.
+    if engine_unit == "months" || engine_unit == "years" {
+        Ok(clamp_month_overflow(target, &modifier))
+    } else {
+        Ok(call_fn(
+            "datetime",
+            vec![
+                target,
+                ast::Expr::Literal(ast::Literal::String(requote(&modifier))),
+            ],
+        ))
+    }
 }
 
 /// Maps a MySQL date/time interval unit to the engine's `datetime()` modifier
@@ -11738,6 +11793,36 @@ mod tests {
                 "expected `{sql}` to stay a plain datetime() call"
             );
         }
+    }
+
+    #[test]
+    fn prefix_interval_lowers_like_the_postfix_form() {
+        // `INTERVAL n unit + date` is the mirror of `date + INTERVAL n unit` and
+        // lowers to exactly the same expression.
+        for (prefix, postfix) in [
+            ("INTERVAL 5 DAY + d", "d + INTERVAL 5 DAY"),
+            ("INTERVAL 1 MONTH + d", "d + INTERVAL 1 MONTH"),
+            ("INTERVAL 3 HOUR + d", "d + INTERVAL 3 HOUR"),
+            ("INTERVAL '1:30' HOUR_MINUTE + d", "d + INTERVAL '1:30' HOUR_MINUTE"),
+        ] {
+            assert_eq!(
+                parse_expr(prefix).unwrap(),
+                parse_expr(postfix).unwrap(),
+                "`{prefix}` should lower like `{postfix}`"
+            );
+        }
+
+        // A leading interval must be followed by `+`: a standalone interval, or
+        // the `- INTERVAL` prefix, is rejected (as in MySQL).
+        assert!(parse_expr("INTERVAL 3 DAY").is_err());
+        assert!(parse_expr("INTERVAL 3 DAY - d").is_err());
+
+        // `INTERVAL(n, ...)` (the count-of-bounds function) is still the function
+        // call, not a prefix interval.
+        assert!(matches!(
+            parse_expr("INTERVAL(5, 1, 10)").unwrap(),
+            ast::Expr::Case { .. }
+        ));
     }
 
     #[test]
