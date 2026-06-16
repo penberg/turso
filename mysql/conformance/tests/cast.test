@@ -3,7 +3,7 @@
 # MySQL CAST is parsed as a real cast (not a function call) and mapped onto the
 # engine's affinity-based CAST. Supported targets: CHAR (text), SIGNED /
 # UNSIGNED (integer), DECIMAL / DEC (fixed-point), DOUBLE / FLOAT / REAL (real),
-# BINARY (blob). A CHAR(n) length is accepted but not enforced. CAST to DECIMAL
+# BINARY (blob). A CHAR(n) length bounds the result to n characters. CAST to DECIMAL
 # rounds the value to its scale D (default 0, since bare DECIMAL is
 # DECIMAL(10,0)): D = 0 yields an integer, D > 0 keeps D places. The DATE /
 # DATETIME / TIME targets are handled separately (lowered to
@@ -39,12 +39,33 @@ SELECT CAST(b AS UNSIGNED) FROM cast_demo ORDER BY a
 30
 7
 
-# CHAR with an (ignored) length still parses and casts to text.
+# CHAR with a length that fits leaves the value unchanged (no padding).
 query
 SELECT CAST(a AS CHAR(4)) FROM cast_demo ORDER BY a
 ----
 2
 10
+
+# CHAR(n) truncates the text to n characters, like MySQL — a string is cut to its
+# first n characters, and a number is rendered then cut. CHAR(0) yields the empty
+# string, and NULL propagates. (CHAR with no length never truncates.)
+query
+SELECT CAST('abcdef' AS CHAR(3)), CAST(12345 AS CHAR(3)), CAST(123.456 AS CHAR(4))
+----
+abc	123	123.
+
+query
+SELECT CAST('ab' AS CHAR(5)), CAST('abcdef' AS CHAR(0)), CAST(NULL AS CHAR(3)), CAST('keepall' AS CHAR)
+----
+ab		NULL	keepall
+
+# The truncation composes over a column — `b` is '30' for a=2 and '7' for a=10,
+# each cut to its first character.
+query
+SELECT CAST(b AS CHAR(1)) FROM cast_demo ORDER BY a
+----
+3
+7
 
 # CAST to bare DECIMAL is DECIMAL(10,0): it rounds to an integer (half away from
 # zero), parsing a leading-numeric string and treating a non-numeric one as 0.

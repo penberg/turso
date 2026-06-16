@@ -3886,9 +3886,9 @@ impl Parser {
             return Ok(rounded);
         }
 
-        let type_name = self.cast_type()?;
+        let (type_name, char_len) = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
-        Ok(build_cast(expr, type_name))
+        Ok(char_truncated_cast(expr, type_name, char_len))
     }
 
     /// If the next token names a MySQL temporal cast target (`DATE`, `DATETIME`,
@@ -3980,9 +3980,9 @@ impl Parser {
             self.expect(&Token::RParen, "`)`")?;
             return Ok(rounded);
         }
-        let type_name = self.cast_type()?;
+        let (type_name, char_len) = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
-        Ok(build_cast(expr, type_name))
+        Ok(char_truncated_cast(expr, type_name, char_len))
     }
 
     /// Parses and maps a MySQL `CAST` target type onto an engine type whose
@@ -3992,19 +3992,34 @@ impl Parser {
     /// [`Self::decimal_cast_round`], and the temporal ones by
     /// [`Self::temporal_cast_func`], so they never reach here. Date/time and JSON
     /// targets diverge from the engine and are rejected. A length/precision is
-    /// accepted but dropped (the engine does not enforce it); rounding of
-    /// fractional values to an integer also differs from MySQL — see
+    /// accepted; for `CHAR(n)` the length `n` is returned (the caller bounds the
+    /// result to `n` characters, which the engine does not do on its own — see
+    /// [`char_truncated_cast`]), and for every other target it is dropped. Rounding
+    /// of fractional values to an integer also differs from MySQL — see
     /// `mysql/COMPAT.md`.
-    fn cast_type(&mut self) -> Result<ast::Type> {
+    ///
+    /// Returns the engine type and, for `CHAR(n)` with a plain integer length, that
+    /// length.
+    fn cast_type(&mut self) -> Result<(ast::Type, Option<i64>)> {
         let Some(Token::Word(w)) = self.peek() else {
             return Err(self.unexpected("a CAST target type"));
         };
         let kw = w.to_ascii_uppercase();
         self.advance();
-        // A trailing length/precision (`CHAR(8)`, `DECIMAL(10,2)`) parses but is
-        // not carried onto the cast.
+        let is_char = matches!(kw.as_str(), "CHAR" | "NCHAR" | "CHARACTER");
+        // A trailing length/precision (`CHAR(8)`, `DECIMAL(10,2)`) parses. For
+        // `CHAR(n)` the length bounds the result (applied by the caller); for any
+        // other target it is dropped (the engine does not enforce it).
+        let mut char_len = None;
         if self.is(&Token::LParen) {
-            let _ = self.type_size()?;
+            let size = self.type_size()?;
+            if is_char {
+                if let Some(ast::TypeSize::MaxSize(n)) = size {
+                    if let ast::Expr::Literal(ast::Literal::Numeric(s)) = *n {
+                        char_len = s.trim().parse::<i64>().ok();
+                    }
+                }
+            }
         }
         let name = match kw.as_str() {
             "CHAR" | "NCHAR" | "CHARACTER" => "CHAR",
@@ -4020,11 +4035,14 @@ impl Parser {
                 )))
             }
         };
-        Ok(ast::Type {
-            name: name.to_string(),
-            size: None,
-            array_dimensions: 0,
-        })
+        Ok((
+            ast::Type {
+                name: name.to_string(),
+                size: None,
+                array_dimensions: 0,
+            },
+            char_len,
+        ))
     }
 
     /// Parses a `CASE` expression — both the searched form
@@ -8743,6 +8761,24 @@ fn substring_index_before_first(s: ast::Expr, d: ast::Expr) -> ast::Expr {
 /// restores MySQL's behaviour — a numeric (`integer`/`real`) value is rounded
 /// before the cast, while a string/blob/NULL value is cast directly (the
 /// leading-integer parse). Every other target is a plain cast.
+/// Builds a `CAST(expr AS type)`, applying MySQL's `CHAR(n)` length bound when
+/// `char_len` is set. MySQL's `CAST(x AS CHAR(n))` truncates the text to `n`
+/// characters (without padding a shorter value), but the engine's `CAST` ignores
+/// the length, so the result is wrapped in `substr(_, 1, n)`: it keeps the first
+/// `n` characters, yields `''` for `n = 0`, and propagates NULL (`substr(NULL, …)`
+/// is NULL). A `CAST` without a `CHAR` length, or any other target, is the plain
+/// cast.
+fn char_truncated_cast(expr: ast::Expr, type_name: ast::Type, char_len: Option<i64>) -> ast::Expr {
+    let cast = build_cast(expr, type_name);
+    match char_len {
+        Some(n) => call_fn(
+            "substr",
+            vec![cast, *numeric_expr("1"), *numeric_expr(&n.to_string())],
+        ),
+        None => cast,
+    }
+}
+
 fn build_cast(expr: ast::Expr, type_name: ast::Type) -> ast::Expr {
     if type_name.name != "INTEGER" {
         return ast::Expr::Cast {
@@ -13054,7 +13090,6 @@ mod tests {
             ("CAST(a AS CHAR)", "CHAR"),
             ("CAST(a AS DOUBLE)", "REAL"),
             ("CAST(a AS BINARY)", "BLOB"),
-            ("CAST(a AS CHAR(8))", "CHAR"), // length parses but is dropped
         ];
         for (sql, expected) in cases {
             let ast::Expr::Cast { type_name, .. } = parse_expr(sql).unwrap() else {
@@ -13064,6 +13099,17 @@ mod tests {
             assert_eq!(ty.name, expected, "for `{sql}`");
             assert!(ty.size.is_none(), "length must be dropped for `{sql}`");
         }
+        // `CAST(a AS CHAR(n))` bounds the result to n characters: it wraps the
+        // text cast in `substr(_, 1, n)` (a non-CHAR length is still dropped).
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("CAST(a AS CHAR(8))").unwrap()
+        else {
+            panic!("expected CAST(a AS CHAR(8)) to wrap in substr()");
+        };
+        assert_eq!(name.as_str(), "substr");
+        assert_eq!(args.len(), 3);
+        assert!(matches!(args[0].as_ref(), ast::Expr::Cast { type_name, .. }
+            if type_name.as_ref().unwrap().name == "CHAR"));
+        assert!(matches!(args[2].as_ref(), ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "8"));
         // An integer target (SIGNED/UNSIGNED) lowers to a `typeof`-guarded CASE
         // that rounds a numeric value before the `CAST ... AS INTEGER` and casts a
         // string/NULL directly (MySQL's argument-type-dependent rounding).
