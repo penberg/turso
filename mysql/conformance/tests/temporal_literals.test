@@ -1,0 +1,47 @@
+# MySQL typed temporal literals: DATE 'str', TIME 'str', TIMESTAMP 'str'.
+#
+# The DATE / TIME / TIMESTAMP keyword immediately before a quoted string is a
+# typed temporal literal whose value is the date/time it denotes (`DATE
+# '2026-03-01'` equals the string '2026-03-01'). The front-end previously
+# rejected the form with a syntax error; it now lowers it to the engine's
+# date()/time()/datetime() of the string, which normalizes it as MySQL does.
+# (MySQL has no DATETIME 'str' literal, so that form is not added.)
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# The literals evaluate to their date/time values.
+query
+SELECT DATE '2026-03-01', TIME '10:30:00', TIMESTAMP '2026-03-01 09:00:00'
+----
+2026-03-01	10:30:00	2026-03-01 09:00:00
+
+# A temporal literal compares equal to the plain string it denotes.
+query
+SELECT DATE '2026-03-01' = '2026-03-01', TIME '10:30:00' = '10:30:00'
+----
+1	1
+
+# Used in a WHERE predicate against date / datetime columns.
+statement ok
+CREATE TABLE IF NOT EXISTS tl (id INT PRIMARY KEY, c DATE, ts DATETIME)
+
+statement ok
+INSERT INTO tl (id, c, ts) VALUES (1, '2026-01-15', '2026-01-15 08:00:00'), (2, '2026-06-01', '2026-06-01 20:00:00')
+
+query
+SELECT id FROM tl WHERE c > DATE '2026-03-01' ORDER BY id
+----
+2
+
+query
+SELECT id FROM tl WHERE ts < TIMESTAMP '2026-03-01 00:00:00' ORDER BY id
+----
+1
+
+# DATE / TIME / TIMESTAMP remain usable as identifiers elsewhere (a column
+# alias here), since the literal form only fires directly before a string.
+query
+SELECT c AS date FROM tl WHERE id = 1
+----
+2026-01-15

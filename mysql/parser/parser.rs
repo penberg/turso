@@ -3255,6 +3255,22 @@ impl Parser {
                         self.advance();
                         self.convert_expr()
                     }
+                    // MySQL typed temporal literals `DATE 'str'`, `TIME 'str'`,
+                    // and `TIMESTAMP 'str'` (keyword directly before a quoted
+                    // string — the form with `(` is the date/time function on the
+                    // function path). Lower to the engine's `date`/`time`/
+                    // `datetime` of the string, which normalizes it as MySQL does
+                    // (`TIMESTAMP '2026-03-01'` → `2026-03-01 00:00:00`). MySQL has
+                    // no `DATETIME 'str'` literal, so it is not included.
+                    "DATE" if matches!(self.peek_nth(1), Some(Token::Str(_))) => {
+                        self.temporal_literal("date")
+                    }
+                    "TIME" if matches!(self.peek_nth(1), Some(Token::Str(_))) => {
+                        self.temporal_literal("time")
+                    }
+                    "TIMESTAMP" if matches!(self.peek_nth(1), Some(Token::Str(_))) => {
+                        self.temporal_literal("datetime")
+                    }
                     // The SQL-standard niladic date/time keywords are valid
                     // *without* parentheses: `CURRENT_TIMESTAMP`, `CURRENT_DATE`,
                     // `CURRENT_TIME`, `LOCALTIME`, `LOCALTIMESTAMP`, and the
@@ -3298,6 +3314,22 @@ impl Parser {
     /// rules, so MySQL's cast target types are mapped to a type name with the
     /// matching affinity (see [`Self::cast_type`]). `CAST` has already been
     /// consumed.
+    /// Parses a MySQL typed temporal literal (`DATE`/`TIME`/`TIMESTAMP` keyword
+    /// already at the cursor, immediately followed by a quoted string) into
+    /// `<engine_fn>('str')` — `date`/`time`/`datetime` of the string.
+    fn temporal_literal(&mut self, engine_fn: &'static str) -> Result<ast::Expr> {
+        self.advance(); // the DATE / TIME / TIMESTAMP keyword
+        let s = match self.peek() {
+            Some(Token::Str(s)) => s.clone(),
+            _ => return Err(self.unexpected("a quoted temporal literal")),
+        };
+        self.advance(); // the string literal
+        Ok(call_fn(
+            engine_fn,
+            vec![ast::Expr::Literal(ast::Literal::String(requote(&s)))],
+        ))
+    }
+
     fn cast_expr(&mut self) -> Result<ast::Expr> {
         self.expect(&Token::LParen, "`(`")?;
         let expr = self.expr()?;
@@ -7843,6 +7875,33 @@ mod tests {
             parse_expr("id IN (1, 2, 3)").unwrap(),
             ast::Expr::InList { .. }
         ));
+    }
+
+    #[test]
+    fn temporal_literals_lower_to_date_functions() {
+        // DATE/TIME/TIMESTAMP 'str' -> date/time/datetime('str').
+        for (sql, func) in [
+            ("DATE '2026-03-01'", "date"),
+            ("TIME '10:30:00'", "time"),
+            ("TIMESTAMP '2026-03-01 09:00:00'", "datetime"),
+        ] {
+            let ast::Expr::FunctionCall { name, args, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a function call");
+            };
+            assert_eq!(name.as_str(), func, "{sql}");
+            assert!(matches!(
+                args[0].as_ref(),
+                ast::Expr::Literal(ast::Literal::String(_))
+            ));
+        }
+
+        // The keyword followed by `(` is still the date/time function, and a
+        // keyword not before a string is an ordinary identifier.
+        assert!(matches!(
+            parse_expr("DATE(d)").unwrap(),
+            ast::Expr::FunctionCall { .. }
+        ));
+        assert!(matches!(parse_expr("date").unwrap(), ast::Expr::Id(_)));
     }
 
     #[test]
