@@ -233,6 +233,7 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
             notnull,
             default,
             pk,
+            key: "",
         });
         Ok(())
     })?;
@@ -253,6 +254,16 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
     for col in &mut info {
         if let Some(ty) = declared.get(&col.name.to_ascii_lowercase()) {
             col.ty = ty.clone();
+        }
+    }
+
+    // The `Key` flag (`UNI`/`MUL`) for columns that lead a non-primary index, so
+    // `SHOW COLUMNS` matches MySQL (a primary-key column reports `PRI` in
+    // `into_row`).
+    let lead_keys = lead_column_keys(conn, &show.table);
+    for col in &mut info {
+        if let Some(k) = lead_keys.get(&col.name.to_ascii_lowercase()) {
+            col.key = k;
         }
     }
 
@@ -296,6 +307,54 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
 /// it with SQLite-isms (e.g. `PRIMARY KEY (ID AUTOINCREMENT)`) that the MySQL
 /// front-end parser rejects, and only each column's leading `name type(size)` is
 /// needed, so the rest of every definition is ignored.
+/// For each column that is the leading column of a non-primary index, its MySQL
+/// `Key` flag: `UNI` when it leads a unique index, `MUL` when it leads a
+/// non-unique one (`UNI` wins if it leads both). Keyed by lowercased column name.
+/// The primary-key index (`origin = pk`) is excluded — those columns report
+/// `PRI` directly. Only the leading column of each index is recorded, as MySQL
+/// flags only that one.
+fn lead_column_keys(conn: &Arc<Connection>, table: &str) -> HashMap<String, &'static str> {
+    let mut keys: HashMap<String, &'static str> = HashMap::new();
+    let escaped = table.replace('\'', "''");
+
+    // `index_list`: seq, name, unique, origin, partial. Skip the PK index.
+    let mut indexes: Vec<(String, bool)> = Vec::new();
+    let index_list = format!("PRAGMA index_list('{escaped}')");
+    if let Ok(Some(mut stmt)) = conn.query(&index_list) {
+        let _ = stmt.run_with_row_callback(|row| {
+            let name = value_to_string(row.get_value(1)).unwrap_or_default();
+            let unique = value_to_string(row.get_value(2)).as_deref() == Some("1");
+            let origin = value_to_string(row.get_value(3)).unwrap_or_default();
+            if !origin.eq_ignore_ascii_case("pk") {
+                indexes.push((name, unique));
+            }
+            Ok(())
+        });
+    }
+
+    for (name, unique) in indexes {
+        // `index_info`: seqno, cid, name — ordered, so the first row is the lead.
+        let idx = name.replace('\'', "''");
+        let mut lead: Option<String> = None;
+        let index_info = format!("PRAGMA index_info('{idx}')");
+        if let Ok(Some(mut stmt)) = conn.query(&index_info) {
+            let _ = stmt.run_with_row_callback(|row| {
+                if lead.is_none() {
+                    lead = value_to_string(row.get_value(2));
+                }
+                Ok(())
+            });
+        }
+        if let Some(col) = lead {
+            let entry = keys.entry(col.to_ascii_lowercase()).or_insert("MUL");
+            if unique {
+                *entry = "UNI";
+            }
+        }
+    }
+    keys
+}
+
 fn declared_column_types(conn: &Arc<Connection>, table: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let query = format!(
@@ -771,6 +830,10 @@ struct ColumnInfo {
     notnull: bool,
     default: Option<String>,
     pk: bool,
+    /// The MySQL `Key` flag for a non-primary-key column: `UNI` when the column
+    /// leads a unique index, `MUL` when it leads a non-unique one, else empty.
+    /// A primary-key column reports `PRI` regardless (see [`Self::into_row`]).
+    key: &'static str,
 }
 
 impl ColumnInfo {
@@ -780,7 +843,9 @@ impl ColumnInfo {
         // does not flag it (an `INTEGER PRIMARY KEY` rowid alias reports
         // `notnull = 0` in `PRAGMA table_info`).
         let null = if self.notnull || self.pk { "NO" } else { "YES" };
-        let key = if self.pk { "PRI" } else { "" };
+        // A primary-key column is `PRI`; otherwise `UNI`/`MUL` from leading an
+        // index, or empty.
+        let key = if self.pk { "PRI" } else { self.key };
         let collation = if is_text_type(&self.ty) {
             Some(COLLATION.to_string())
         } else {

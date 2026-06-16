@@ -1,0 +1,32 @@
+# SHOW COLUMNS: the Key flag (PRI / UNI / MUL).
+#
+# MySQL's SHOW COLUMNS reports each column's Key: PRI for a primary-key column,
+# UNI for the leading column of a unique index, MUL for the leading column of a
+# non-unique index (only the leading column of a multi-column index is flagged),
+# and empty otherwise. The front-end derives UNI/MUL from the engine's index
+# list (PRAGMA index_list / index_info), excluding the primary-key index (those
+# columns report PRI directly). WordPress and MySQL tools read this column.
+#
+# Rows are tab-separated with a trailing tab for the empty Extra column. Expected
+# to pass against both turso-mysql-server and a real mysqld. Uses its own table.
+
+statement ok
+CREATE TABLE IF NOT EXISTS keyflag (id INT PRIMARY KEY, uni INT UNIQUE, mul INT, comp_a INT, comp_b INT, plain INT, KEY keyflag_m (mul), KEY keyflag_ab (comp_a, comp_b))
+
+# id -> PRI, uni -> UNI, mul -> MUL, comp_a -> MUL (lead of a composite index),
+# comp_b -> empty (not the lead column), plain -> empty.
+query
+SHOW COLUMNS FROM keyflag
+----
+id	int	NO	PRI	NULL	
+uni	int	YES	UNI	NULL	
+mul	int	YES	MUL	NULL	
+comp_a	int	YES	MUL	NULL	
+comp_b	int	YES		NULL	
+plain	int	YES		NULL	
+
+# The Key filter selects the UNI column.
+query
+SHOW COLUMNS FROM keyflag WHERE Key = 'UNI'
+----
+uni	int	YES	UNI	NULL	
