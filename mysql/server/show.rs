@@ -67,7 +67,90 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     if let Some(result) = parse_show_warnings(sql) {
         return Some(Ok(ShowOutcome::Columns(result)));
     }
+    if let Some(result) = parse_maintenance(sql) {
+        return Some(Ok(ShowOutcome::Columns(result)));
+    }
     None
+}
+
+/// Handles the table-maintenance statements `{ANALYZE | CHECK | OPTIMIZE |
+/// REPAIR} TABLE tbl [, tbl] ...` (WordPress's database-repair admin page runs
+/// these). The engine has no fragmentation, optimizer statistics, or
+/// MySQL-style corruption, so each is a no-op that reports success: the result
+/// is MySQL's `Table` / `Op` / `Msg_type` / `Msg_text` columns with one
+/// `status` / `OK` row per named table. The `Table` value is the bare table name
+/// (the engine has no schema-qualified name, so it is not `db.tbl` as MySQL
+/// reports), and trailing options (`QUICK`, `EXTENDED`, `FOR UPGRADE`, …) are
+/// ignored. Returns `None` for any other statement.
+fn parse_maintenance(sql: &str) -> Option<ColumnsResult> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = tokenize(trimmed);
+    let kw = |t: &str, k: &str| t.eq_ignore_ascii_case(k);
+
+    let op = match toks.first()? {
+        t if kw(t, "ANALYZE") => "analyze",
+        t if kw(t, "CHECK") => "check",
+        t if kw(t, "OPTIMIZE") => "optimize",
+        t if kw(t, "REPAIR") => "repair",
+        _ => return None,
+    };
+    let mut k = 1;
+    // An optional `NO_WRITE_TO_BINLOG` / `LOCAL` modifier precedes `TABLE`.
+    if toks
+        .get(k)
+        .is_some_and(|t| kw(t, "NO_WRITE_TO_BINLOG") || kw(t, "LOCAL"))
+    {
+        k += 1;
+    }
+    if !toks.get(k).is_some_and(|t| kw(t, "TABLE")) {
+        return None;
+    }
+    k += 1;
+
+    // The comma-separated table list (each possibly `db.tbl`). The list ends at
+    // the first token that is not followed by a comma; any trailing option
+    // keywords are left unconsumed and ignored.
+    let mut tables = Vec::new();
+    loop {
+        let Some(first) = toks.get(k) else { break };
+        let mut table = first.clone();
+        k += 1;
+        if toks.get(k).is_some_and(|t| t == ".") {
+            k += 1;
+            match toks.get(k) {
+                Some(t) => {
+                    table = t.clone();
+                    k += 1;
+                }
+                None => return None,
+            }
+        }
+        tables.push(table);
+        if toks.get(k).is_some_and(|t| t == ",") {
+            k += 1;
+            continue;
+        }
+        break;
+    }
+    if tables.is_empty() {
+        return None;
+    }
+
+    let rows = tables
+        .into_iter()
+        .map(|t| {
+            vec![
+                Some(t),
+                Some(op.to_string()),
+                Some("status".to_string()),
+                Some("OK".to_string()),
+            ]
+        })
+        .collect();
+    Some(ColumnsResult {
+        columns: vec!["Table", "Op", "Msg_type", "Msg_text"],
+        rows,
+    })
 }
 
 /// Handles `SHOW {WARNINGS | ERRORS} [LIMIT ...]`. The engine raises no
@@ -1421,6 +1504,45 @@ mod tests {
         assert!(is_text_type("LONGTEXT"));
         assert!(!is_text_type("INT"));
         assert!(!is_text_type("BIGINT"));
+    }
+
+    #[test]
+    fn parses_maintenance_statements() {
+        // Each op yields a `status`/`OK` row per table with the op name.
+        let r = parse_maintenance("ANALYZE TABLE t").unwrap();
+        assert_eq!(r.columns, vec!["Table", "Op", "Msg_type", "Msg_text"]);
+        assert_eq!(
+            r.rows,
+            vec![vec![
+                Some("t".to_string()),
+                Some("analyze".to_string()),
+                Some("status".to_string()),
+                Some("OK".to_string()),
+            ]]
+        );
+
+        // The op name is taken from the keyword.
+        for (sql, op) in [
+            ("CHECK TABLE t", "check"),
+            ("OPTIMIZE TABLE t", "optimize"),
+            ("REPAIR TABLE t", "repair"),
+        ] {
+            assert_eq!(parse_maintenance(sql).unwrap().rows[0][1], Some(op.to_string()));
+        }
+
+        // A comma-separated list gives one row per table; the `LOCAL` modifier
+        // and trailing options are ignored; a `db.tbl` name uses the table part.
+        assert_eq!(parse_maintenance("ANALYZE TABLE a, b").unwrap().rows.len(), 2);
+        assert_eq!(parse_maintenance("OPTIMIZE LOCAL TABLE t").unwrap().rows.len(), 1);
+        assert_eq!(parse_maintenance("CHECK TABLE t QUICK").unwrap().rows.len(), 1);
+        assert_eq!(
+            parse_maintenance("ANALYZE TABLE d.t").unwrap().rows[0][0],
+            Some("t".to_string())
+        );
+
+        // Unrelated statements fall through.
+        assert!(parse_maintenance("SELECT 1").is_none());
+        assert!(parse_maintenance("ANALYZE t").is_none()); // missing TABLE
     }
 
     #[test]

@@ -513,11 +513,8 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement          | Status | Comment |
 |--------------------|--------|---------|
-| ANALYZE TABLE      | ❌     |         |
-| CHECK TABLE        | ❌     |         |
+| ANALYZE / CHECK / OPTIMIZE / REPAIR TABLE | 🚧 | Accepted as a no-op that reports success (WordPress's database-repair admin page runs them). The engine has no fragmentation, optimizer statistics, or MySQL-style corruption, so each returns MySQL's `Table`/`Op`/`Msg_type`/`Msg_text` columns with one `status`/`OK` row per named table (comma lists give one row each; the `LOCAL` modifier and trailing options like `QUICK`/`FOR UPGRADE` are ignored). Not byte-identical to mysqld: `Table` is the bare table name (no `db.` prefix), and `OPTIMIZE` returns one status row rather than InnoDB's note + status pair. |
 | CHECKSUM TABLE     | ❌     |         |
-| OPTIMIZE TABLE     | ❌     |         |
-| REPAIR TABLE       | ❌     |         |
 
 #### Component, Plugin, and Loadable Function
 
