@@ -26,6 +26,8 @@ SELECT id, name FROM t ORDER BY id
 
 - `statement ok` — the SQL must succeed.
 - `statement error` — the SQL must fail.
+- `statement error <code>` — the SQL must fail with that MySQL error number
+  (e.g. `statement error 1062` for a duplicate key).
 - `query` — the SQL must succeed and return exactly the rows after `----`, in
   order, columns separated by a single tab, SQL `NULL` rendered as `NULL`.
 - `query types` — like `query`, but the single expected line lists the MySQL

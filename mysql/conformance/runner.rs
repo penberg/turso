@@ -26,6 +26,8 @@
 //!
 //! * `statement ok` — the SQL must execute without error.
 //! * `statement error` — the SQL must fail.
+//! * `statement error <code>` — the SQL must fail with that MySQL error number
+//!   (e.g. `statement error 1062`).
 //! * `query` — the SQL must succeed and produce exactly the rows after `----`,
 //!   in order, with columns separated by a single tab and SQL `NULL` rendered
 //!   as the literal `NULL`.
@@ -54,10 +56,13 @@ use mysql::{Conn, Params, Value};
 /// One record (test directive plus its payload) parsed from a `.test` file.
 #[derive(Debug, Clone)]
 pub enum Record {
-    /// A statement that must succeed (`ok`) or fail (`!ok`).
+    /// A statement that must succeed (`ok`) or fail (`!ok`). When `expect_ok` is
+    /// false, `expect_code` optionally pins the MySQL error code the failure must
+    /// carry (`statement error 1062`).
     Statement {
         line: usize,
         expect_ok: bool,
+        expect_code: Option<u16>,
         sql: String,
     },
     /// A query whose rows must match `expected` exactly and in order.
@@ -142,20 +147,30 @@ pub fn parse(content: &str) -> Result<Vec<Record>> {
                     expected,
                 });
             }
-            "statement ok" | "statement error" => {
-                let expect_ok = directive.ends_with("ok");
-                let mut sql = Vec::new();
-                while i < lines.len() && !lines[i].trim().is_empty() {
-                    sql.push(lines[i]);
-                    i += 1;
-                }
-                if sql.is_empty() {
-                    bail!("line {directive_line}: `{directive}` has no SQL");
-                }
+            "statement ok" => {
+                let sql = read_statement_sql(&lines, &mut i, &directive, directive_line)?;
                 records.push(Record::Statement {
                     line: directive_line,
-                    expect_ok,
-                    sql: sql.join("\n"),
+                    expect_ok: true,
+                    expect_code: None,
+                    sql,
+                });
+            }
+            // `statement error` or `statement error <code>` (the optional code
+            // pins the MySQL error number, e.g. `statement error 1062`).
+            d if d == "statement error" || d.starts_with("statement error ") => {
+                let expect_code = match d.strip_prefix("statement error ").map(str::trim) {
+                    Some(code) if !code.is_empty() => Some(code.parse::<u16>().with_context(|| {
+                        format!("line {directive_line}: invalid error code `{code}`")
+                    })?),
+                    _ => None,
+                };
+                let sql = read_statement_sql(&lines, &mut i, &directive, directive_line)?;
+                records.push(Record::Statement {
+                    line: directive_line,
+                    expect_ok: false,
+                    expect_code,
+                    sql,
                 });
             }
             "query types" => {
@@ -198,6 +213,25 @@ pub fn parse(content: &str) -> Result<Vec<Record>> {
         }
     }
     Ok(records)
+}
+
+/// Reads the SQL body of a `statement` directive — the lines up to the next
+/// blank line. Advances `i` past them.
+fn read_statement_sql(
+    lines: &[&str],
+    i: &mut usize,
+    directive: &str,
+    directive_line: usize,
+) -> Result<String> {
+    let mut sql = Vec::new();
+    while *i < lines.len() && !lines[*i].trim().is_empty() {
+        sql.push(lines[*i]);
+        *i += 1;
+    }
+    if sql.is_empty() {
+        bail!("line {directive_line}: `{directive}` has no SQL");
+    }
+    Ok(sql.join("\n"))
 }
 
 /// Reads a query block: the SQL lines up to a `----` separator, then the
@@ -311,11 +345,21 @@ pub fn run(conn: &mut Conn, records: &[Record]) -> Vec<Outcome> {
     records.iter().map(|r| run_record(conn, r)).collect()
 }
 
+/// The MySQL error number a driver error carries, if any (a server-side error
+/// reported over the protocol, as opposed to a client/IO error).
+fn mysql_error_code(error: &mysql::Error) -> Option<u16> {
+    match error {
+        mysql::Error::MySqlError(e) => Some(e.code),
+        _ => None,
+    }
+}
+
 fn run_record(conn: &mut Conn, record: &Record) -> Outcome {
     match record {
         Record::Statement {
             line,
             expect_ok,
+            expect_code,
             sql,
         } => match (expect_ok, conn.query_drop(sql)) {
             (true, Ok(())) => Outcome::Pass,
@@ -327,7 +371,19 @@ fn run_record(conn: &mut Conn, record: &Record) -> Outcome {
                 line: *line,
                 message: "expected an error, but statement succeeded".to_string(),
             },
-            (false, Err(_)) => Outcome::Pass,
+            (false, Err(e)) => match expect_code {
+                None => Outcome::Pass,
+                Some(want) => match mysql_error_code(&e) {
+                    Some(got) if got == *want => Outcome::Pass,
+                    got => Outcome::Fail {
+                        line: *line,
+                        message: format!(
+                            "expected error code {want}, got {}: {e}",
+                            got.map_or_else(|| "none".to_string(), |c| c.to_string())
+                        ),
+                    },
+                },
+            },
         },
         Record::Query {
             line,
@@ -583,5 +639,39 @@ SELECT id FROM t ORDER BY id
     fn query_without_separator_is_an_error() {
         let content = "query\nSELECT 1\n";
         assert!(parse(content).is_err());
+    }
+
+    #[test]
+    fn parses_statement_error_with_code() {
+        let content = "\
+statement error 1062
+INSERT INTO t VALUES (1)
+
+statement error
+INSERT INTO t VALUES (2)
+";
+        let records = parse(content).unwrap();
+        assert!(matches!(
+            &records[0],
+            Record::Statement {
+                expect_ok: false,
+                expect_code: Some(1062),
+                ..
+            }
+        ));
+        // The bare form leaves the code unpinned.
+        assert!(matches!(
+            &records[1],
+            Record::Statement {
+                expect_ok: false,
+                expect_code: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn statement_error_with_bad_code_is_an_error() {
+        assert!(parse("statement error notanumber\nSELECT 1\n").is_err());
     }
 }

@@ -1,0 +1,50 @@
+# Errors carry the MySQL error number a real server reports, not a generic 1105.
+#
+# The engine raises constraint and name-resolution failures with descriptive
+# messages but no MySQL error code, so the front-end previously reported them all
+# as ER_ERROR_GENERAL (1105, HY000). Clients branch on the code: WordPress's
+# $wpdb checks mysql_errno() for a duplicate key (1062) when inserting, and for a
+# missing table (1146) before creating one, so a generic code misleads them. The
+# front-end now maps the common cases to their MySQL code and SQLSTATE.
+#
+# `statement error <code>` asserts the failure carries that exact error number;
+# verified against MySQL 8.4. Uses file-unique names (the conformance DB is
+# shared).
+
+statement ok
+CREATE TABLE errcode_t (id INT PRIMARY KEY, k VARCHAR(20) UNIQUE, nn VARCHAR(10) NOT NULL)
+
+statement ok
+INSERT INTO errcode_t (id, k, nn) VALUES (1, 'a', 'x')
+
+# A duplicate UNIQUE key is ER_DUP_ENTRY.
+statement error 1062
+INSERT INTO errcode_t (id, k, nn) VALUES (2, 'a', 'y')
+
+# A duplicate PRIMARY KEY is also ER_DUP_ENTRY.
+statement error 1062
+INSERT INTO errcode_t (id, k, nn) VALUES (1, 'b', 'y')
+
+# An explicit NULL into a NOT NULL column is ER_BAD_NULL_ERROR.
+statement error 1048
+INSERT INTO errcode_t (id, k, nn) VALUES (3, 'c', NULL)
+
+# A reference to a missing table is ER_NO_SUCH_TABLE.
+statement error 1146
+SELECT * FROM errcode_missing_table
+
+# A reference to a missing column is ER_BAD_FIELD_ERROR.
+statement error 1054
+SELECT errcode_missing_col FROM errcode_t
+
+# An INSERT naming a missing column is also ER_BAD_FIELD_ERROR.
+statement error 1054
+INSERT INTO errcode_t (id, errcode_missing_col) VALUES (4, 5)
+
+# Creating a table that already exists is ER_TABLE_EXISTS_ERROR.
+statement error 1050
+CREATE TABLE errcode_t (id INT)
+
+# The bare `statement error` form (no code) still just requires a failure.
+statement error
+INSERT INTO errcode_t (id, k, nn) VALUES (1, 'dup-pk-again', 'z')

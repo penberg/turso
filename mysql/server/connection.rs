@@ -33,6 +33,14 @@ const ER_PARSE_ERROR: u16 = 1064;
 const ER_NOT_SUPPORTED_YET: u16 = 1235;
 /// `ER_NO_SUCH_TABLE`: a statement referenced a table that does not exist.
 const ER_NO_SUCH_TABLE: u16 = 1146;
+/// `ER_DUP_ENTRY`: a write violated a UNIQUE or PRIMARY KEY constraint.
+const ER_DUP_ENTRY: u16 = 1062;
+/// `ER_BAD_NULL_ERROR`: a NULL was stored in a `NOT NULL` column.
+const ER_BAD_NULL_ERROR: u16 = 1048;
+/// `ER_BAD_FIELD_ERROR`: a statement referenced a column that does not exist.
+const ER_BAD_FIELD_ERROR: u16 = 1054;
+/// `ER_TABLE_EXISTS_ERROR`: a `CREATE TABLE` named an existing table.
+const ER_TABLE_EXISTS_ERROR: u16 = 1050;
 
 /// Wraps the blocking socket with a frame decoder and a write buffer.
 struct Wire {
@@ -803,10 +811,49 @@ fn unknown_statement_response(seq: u8, id: u32) -> Vec<u8> {
     out
 }
 
+/// Maps an engine error to the MySQL `(error code, SQLSTATE)` a real server
+/// reports. Clients branch on the code — WordPress's `$wpdb` checks
+/// `mysql_errno()` for a duplicate key (1062) and a missing table (1146), for
+/// instance — so a generic 1105 misleads them. The engine raises these as a
+/// `Constraint` or `ParseError` carrying a descriptive message; match the
+/// message for the cases MySQL gives a specific code, and otherwise fall back to
+/// the generic `ER_ERROR_GENERAL` (1105, `HY000`).
+fn error_code_and_state(error: &LimboError) -> (u16, [u8; 5]) {
+    match error {
+        // A constraint violation at execution time. SQLite's rowid/PRIMARY KEY
+        // conflicts also report as "UNIQUE constraint failed".
+        LimboError::Constraint(msg) => {
+            let msg = msg.to_ascii_uppercase();
+            if msg.contains("UNIQUE CONSTRAINT") {
+                (ER_DUP_ENTRY, *b"23000")
+            } else if msg.contains("NOT NULL CONSTRAINT") {
+                (ER_BAD_NULL_ERROR, *b"23000")
+            } else {
+                (ER_ERROR_GENERAL, *b"HY000")
+            }
+        }
+        // Schema/name resolution failures surface as `ParseError`.
+        LimboError::ParseError(msg) => {
+            let msg = msg.to_ascii_lowercase();
+            if msg.contains("such table") {
+                (ER_NO_SUCH_TABLE, *b"42S02")
+            } else if msg.contains("such column") || msg.contains("column named") {
+                (ER_BAD_FIELD_ERROR, *b"42S22")
+            } else if msg.contains("already exists") {
+                (ER_TABLE_EXISTS_ERROR, *b"42S01")
+            } else {
+                (ER_ERROR_GENERAL, *b"HY000")
+            }
+        }
+        _ => (ER_ERROR_GENERAL, *b"HY000"),
+    }
+}
+
 /// Builds a single ERR-packet response for a failed query.
 fn error_response(seq: u8, error: &LimboError) -> Vec<u8> {
     let mut out = Vec::new();
-    let err = ErrPacket::new(ER_ERROR_GENERAL, error.to_string());
+    let (code, state) = error_code_and_state(error);
+    let err = ErrPacket::new(code, error.to_string()).with_state(state);
     encode_frame(&mut out, seq, &err.encode());
     out
 }
@@ -820,4 +867,59 @@ fn scramble_for(connection_id: u32) -> [u8; 20] {
         *byte = (connection_id.wrapping_add(i as u32) as u8).wrapping_add(1) | 0x01;
     }
     scramble
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_engine_errors_to_mysql_codes() {
+        let cases = [
+            (
+                LimboError::Constraint("UNIQUE constraint failed: t.k (19)".into()),
+                ER_DUP_ENTRY,
+                *b"23000",
+            ),
+            (
+                LimboError::Constraint("NOT NULL constraint failed: t.c".into()),
+                ER_BAD_NULL_ERROR,
+                *b"23000",
+            ),
+            (
+                LimboError::ParseError("no such table: t".into()),
+                ER_NO_SUCH_TABLE,
+                *b"42S02",
+            ),
+            (
+                LimboError::ParseError("no such column: c".into()),
+                ER_BAD_FIELD_ERROR,
+                *b"42S22",
+            ),
+            (
+                LimboError::ParseError("table t has no column named c".into()),
+                ER_BAD_FIELD_ERROR,
+                *b"42S22",
+            ),
+            (
+                LimboError::ParseError("table t already exists".into()),
+                ER_TABLE_EXISTS_ERROR,
+                *b"42S01",
+            ),
+        ];
+        for (err, code, state) in cases {
+            assert_eq!(error_code_and_state(&err), (code, state), "for {err:?}");
+        }
+
+        // An unrecognized error keeps the generic code and SQLSTATE.
+        assert_eq!(
+            error_code_and_state(&LimboError::InternalError("boom".into())),
+            (ER_ERROR_GENERAL, *b"HY000")
+        );
+        // A CHECK constraint is a constraint but not one we map specifically.
+        assert_eq!(
+            error_code_and_state(&LimboError::Constraint("CHECK constraint failed".into())),
+            (ER_ERROR_GENERAL, *b"HY000")
+        );
+    }
 }

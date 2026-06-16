@@ -148,10 +148,10 @@ session variables, multi-statement/multi-result, compression — is unimplemente
 | Packet                         | Status | Comment                                                     |
 |--------------------------------|--------|-------------------------------------------------------------|
 | `OK_Packet`                    | ❌     | Encoded; `affected_rows`/`last_insert_id` from the engine.  |
-| `ERR_Packet`                   | ❌     | Encoded; always SQLSTATE `HY000`, error code `1105`.        |
+| `ERR_Packet`                   | 🚧     | Encoded with the mapped error code and SQLSTATE (below), defaulting to `1105`/`HY000`. |
 | `EOF_Packet`                   | ❌     | Encoded; used to terminate column lists and result sets.    |
-| MySQL error code mapping       | ❌     | All errors collapse to a single generic code.               |
-| SQLSTATE mapping               | ❌     | Always `HY000`.                                             |
+| MySQL error code mapping       | 🚧     | The common cases carry their real code: duplicate key → `1062` (`ER_DUP_ENTRY`), NULL into a `NOT NULL` column → `1048`, missing table → `1146`, missing column → `1054`, `CREATE` of an existing table → `1050`, syntax error → `1064`, unsupported statement → `1235`. Other engine errors still collapse to the generic `1105`. WordPress's `$wpdb` branches on `mysql_errno()` (e.g. duplicate-key on insert). |
+| SQLSTATE mapping               | 🚧     | Set for the mapped codes (`23000` for `1062`/`1048`, `42S02` for `1146`, `42S22` for `1054`, `42S01` for `1050`, `42000` for syntax); otherwise `HY000`. |
 | Session state change tracking  | ❌     | Not implemented.                                            |
 
 ### Result sets
