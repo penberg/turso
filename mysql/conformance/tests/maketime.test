@@ -1,13 +1,13 @@
 # MAKETIME(hour, minute, second) conformance.
 #
 # MAKETIME builds a time string from hour/minute/second components. The front-end
-# lowers it to printf('%02d:%02d:%02d', hour, minute, second), guarded by a CASE
-# that returns NULL when any argument is NULL or minute/second is outside 0..59
-# (which MySQL also rejects to NULL). The hour may exceed 23 (a MySQL TIME spans
-# many hours).
+# lowers it to printf('%s%02d:%02d:%02d', sign, abs(hour), minute, second),
+# guarded by a CASE that returns NULL when any argument is NULL or minute/second
+# is outside 0..59 (which MySQL also rejects to NULL). The hour may exceed 23 (a
+# MySQL TIME spans many hours) and may be negative (the whole TIME is negative).
 #
-# Scope: a negative hour (MySQL pads to -01:..; printf gives -1:..) and an hour
-# past 838 (MySQL clamps) diverge and are not exercised.
+# Scope: an hour past 838 (MySQL clamps the TIME range) diverges and is not
+# exercised.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld. Uses its
 # own table name.
@@ -23,6 +23,13 @@ query
 SELECT MAKETIME(25, 0, 0), MAKETIME(100, 30, 5)
 ----
 25:00:00	100:30:05
+
+# A negative hour makes the whole TIME negative: the sign leads, and the hour
+# magnitude is still zero-padded (-01, not -1).
+query
+SELECT MAKETIME(-1, 0, 0), MAKETIME(-1, 30, 45), MAKETIME(-12, 5, 9), MAKETIME(-100, 0, 0)
+----
+-01:00:00	-01:30:45	-12:05:09	-100:00:00
 
 # An out-of-range minute or second yields NULL.
 query

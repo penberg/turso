@@ -7175,13 +7175,14 @@ impl Parser {
     }
 
     /// Lowers `MAKETIME(hour, minute, second)` (the name and `(` are already
-    /// consumed) to `printf('%02d:%02d:%02d', hour, minute, second)`, guarded by a
-    /// `CASE` that returns NULL when any argument is NULL or `minute`/`second` is
-    /// outside `0..=59` (which MySQL also rejects to NULL). The hour may exceed 23
-    /// (MySQL `TIME` spans to 838 hours). Divergences not modeled: a negative hour
-    /// renders as `-1:..` rather than MySQL's `-01:..`, and an hour past 838 is
-    /// not clamped — documented in `mysql/COMPAT.md`. Exactly three arguments are
-    /// required.
+    /// consumed) to `printf('%s%02d:%02d:%02d', sign, abs(hour), minute, second)`,
+    /// guarded by a `CASE` that returns NULL when any argument is NULL or
+    /// `minute`/`second` is outside `0..=59` (which MySQL also rejects to NULL).
+    /// The hour may exceed 23 (MySQL `TIME` spans to 838 hours). The sign is split
+    /// from the magnitude so a negative hour renders as MySQL's `-01:..` (the sign
+    /// before the zero-padded hour) rather than `-1:..`. One divergence not
+    /// modeled: an hour past 838 is not clamped (see `mysql/COMPAT.md`). Exactly
+    /// three arguments are required.
     fn maketime_call(&mut self) -> Result<ast::Expr> {
         let hour = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
@@ -7215,11 +7216,23 @@ impl Parser {
         );
         let guard = ast::Expr::binary(any_null, ast::Operator::Or, bad_range);
 
+        // MySQL renders a negative hour as `-01:..` — the sign before the
+        // zero-padded magnitude — so split the sign from `abs(hour)` (a plain
+        // `%02d` of `-1` would be `-1`, putting the sign inside the field width).
+        let sign = ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::binary(hour.clone(), ast::Operator::Less, num("0"))),
+                Box::new(ast::Expr::Literal(ast::Literal::String(requote("-")))),
+            )],
+            else_expr: Some(Box::new(ast::Expr::Literal(ast::Literal::String(requote(""))))),
+        };
         let made = call_fn(
             "printf",
             vec![
-                ast::Expr::Literal(ast::Literal::String(requote("%02d:%02d:%02d"))),
-                hour,
+                ast::Expr::Literal(ast::Literal::String(requote("%s%02d:%02d:%02d"))),
+                sign,
+                unary_fn("abs", hour),
                 minute,
                 second,
             ],
@@ -13143,7 +13156,8 @@ mod tests {
     #[test]
     fn maketime_lowers_to_guarded_printf() {
         // MAKETIME(h, m, s) -> CASE WHEN <null/range guard> THEN NULL ELSE
-        // printf('%02d:%02d:%02d', h, m, s).
+        // printf('%s%02d:%02d:%02d', sign, abs(h), m, s) -- the sign is split from
+        // the hour so a negative hour renders as `-01:..`, not `-1:..`.
         let ast::Expr::Case {
             base, else_expr, ..
         } = parse_expr("MAKETIME(h, m, s)").unwrap()
@@ -13155,9 +13169,13 @@ mod tests {
             panic!("expected the ELSE to be a printf() call");
         };
         assert_eq!(name.as_str(), "printf");
-        assert_eq!(args.len(), 4);
+        assert_eq!(args.len(), 5);
         assert!(
-            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%02d:%02d:%02d'")
+            matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%s%02d:%02d:%02d'")
+        );
+        // The hour magnitude is abs(h).
+        assert!(
+            matches!(args[2].as_ref(), ast::Expr::FunctionCall { name, .. } if name.as_str() == "abs")
         );
     }
 
