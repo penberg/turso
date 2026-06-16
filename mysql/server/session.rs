@@ -52,6 +52,20 @@ pub fn try_handle(sql: &str) -> Option<SessionResponse> {
         return Some(SessionResponse::Ok);
     }
 
+    // `DROP {PROCEDURE|FUNCTION} IF EXISTS name` is a no-op that reports success:
+    // the engine has no stored routines, so there is never one to drop, and
+    // `IF EXISTS` makes the drop succeed silently (MySQL only adds a note). This
+    // is mysqldump's and a migration's standard "drop before create" preamble.
+    // The bare form (no `IF EXISTS`) is left to the parser, which rejects it.
+    if words.first() == Some(&"DROP")
+        && matches!(words.get(1), Some(&"PROCEDURE") | Some(&"FUNCTION"))
+        && words.get(2) == Some(&"IF")
+        && words.get(3) == Some(&"EXISTS")
+        && words.len() >= 5
+    {
+        return Some(SessionResponse::Ok);
+    }
+
     // `SELECT @@var, ...` / `SELECT VERSION()` and similar introspection.
     if upper.starts_with("SELECT ") || upper.starts_with("SELECT\t") {
         return handle_select(&trimmed[6..]);
@@ -228,6 +242,32 @@ mod tests {
         }
         // Bare `FLUSH` (no target) is left to the parser, which rejects it.
         assert!(try_handle("FLUSH").is_none());
+    }
+
+    #[test]
+    fn drop_routine_if_exists_is_a_noop() {
+        for sql in [
+            "DROP PROCEDURE IF EXISTS foo",
+            "DROP FUNCTION IF EXISTS foo",
+            "drop procedure if exists `my proc`;",
+            "DROP PROCEDURE IF EXISTS db.foo",
+        ] {
+            assert!(
+                matches!(try_handle(sql), Some(SessionResponse::Ok)),
+                "expected `{sql}` to be a no-op OK"
+            );
+        }
+        // Without `IF EXISTS` (or a name), or for another object, it falls
+        // through to the parser, which rejects it (matching MySQL, which errors
+        // because the routine does not exist).
+        for sql in [
+            "DROP PROCEDURE foo",
+            "DROP FUNCTION foo",
+            "DROP PROCEDURE IF EXISTS",
+            "DROP TABLE IF EXISTS foo",
+        ] {
+            assert!(try_handle(sql).is_none(), "expected `{sql}` to fall through");
+        }
     }
 
     #[test]

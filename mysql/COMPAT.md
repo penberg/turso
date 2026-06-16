@@ -235,7 +235,7 @@ incomplete.
 | DROP FUNCTION                          | ❌     |         |
 | DROP INDEX                             | ❌     |         |
 | DROP LOGFILE GROUP                     | ❌     |         |
-| DROP PROCEDURE / DROP FUNCTION         | ❌     |         |
+| DROP PROCEDURE / DROP FUNCTION         | 🚧     | The `DROP {PROCEDURE\|FUNCTION} IF EXISTS name` form is accepted as a **no-op** that reports success: the engine has no stored routines, so there is never one to drop, and `IF EXISTS` makes that succeed silently (MySQL only attaches a note). This is the "drop before create" preamble mysqldump and migration scripts emit, including wrapped in a version-gated executable comment (`/*!50003 DROP PROCEDURE IF EXISTS x */`). The bare form (no `IF EXISTS`) stays rejected — MySQL also errors there because the routine does not exist. Defining routines (`CREATE PROCEDURE`/`FUNCTION`) remains unsupported. |
 | DROP SERVER                            | ❌     |         |
 | DROP SPATIAL REFERENCE SYSTEM          | ❌     |         |
 | DROP TABLE *tbl_name* (single table)   | ✅     |         |

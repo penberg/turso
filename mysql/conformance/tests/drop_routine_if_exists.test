@@ -1,0 +1,34 @@
+# DROP PROCEDURE / DROP FUNCTION ... IF EXISTS.
+#
+# The engine has no stored routines, so a `DROP {PROCEDURE|FUNCTION} IF EXISTS
+# name` can never find one to drop -- and `IF EXISTS` makes that succeed silently
+# (MySQL only attaches a note). It is the standard "drop before create" preamble
+# in mysqldump output and migration scripts. The front-end parser has no stored-
+# routine statements, so it rejected these outright; the server now answers the
+# `IF EXISTS` form as a no-op OK.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# The IF EXISTS form succeeds even though no such routine exists.
+statement ok
+DROP PROCEDURE IF EXISTS noproc_demo
+
+statement ok
+DROP FUNCTION IF EXISTS nofunc_demo
+
+# A schema-qualified name is accepted too.
+statement ok
+DROP PROCEDURE IF EXISTS conformance.noproc_demo
+
+# mysqldump wraps the drop in a version-gated executable comment; the server
+# unwraps it before dispatch, so it is the same no-op.
+statement ok
+/*!50003 DROP PROCEDURE IF EXISTS dumped_demo */
+
+# Without IF EXISTS the statement fails on both: MySQL because the routine does
+# not exist, the front-end because it does not implement stored routines.
+statement error
+DROP PROCEDURE noproc_demo
+
+statement error
+DROP FUNCTION nofunc_demo
