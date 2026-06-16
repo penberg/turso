@@ -1,0 +1,51 @@
+# WEEK(date, 1) -- the Monday-first, "more than three days" week mode.
+#
+# MySQL's WEEK(d, 1) numbers weeks Monday-first, range 0-53, where week 1 is the
+# first week with more than three days in the year. WordPress's WP_Date_Query
+# uses this mode when the week starts on Monday. It has no single strftime code,
+# so the front-end lowers it to the ISO week (%V) with a year-boundary
+# correction: an early-January date whose ISO week belongs to the previous ISO
+# year is week 0, and a late-December date whose ISO week belongs to the next ISO
+# year is week 53. The values below were taken from MySQL 8.4.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+# Mid-year, and the two year-boundary corrections (0 in early January, 53 in
+# late December).
+query
+SELECT WEEK('2026-06-15', 1), WEEK('2023-01-01', 1), WEEK('2024-12-30', 1)
+----
+25	0	53
+
+# Week 1 begins once the week has more than three days in the new year.
+query
+SELECT WEEK('2026-01-01', 1), WEEK('2021-01-03', 1), WEEK('2021-01-04', 1)
+----
+1	0	1
+
+# A long ISO year reaches week 53 without the boundary correction.
+query
+SELECT WEEK('2026-12-31', 1)
+----
+53
+
+# The default mode (0) and the other supported modes are unchanged.
+query
+SELECT WEEK('2026-06-15'), WEEK('2026-06-15', 0), WEEK('2026-06-15', 3), WEEK('2026-06-15', 5)
+----
+24	24	25	24
+
+# Usable over a column.
+statement ok
+CREATE TABLE IF NOT EXISTS wk1 (id INT PRIMARY KEY, d DATE)
+
+statement ok
+INSERT INTO wk1 (id, d) VALUES (1, '2023-01-01'), (2, '2026-06-15'), (3, '2024-12-31')
+
+query
+SELECT id, WEEK(d, 1) FROM wk1 ORDER BY id
+----
+1	0
+2	25
+3	53

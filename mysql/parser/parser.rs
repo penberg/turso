@@ -4652,16 +4652,25 @@ impl Parser {
     }
 
     /// Parses `WEEK(d[, mode])` (the name and `(` are already consumed) and
-    /// lowers it to `CAST(strftime(fmt, d) AS INTEGER)`. MySQL's week `mode`
-    /// (default `0`, MySQL's `default_week_format`) selects among eight week
-    /// numbering schemes; only the three whose definition matches an engine
-    /// strftime format are supported:
+    /// lowers it to a `strftime`-based week number. MySQL's week `mode` (default
+    /// `0`, MySQL's `default_week_format`) selects among eight numbering schemes.
+    /// Three map directly to an engine strftime format:
     ///   - mode 0 → `%U` (Sunday-first, 0–53, week 1 = first week with a Sunday),
     ///   - mode 3 → `%V` (ISO 8601, Monday-first, 1–53),
     ///   - mode 5 → `%W` (Monday-first, 0–53, week 1 = first week with a Monday).
     ///
-    /// The other modes (1/2/4/6/7) have no exact strftime equivalent and are
-    /// rejected. The `mode` must be an integer literal.
+    /// Mode 1 (Monday-first, 0–53, week 1 = first week with more than three days
+    /// this year — which WordPress's `WP_Date_Query` uses when the week starts on
+    /// Monday) has no single strftime code, but it equals the ISO week (`%V`)
+    /// except in the partial week at a year boundary: an early-January date whose
+    /// ISO week belongs to the previous ISO year (`%G` < `%Y`) is week 0, and a
+    /// late-December date whose ISO week belongs to the next ISO year (`%G` >
+    /// `%Y`) is week 53. This identity was verified against MySQL 8.4 for every
+    /// day from 2016 to 2031.
+    ///
+    /// The remaining modes (2/4/6/7) have no clean strftime equivalent (their
+    /// 1–53 / Sunday-based year-boundary numbering depends on the adjacent year's
+    /// last week) and are rejected. The `mode` must be an integer literal.
     fn week_call(&mut self) -> Result<ast::Expr> {
         let arg = self.expr()?;
         let mode = if self.eat(&Token::Comma) {
@@ -4680,6 +4689,29 @@ impl Parser {
         };
         self.expect(&Token::RParen, "`)`")?;
 
+        // Mode 1: ISO week (`%V`), but 0 in a previous-year partial week and 53
+        // in a next-year partial week (see the doc comment).
+        if mode == 1 {
+            let iso_year_below = ast::Expr::binary(
+                strftime_int("%G", arg.clone()),
+                ast::Operator::Less,
+                strftime_int("%Y", arg.clone()),
+            );
+            let iso_year_above = ast::Expr::binary(
+                strftime_int("%G", arg.clone()),
+                ast::Operator::Greater,
+                strftime_int("%Y", arg.clone()),
+            );
+            return Ok(ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![
+                    (Box::new(iso_year_below), numeric_expr("0")),
+                    (Box::new(iso_year_above), numeric_expr("53")),
+                ],
+                else_expr: Some(Box::new(strftime_int("%V", arg))),
+            });
+        }
+
         let fmt = match mode {
             0 => "%U",
             3 => "%V",
@@ -4687,33 +4719,11 @@ impl Parser {
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "WEEK() mode {other} is not supported yet \
-                     (only modes 0, 3, and 5 map to an engine week format)"
+                     (only modes 0, 1, 3, and 5 map to an engine week number)"
                 )))
             }
         };
-
-        let strftime = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("strftime"),
-            distinctness: None,
-            args: vec![
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote(fmt)))),
-                Box::new(arg),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        Ok(ast::Expr::Cast {
-            expr: Box::new(strftime),
-            type_name: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-                array_dimensions: 0,
-            }),
-        })
+        Ok(strftime_int(fmt, arg))
     }
 
     /// Parses `DATE_ADD(x, INTERVAL n unit)` (or `DATE_SUB`, when `subtract` is
@@ -5810,6 +5820,22 @@ fn call_fn(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             filter_clause: None,
             over_clause: None,
         },
+    }
+}
+
+/// Builds `CAST(strftime(fmt, arg) AS INTEGER)` — a single `strftime` field as
+/// an integer (which also strips any zero padding). Used by the `WEEK` lowering.
+fn strftime_int(fmt: &str, arg: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(call_fn(
+            "strftime",
+            vec![ast::Expr::Literal(ast::Literal::String(requote(fmt))), arg],
+        )),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 
@@ -9060,13 +9086,49 @@ mod tests {
                 "wrong format code for `{sql}`"
             );
         }
-        // Modes with no exact engine equivalent are rejected.
-        for mode in [1, 2, 4, 6, 7] {
+        // Modes with no clean engine equivalent are rejected.
+        for mode in [2, 4, 6, 7] {
             assert!(
                 parse_expr(&format!("WEEK(d, {mode})")).is_err(),
                 "WEEK mode {mode} should be unsupported"
             );
         }
+    }
+
+    #[test]
+    fn week_mode_1_lowers_to_iso_week_with_boundary_case() {
+        // WEEK(d, 1) -> CASE WHEN %G < %Y THEN 0 WHEN %G > %Y THEN 53 ELSE %V END.
+        let ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } = parse_expr("WEEK(d, 1)").unwrap()
+        else {
+            panic!("expected WEEK(d, 1) to lower to a CASE");
+        };
+        assert!(base.is_none());
+        assert_eq!(when_then_pairs.len(), 2);
+        // First guard compares ISO year below the calendar year, yielding 0.
+        assert!(matches!(
+            when_then_pairs[0].0.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::Less, _)
+        ));
+        assert!(matches!(&*when_then_pairs[0].1, ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0"));
+        assert!(matches!(
+            when_then_pairs[1].0.as_ref(),
+            ast::Expr::Binary(_, ast::Operator::Greater, _)
+        ));
+        assert!(matches!(&*when_then_pairs[1].1, ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "53"));
+        // The else branch is the ISO week, CAST(strftime('%V', d) AS INTEGER).
+        let else_branch = else_expr.unwrap();
+        let ast::Expr::Cast { expr, .. } = else_branch.as_ref() else {
+            panic!("expected a CAST in the else branch");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+            panic!("expected strftime in the else branch");
+        };
+        assert_eq!(name.as_str(), "strftime");
+        assert!(matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%V'"));
     }
 
     #[test]
