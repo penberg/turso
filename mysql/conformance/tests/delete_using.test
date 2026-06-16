@@ -1,0 +1,81 @@
+# Multi-table DELETE, the USING spelling.
+#
+# MySQL writes a multi-table delete two equivalent ways: `DELETE t1 FROM <refs>
+# [WHERE]` (target before FROM) and `DELETE FROM t1 USING <refs> [WHERE]` (target
+# after FROM). The front-end already lowered the first; the USING form was
+# rejected. Both delete the named target rows chosen by joining <refs>, lowering
+# to `DELETE FROM t1 WHERE rowid IN (SELECT t1.rowid FROM <refs> [WHERE])`.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE IF NOT EXISTS du_posts (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE IF NOT EXISTS du_meta (mid INT PRIMARY KEY, pid INT, w INT)
+
+statement ok
+INSERT INTO du_meta VALUES (1, 1, 7), (2, 3, 9)
+
+# Deletes the join-matched target rows (du_meta references posts 1 and 3).
+statement ok
+INSERT INTO du_posts VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+DELETE FROM du_posts USING du_posts JOIN du_meta ON du_posts.id = du_meta.pid
+
+query
+SELECT id FROM du_posts ORDER BY id
+----
+2
+4
+
+# INNER JOIN keyword, a source alias on the other table, and a WHERE on the
+# source: only the du_meta row with w > 8 (pid = 3) drives a delete.
+statement ok
+DELETE FROM du_posts
+
+statement ok
+INSERT INTO du_posts VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+DELETE FROM du_posts USING du_posts INNER JOIN du_meta m ON du_posts.id = m.pid WHERE m.w > 8
+
+query
+SELECT id FROM du_posts ORDER BY id
+----
+1
+2
+4
+
+# The comma form of the sources after USING.
+statement ok
+DELETE FROM du_posts
+
+statement ok
+INSERT INTO du_posts VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+DELETE FROM du_posts USING du_posts, du_meta WHERE du_posts.id = du_meta.pid
+
+query
+SELECT id FROM du_posts ORDER BY id
+----
+2
+4
+
+# The target can be the other joined table: delete du_meta rows whose post has
+# v > 15 (post 3, v = 30 -> du_meta row mid = 2).
+statement ok
+DELETE FROM du_posts
+
+statement ok
+INSERT INTO du_posts VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+statement ok
+DELETE FROM du_meta USING du_posts JOIN du_meta ON du_posts.id = du_meta.pid WHERE du_posts.v > 15
+
+query
+SELECT mid FROM du_meta ORDER BY mid
+----
+1

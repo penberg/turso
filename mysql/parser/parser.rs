@@ -3220,16 +3220,29 @@ impl Parser {
         self.expect_keyword("FROM")?;
 
         let tbl_name = self.qualified_name()?;
-        if self.is(&Token::Comma) {
-            // `DELETE FROM t1, t2 USING ...` — the other multi-table spelling.
-            return Err(ParseError::Unsupported(
-                "multi-table DELETE is not supported yet".to_string(),
-            ));
-        }
-        if self.is_keyword("USING") {
-            return Err(ParseError::Unsupported(
-                "DELETE ... USING is not supported yet".to_string(),
-            ));
+        // The `USING` spelling of a multi-table delete: `DELETE FROM t1[, t2]
+        // USING <refs> [WHERE]`, with the target list after `FROM`. It is
+        // equivalent to the `DELETE <targets> FROM <refs>` form, so collect the
+        // targets, take the `USING` clause as the joined sources, and share the
+        // same lowering.
+        if self.is(&Token::Comma) || self.is_keyword("USING") {
+            let mut targets = vec![tbl_name];
+            while self.eat(&Token::Comma) {
+                targets.push(self.qualified_name()?);
+            }
+            self.expect_keyword("USING")?;
+            let from = self.from_clause()?;
+            let where_clause = if self.eat_keyword("WHERE") {
+                Some(Box::new(self.expr()?))
+            } else {
+                None
+            };
+            if self.is_keyword("ORDER") || self.is_keyword("LIMIT") {
+                return Err(ParseError::Unsupported(
+                    "ORDER BY / LIMIT on DELETE is not supported yet".to_string(),
+                ));
+            }
+            return self.finish_multi_table_delete(targets, from, where_clause);
         }
 
         let where_clause = if self.eat_keyword("WHERE") {
@@ -3295,7 +3308,22 @@ impl Parser {
                 "ORDER BY / LIMIT on DELETE is not supported yet".to_string(),
             ));
         }
+        self.finish_multi_table_delete(targets, from, where_clause)
+    }
 
+    /// Builds the engine `DELETE` for a multi-table delete from its parsed
+    /// `targets`, joined `from` clause, and `where_clause` — shared by the two
+    /// MySQL spellings, `DELETE <targets> FROM <refs>` and `DELETE FROM <targets>
+    /// USING <refs>`. It lowers to `DELETE FROM <table> WHERE rowid IN (SELECT
+    /// t1.rowid FROM <refs> [WHERE] [UNION SELECT t2.rowid ...])`; every target
+    /// must resolve to a table in `from`, and (for this single-`DELETE`-with-
+    /// `UNION` lowering) all targets must be the same table.
+    fn finish_multi_table_delete(
+        &mut self,
+        targets: Vec<ast::QualifiedName>,
+        from: ast::FromClause,
+        where_clause: Option<Box<ast::Expr>>,
+    ) -> Result<ast::Stmt> {
         // Resolve every target alias/name to its underlying table; they must all
         // be the same table for the single-DELETE-with-UNION lowering to match
         // MySQL's multi-table delete.
@@ -17581,8 +17609,10 @@ mod tests {
     #[test]
     fn delete_unsupported_variants() {
         for sql in [
-            "DELETE t1, t2 FROM t1, t2 WHERE t1.id = t2.id", // multiple target tables
-            "DELETE FROM a, b",
+            // Multiple *different* target tables, in either spelling.
+            "DELETE t1, t2 FROM t1, t2 WHERE t1.id = t2.id",
+            "DELETE FROM t1, t2 USING t1, t2 WHERE t1.id = t2.id",
+            // A target not present in the join refs.
             "DELETE FROM t USING u",
             // An offset on the LIMIT stays rejected (MySQL allows only a count).
             "DELETE FROM t LIMIT 1, 2",
@@ -17592,6 +17622,13 @@ mod tests {
                 "expected `{sql}` to be unsupported"
             );
         }
+
+        // The USING spelling of a single-target multi-table delete parses (it is
+        // equivalent to the `DELETE <target> FROM <refs>` form).
+        assert!(matches!(
+            parse("DELETE FROM t USING t JOIN u ON t.id = u.id"),
+            Ok(ast::Stmt::Delete { .. })
+        ));
 
         // A count-only LIMIT is honored.
         let ast::Stmt::Delete { limit, .. } = parse("DELETE FROM t WHERE a = 1 LIMIT 5").unwrap()
