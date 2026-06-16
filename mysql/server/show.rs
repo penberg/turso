@@ -1037,7 +1037,9 @@ const TABLE_STATUS_COLUMNS: &[&str] = &[
 /// The parsed form of a `SHOW TABLE STATUS [{FROM|IN} db] [LIKE 'pattern']`
 /// statement: the optional `LIKE` pattern (`None` lists every table).
 struct ShowTableStatus {
-    like: Option<String>,
+    /// A filter on the table name: `(is_like, value)`. From `LIKE 'pat'`
+    /// (is_like) or `WHERE Name {= | LIKE} value`.
+    name_filter: Option<(bool, String)>,
 }
 
 /// Parses `SHOW TABLE STATUS [{FROM|IN} db] [LIKE 'pattern']`, returning `None`
@@ -1068,16 +1070,29 @@ fn parse_show_table_status(sql: &str) -> Option<ShowTableStatus> {
         k += 1;
     }
 
-    // Optional `LIKE 'pattern'`.
-    let like = if toks.get(k).is_some_and(|t| kw(t, "LIKE")) {
+    // An optional table-name filter: `LIKE 'pattern'`, or `WHERE Name {= | LIKE}
+    // value` (WordPress's `wpdb` issues `SHOW TABLE STATUS WHERE Name = 'tbl'`).
+    let name_filter = if toks.get(k).is_some_and(|t| kw(t, "LIKE")) {
         k += 1;
-        let pat = toks.get(k)?;
-        let unquoted = pat
-            .strip_prefix('\'')
-            .and_then(|p| p.strip_suffix('\''))
-            .or_else(|| pat.strip_prefix('"').and_then(|p| p.strip_suffix('"')))?;
+        let value = unquote_token(toks.get(k)?)?;
         k += 1;
-        Some(unquoted.to_string())
+        Some((true, value))
+    } else if toks.get(k).is_some_and(|t| kw(t, "WHERE")) {
+        k += 1;
+        // Only a single `Name {= | LIKE} value` predicate is recognized.
+        if !toks.get(k).is_some_and(|t| kw(t, "Name")) {
+            return None;
+        }
+        k += 1;
+        let like = match toks.get(k)?.as_str() {
+            "=" => false,
+            t if kw(t, "LIKE") => true,
+            _ => return None,
+        };
+        k += 1;
+        let value = unquote_token(toks.get(k)?)?;
+        k += 1;
+        Some((like, value))
     } else {
         None
     };
@@ -1085,7 +1100,7 @@ fn parse_show_table_status(sql: &str) -> Option<ShowTableStatus> {
     if k != toks.len() {
         return None;
     }
-    Some(ShowTableStatus { like })
+    Some(ShowTableStatus { name_filter })
 }
 
 /// Builds the `SHOW TABLE STATUS` result set from the schema. Most columns the
@@ -1100,8 +1115,16 @@ fn build_table_status(
     let mut query =
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             .to_string();
-    if let Some(pat) = &show.like {
-        query.push_str(&format!(" AND name LIKE '{}'", pat.replace('\'', "''")));
+    if let Some((is_like, value)) = &show.name_filter {
+        let escaped = value.replace('\'', "''");
+        if *is_like {
+            // MySQL's `LIKE` uses backslash as the default escape character (so a
+            // WordPress pattern like `wp\_%` matches a literal underscore); the
+            // engine's `LIKE` has none, so supply `ESCAPE '\'`.
+            query.push_str(&format!(" AND name LIKE '{escaped}' ESCAPE '\\'"));
+        } else {
+            query.push_str(&format!(" AND name = '{escaped}'"));
+        }
     }
     query.push_str(" ORDER BY name");
 
@@ -1364,19 +1387,36 @@ mod tests {
 
     #[test]
     fn parses_show_table_status() {
-        assert!(parse_show_table_status("SHOW TABLE STATUS").unwrap().like.is_none());
+        assert!(parse_show_table_status("SHOW TABLE STATUS")
+            .unwrap()
+            .name_filter
+            .is_none());
+        // `LIKE 'pat'` is a like-filter on the name.
         assert_eq!(
             parse_show_table_status("SHOW TABLE STATUS LIKE 'wp_posts'")
                 .unwrap()
-                .like
-                .as_deref(),
-            Some("wp_posts")
+                .name_filter,
+            Some((true, "wp_posts".to_string()))
+        );
+        // `WHERE Name = 'tbl'` is an exact filter; `WHERE Name LIKE 'pat'` a
+        // like-filter (WordPress's `wpdb` issues the `=` form).
+        assert_eq!(
+            parse_show_table_status("SHOW TABLE STATUS WHERE Name = 'wp_posts'")
+                .unwrap()
+                .name_filter,
+            Some((false, "wp_posts".to_string()))
+        );
+        assert_eq!(
+            parse_show_table_status("SHOW TABLE STATUS WHERE Name LIKE 'wp\\_%'")
+                .unwrap()
+                .name_filter,
+            Some((true, "wp\\_%".to_string()))
         );
         // The `{FROM|IN} db` qualifier is accepted and ignored.
         assert!(parse_show_table_status("SHOW TABLE STATUS FROM mydb LIKE 't'").is_some());
-        // Unrelated statements and the WHERE form fall through.
+        // Unrelated statements and a non-`Name` WHERE column fall through.
         assert!(parse_show_table_status("SHOW TABLES").is_none());
-        assert!(parse_show_table_status("SHOW TABLE STATUS WHERE Name = 't'").is_none());
+        assert!(parse_show_table_status("SHOW TABLE STATUS WHERE Engine = 'InnoDB'").is_none());
         // The 18-column MySQL shape is reported in order.
         assert_eq!(TABLE_STATUS_COLUMNS.len(), 18);
         assert_eq!(TABLE_STATUS_COLUMNS[0], "Name");

@@ -1,8 +1,9 @@
-# SHOW TABLE STATUS [LIKE 'pattern'] conformance.
+# SHOW TABLE STATUS [LIKE 'pattern' | WHERE Name {= | LIKE} value] conformance.
 #
-# WordPress reads SHOW TABLE STATUS in two places: maybe_convert_table_to_utf8mb4
+# WordPress reads SHOW TABLE STATUS in several places: maybe_convert_table_to_utf8mb4
 # (`SHOW TABLE STATUS LIKE '<table>'`, an existence check plus the table's
-# Collation) and Site Health (sums Data_length + Index_length). The front-end
+# Collation), wpdb's table routing (`SHOW TABLE STATUS WHERE Name = '<table>'`),
+# and Site Health (sums Data_length + Index_length). The front-end
 # answers it server-side, one row per table, with MySQL's 18-column shape. Most
 # columns the engine does not track (sizes, timestamps, auto-increment) are 0 or
 # NULL; Engine/Row_format/Collation are fixed front-end values and Rows is the
@@ -29,4 +30,23 @@ tstat_demo	InnoDB	10	Dynamic	2	0	0	0	0	0	NULL	NULL	NULL	NULL	utf8mb4_general_ci	
 # row as "table does not exist").
 query
 SHOW TABLE STATUS LIKE 'no_such_tstat_table'
+----
+
+# The WHERE Name = '<table>' filter that WordPress's wpdb issues, returning the
+# same single row as the LIKE form.
+query
+SHOW TABLE STATUS WHERE Name = 'tstat_demo'
+----
+tstat_demo	InnoDB	10	Dynamic	2	0	0	0	0	0	NULL	NULL	NULL	NULL	utf8mb4_general_ci	NULL		
+
+# WHERE Name LIKE honors MySQL's backslash escape, so '\_' matches a literal
+# underscore (not any character).
+query
+SHOW TABLE STATUS WHERE Name LIKE 'tstat\_demo'
+----
+tstat_demo	InnoDB	10	Dynamic	2	0	0	0	0	0	NULL	NULL	NULL	NULL	utf8mb4_general_ci	NULL		
+
+# A non-matching WHERE Name filter yields an empty result.
+query
+SHOW TABLE STATUS WHERE Name = 'no_such_tstat_table'
 ----
