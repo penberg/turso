@@ -310,6 +310,7 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
             default,
             pk,
             key: "",
+            auto_increment: false,
         });
         Ok(())
     })?;
@@ -340,6 +341,20 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
     for col in &mut info {
         if let Some(k) = lead_keys.get(&col.name.to_ascii_lowercase()) {
             col.key = k;
+        }
+    }
+
+    // A MySQL `AUTO_INCREMENT` column lowers to the engine's rowid `AUTOINCREMENT`
+    // on the single-column primary key, so `SHOW COLUMNS` reports `auto_increment`
+    // in its `Extra` (which WordPress's schema diffing reads). The keyword appears
+    // in the stored CREATE only when the column was declared `AUTO_INCREMENT`
+    // (a plain `INTEGER PRIMARY KEY` rowid omits it), so flag the primary-key
+    // column when the table's schema carries it.
+    if table_is_autoincrement(conn, &show.table) {
+        for col in &mut info {
+            if col.pk {
+                col.auto_increment = true;
+            }
         }
     }
 
@@ -489,6 +504,30 @@ fn lead_column_keys(conn: &Arc<Connection>, table: &str) -> HashMap<String, &'st
         }
     }
     keys
+}
+
+/// Whether the table's stored `CREATE TABLE` declares an `AUTOINCREMENT` primary
+/// key — the form a MySQL `AUTO_INCREMENT` column lowers to. The engine writes the
+/// keyword inline (`id INTEGER PRIMARY KEY AUTOINCREMENT`) or on a table-level key
+/// (`PRIMARY KEY (id AUTOINCREMENT)`); either way it is present only when the
+/// column was declared `AUTO_INCREMENT`, never for a plain rowid primary key.
+/// Best-effort: any failure to read the schema yields `false`.
+fn table_is_autoincrement(conn: &Arc<Connection>, table: &str) -> bool {
+    let query = format!(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '{}'",
+        table.replace('\'', "''")
+    );
+    let Ok(Some(mut stmt)) = conn.query(&query) else {
+        return false;
+    };
+    let mut found = false;
+    let _ = stmt.run_with_row_callback(|row| {
+        if let Some(sql) = value_to_string(row.get_value(0)) {
+            found = sql.to_ascii_uppercase().contains("AUTOINCREMENT");
+        }
+        Ok(())
+    });
+    found
 }
 
 fn declared_column_types(conn: &Arc<Connection>, table: &str) -> HashMap<String, String> {
@@ -978,6 +1017,9 @@ struct ColumnInfo {
     /// leads a unique index, `MUL` when it leads a non-unique one, else empty.
     /// A primary-key column reports `PRI` regardless (see [`Self::into_row`]).
     key: &'static str,
+    /// Whether the column auto-increments, reported as `auto_increment` in the
+    /// MySQL `Extra` column.
+    auto_increment: bool,
 }
 
 impl ColumnInfo {
@@ -1001,6 +1043,12 @@ impl ColumnInfo {
         // MySQL reports a string default as its bare value (`hi`), where the
         // engine stores the SQL literal (`'hi'`); strip the quotes.
         let default = normalize_default(self.default);
+        // `Extra` carries `auto_increment` for an auto-incrementing column.
+        let extra = if self.auto_increment {
+            "auto_increment"
+        } else {
+            ""
+        };
         let field = Some(self.name);
         if full {
             vec![
@@ -1010,7 +1058,7 @@ impl ColumnInfo {
                 Some(null.to_string()),
                 Some(key.to_string()),
                 default,
-                Some(String::new()), // Extra
+                Some(extra.to_string()),
                 Some(PRIVILEGES.to_string()),
                 Some(String::new()), // Comment
             ]
@@ -1021,7 +1069,7 @@ impl ColumnInfo {
                 Some(null.to_string()),
                 Some(key.to_string()),
                 default,
-                Some(String::new()), // Extra
+                Some(extra.to_string()),
             ]
         }
     }

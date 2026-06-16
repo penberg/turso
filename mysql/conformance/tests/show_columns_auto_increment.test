@@ -1,0 +1,39 @@
+# SHOW COLUMNS reports auto_increment in the Extra column.
+#
+# A MySQL AUTO_INCREMENT column lowers to the engine's rowid AUTOINCREMENT primary
+# key; SHOW COLUMNS reports `auto_increment` in its Extra column (which WordPress's
+# schema diffing reads), for both the inline and table-level PRIMARY KEY forms. A
+# plain rowid primary key (no AUTO_INCREMENT) has an empty Extra.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its own
+# table names. Plain INT (no UNSIGNED) avoids the rowid-PK type-display divergence.
+
+statement ok
+CREATE TABLE sca_inline (id INT AUTO_INCREMENT PRIMARY KEY, n INT)
+
+# The inline AUTO_INCREMENT PRIMARY KEY column reports auto_increment in Extra.
+query
+SHOW COLUMNS FROM sca_inline
+----
+id	int	NO	PRI	NULL	auto_increment
+n	int	YES		NULL	
+
+statement ok
+CREATE TABLE sca_table (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id))
+
+# The table-level PRIMARY KEY form reports it the same way.
+query
+SHOW COLUMNS FROM sca_table
+----
+id	int	NO	PRI	NULL	auto_increment
+n	int	YES		NULL	
+
+statement ok
+CREATE TABLE sca_plain (id INT PRIMARY KEY, n INT)
+
+# A plain primary key (no AUTO_INCREMENT) has an empty Extra.
+query
+SHOW COLUMNS FROM sca_plain
+----
+id	int	NO	PRI	NULL	
+n	int	YES		NULL	
