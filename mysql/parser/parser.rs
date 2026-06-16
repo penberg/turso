@@ -1730,13 +1730,8 @@ impl Parser {
     /// `ORDER BY` / `LIMIT` or any set-operation compound, which belong to the
     /// surrounding compound select.
     fn parse_one_select(&mut self) -> Result<ast::OneSelect> {
-        if self.is_keyword("DISTINCTROW") {
-            // MySQL synonym for DISTINCT; not modeled.
-            return Err(ParseError::Unsupported(
-                "SELECT DISTINCTROW is not supported yet".to_string(),
-            ));
-        }
-        let distinctness = if self.eat_keyword("DISTINCT") {
+        // `DISTINCTROW` is MySQL's synonym for `DISTINCT`; treat it identically.
+        let distinctness = if self.eat_keyword("DISTINCT") || self.eat_keyword("DISTINCTROW") {
             Some(ast::Distinctness::Distinct)
         } else {
             self.eat_keyword("ALL"); // the default quantifier; accepted and ignored
@@ -7744,7 +7739,6 @@ mod tests {
     #[test]
     fn select_unsupported_variants() {
         for sql in [
-            "SELECT DISTINCTROW a FROM t",
             "SELECT * FROM a FULL JOIN b ON a.id = b.id",
             "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
             "SELECT * FROM a LEFT JOIN b",
@@ -7755,6 +7749,19 @@ mod tests {
                 matches!(parse(sql).unwrap_err(), ParseError::Unsupported(_)),
                 "expected `{sql}` to be unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn distinctrow_is_a_distinct_synonym() {
+        for sql in ["SELECT DISTINCTROW a FROM t", "SELECT DISTINCT a FROM t"] {
+            let ast::Stmt::Select(select) = parse(sql).unwrap() else {
+                panic!("expected a SELECT for `{sql}`");
+            };
+            let ast::OneSelect::Select { distinctness, .. } = select.body.select else {
+                panic!("expected OneSelect::Select");
+            };
+            assert_eq!(distinctness, Some(ast::Distinctness::Distinct), "{sql}");
         }
     }
 

@@ -1,0 +1,35 @@
+# SELECT DISTINCTROW -- MySQL's synonym for SELECT DISTINCT.
+#
+# DISTINCTROW removes duplicate rows from the result, exactly like DISTINCT. The
+# front-end previously rejected it ("SELECT DISTINCTROW is not supported yet");
+# it now treats it identically to DISTINCT.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table name.
+
+statement ok
+CREATE TABLE IF NOT EXISTS dr_demo (id INT PRIMARY KEY, cat VARCHAR(10), n INT)
+
+statement ok
+INSERT INTO dr_demo (id, cat, n) VALUES (1, 'a', 5), (2, 'a', 5), (3, 'b', 9), (4, 'b', 7)
+
+# DISTINCTROW on a single column dedupes its values.
+query
+SELECT DISTINCTROW cat FROM dr_demo ORDER BY cat
+----
+a
+b
+
+# DISTINCTROW over multiple columns dedupes whole rows (a,5 appears twice).
+query
+SELECT DISTINCTROW cat, n FROM dr_demo ORDER BY cat, n
+----
+a	5
+b	7
+b	9
+
+# It composes with WHERE, GROUP BY-free aggregation excluded -- just a filter.
+query
+SELECT DISTINCTROW cat FROM dr_demo WHERE n > 6 ORDER BY cat
+----
+b
