@@ -43,3 +43,14 @@ SELECT COLUMN_NAME, SEQ_IN_INDEX FROM information_schema.STATISTICS WHERE TABLE_
 x	1
 y	2
 z	3
+
+statement ok
+CREATE TABLE isstat_pk (object_id INT, term_taxonomy_id INT, extra INT, PRIMARY KEY (object_id, term_taxonomy_id))
+
+# A composite PRIMARY KEY (as in WordPress's wp_term_relationships) numbers its
+# columns 1, 2 in declaration order, not 1, 1.
+query
+SELECT COLUMN_NAME, SEQ_IN_INDEX FROM information_schema.STATISTICS WHERE TABLE_NAME = 'isstat_pk' AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX
+----
+object_id	1
+term_taxonomy_id	2

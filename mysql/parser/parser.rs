@@ -9221,7 +9221,7 @@ fn information_schema_statistics_select() -> ast::Select {
          m.name AS TABLE_NAME, \
          0 AS NON_UNIQUE, \
          'PRIMARY' AS INDEX_NAME, \
-         p.pk AS SEQ_IN_INDEX, \
+         ROW_NUMBER() OVER (PARTITION BY m.name ORDER BY p.cid) AS SEQ_IN_INDEX, \
          p.name AS COLUMN_NAME, \
          'A' AS COLLATION, \
          0 AS CARDINALITY, \
