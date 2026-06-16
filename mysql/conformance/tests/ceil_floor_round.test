@@ -1,0 +1,65 @@
+# CEIL / CEILING / FLOOR / ROUND return integers, like MySQL.
+#
+# These produce a whole number, which MySQL types as an integer (printing `6`).
+# The engine's ceil/floor/round return a real, so the front-end wraps them in
+# CAST(... AS INTEGER) to match — otherwise they print `6.0`. The two-argument
+# ROUND(x, d) with d > 0 keeps d decimal places and stays a real; ROUND(x, 0) is
+# an integer.
+#
+# Verified against MySQL 8.4. Uses a file-unique table name.
+
+# Rounding a real up / down / to nearest gives a bare integer.
+query
+SELECT CEIL(5.7), FLOOR(5.7), CEILING(5.7), ROUND(5.5)
+----
+6	5	6	6
+
+# Negative values, and round-half-away-from-zero.
+query
+SELECT CEIL(-2.3), FLOOR(-2.3), ROUND(-2.5), ROUND(2.5)
+----
+-2	-3	-3	3
+
+# The result of integer division (a real) rounds to an integer.
+query
+SELECT CEIL(10 / 3), FLOOR(10 / 3)
+----
+4	3
+
+# An integer argument is unchanged.
+query
+SELECT CEIL(5), FLOOR(5), ROUND(5)
+----
+5	5	5
+
+# The integer result composes in arithmetic (no stray `.0`).
+query
+SELECT CEIL(2.5) + 1, FLOOR(3.7) * 2
+----
+4	6
+
+# ROUND(x, d): d > 0 keeps decimals, d = 0 is an integer.
+query
+SELECT ROUND(5.678, 2), ROUND(5.678, 0)
+----
+5.68	6
+
+# NULL propagates.
+query
+SELECT CEIL(NULL), FLOOR(NULL), ROUND(NULL)
+----
+NULL	NULL	NULL
+
+# Over a column.
+statement ok
+CREATE TABLE cfr (id INT PRIMARY KEY, v DECIMAL(10,3))
+
+statement ok
+INSERT INTO cfr VALUES (1, 4.2), (2, 7.8), (3, -1.5)
+
+query
+SELECT id, CEIL(v), FLOOR(v), ROUND(v) FROM cfr ORDER BY id
+----
+1	5	4	4
+2	8	7	8
+3	-1	-2	-2

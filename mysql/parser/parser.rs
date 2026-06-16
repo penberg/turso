@@ -3966,6 +3966,42 @@ impl Parser {
             return Ok(arg);
         }
 
+        // `CEIL`/`CEILING`/`FLOOR` and the single-argument `ROUND(x)` produce a
+        // whole number, which MySQL types as an integer — but the engine's
+        // `ceil`/`floor`/`round` return a real, printing `6.0` where MySQL prints
+        // `6`. Wrap the result in `CAST(... AS INTEGER)` to match. (A magnitude
+        // above 2^63 saturates the cast — a documented edge; MySQL keeps such a
+        // value as a double.) The two-argument `ROUND(x, d)` keeps `d` decimal
+        // places and stays a real.
+        if upper == "CEIL" || upper == "CEILING" {
+            let arg = self.expr()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(cast_to_integer(call_fn("ceil", vec![arg])));
+        }
+        if upper == "FLOOR" {
+            let arg = self.expr()?;
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(cast_to_integer(call_fn("floor", vec![arg])));
+        }
+        if upper == "ROUND" {
+            let arg = self.expr()?;
+            if self.eat(&Token::Comma) {
+                let digits = self.expr()?;
+                self.expect(&Token::RParen, "`)`")?;
+                // `ROUND(x, 0)` is an integer like `ROUND(x)`; `ROUND(x, d)` with
+                // `d > 0` keeps `d` decimals and stays a real. (A negative `d` is
+                // an integer in MySQL but the engine does not round to tens, a
+                // separate pre-existing divergence, so it is left as-is.)
+                let round = call_fn("round", vec![arg, digits.clone()]);
+                if matches!(&digits, ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0") {
+                    return Ok(cast_to_integer(round));
+                }
+                return Ok(round);
+            }
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(cast_to_integer(call_fn("round", vec![arg])));
+        }
+
         // `HEX(x)` is overloaded: the uppercase hex of a number, or the hex of a
         // string's bytes (see `hex_call`).
         if upper == "HEX" {
@@ -7456,6 +7492,20 @@ fn crypto_hex_digest(engine_fn: &str, arg: ast::Expr) -> ast::Expr {
             Box::new(ast::Expr::Literal(ast::Literal::Null)),
         )],
         else_expr: Some(Box::new(digest)),
+    }
+}
+
+/// Wraps an expression in `CAST(expr AS INTEGER)` — used to give the
+/// whole-number math functions (`CEIL`/`FLOOR`/`ROUND`) MySQL's integer result
+/// type rather than the engine's real.
+fn cast_to_integer(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 
@@ -13480,15 +13530,7 @@ mod tests {
     fn math_functions_parse_and_rename_synonyms() {
         // Functions that keep their name (the engine resolves them
         // case-insensitively).
-        for input in [
-            "ROUND(x, 2)",
-            "FLOOR(x)",
-            "CEIL(x)",
-            "POW(x, 2)",
-            "SQRT(x)",
-            "EXP(x)",
-            "LN(x)",
-        ] {
+        for input in ["ROUND(x, 2)", "POW(x, 2)", "SQRT(x)", "EXP(x)", "LN(x)"] {
             let ast::Expr::FunctionCall { name, .. } = parse_expr(input).unwrap() else {
                 panic!("expected `{input}` to parse as a function call");
             };
@@ -13501,16 +13543,44 @@ mod tests {
             );
         }
 
-        // `CEILING`/`POWER` are MySQL synonyms renamed to the engine's `ceil`/`pow`.
-        let ast::Expr::FunctionCall { name, .. } = parse_expr("CEILING(x)").unwrap() else {
-            panic!("expected a function call");
-        };
-        assert_eq!(name.as_str(), "ceil");
+        // `POWER` is a MySQL synonym renamed to the engine's `pow`.
         let ast::Expr::FunctionCall { name, args, .. } = parse_expr("POWER(x, 3)").unwrap() else {
             panic!("expected a function call");
         };
         assert_eq!(name.as_str(), "pow");
         assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn ceil_floor_round_return_integer() {
+        // CEIL/CEILING/FLOOR and 1-arg ROUND wrap the engine call in CAST(...
+        // AS INTEGER) so they type as an integer like MySQL.
+        for (input, engine) in [
+            ("CEIL(x)", "ceil"),
+            ("CEILING(x)", "ceil"),
+            ("FLOOR(x)", "floor"),
+            ("ROUND(x)", "round"),
+        ] {
+            let ast::Expr::Cast { expr, type_name } = parse_expr(input).unwrap() else {
+                panic!("expected `{input}` to lower to a CAST");
+            };
+            assert_eq!(type_name.unwrap().name, "INTEGER");
+            let ast::Expr::FunctionCall { name, .. } = expr.as_ref() else {
+                panic!("expected a function call inside the cast for `{input}`");
+            };
+            assert_eq!(name.as_str(), engine, "for `{input}`");
+        }
+        // ROUND(x, 2) keeps decimals and stays a real (a bare call); ROUND(x, 0)
+        // is an integer, so it casts.
+        let ast::Expr::FunctionCall { name, args, .. } = parse_expr("ROUND(x, 2)").unwrap() else {
+            panic!("expected ROUND(x, 2) to stay a function call");
+        };
+        assert_eq!(name.as_str(), "round");
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            parse_expr("ROUND(x, 0)").unwrap(),
+            ast::Expr::Cast { .. }
+        ));
     }
 
     #[test]
