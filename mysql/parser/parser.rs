@@ -6297,20 +6297,21 @@ impl Parser {
         // `{:+}` renders an explicit sign, e.g. `+5 days` / `-1 days`.
         let modifier = format!("{amount:+} {engine_unit}");
 
-        Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("datetime"),
-            distinctness: None,
-            args: vec![
-                Box::new(target),
-                Box::new(ast::Expr::Literal(ast::Literal::String(requote(&modifier)))),
-            ],
-            order_by: Vec::new(),
-            within_group: Vec::new(),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        })
+        // A month or year step can overflow a shorter target month — the engine
+        // rolls `Jan 31 + 1 month` into March, but MySQL clamps to the last day
+        // of the month (`Feb 28`). Wrap those with the clamp; day/time steps never
+        // overflow and pass through as a plain `datetime(target, '<modifier>')`.
+        if engine_unit == "months" || engine_unit == "years" {
+            Ok(clamp_month_overflow(target, &modifier))
+        } else {
+            Ok(call_fn(
+                "datetime",
+                vec![
+                    target,
+                    ast::Expr::Literal(ast::Literal::String(requote(&modifier))),
+                ],
+            ))
+        }
     }
 
     /// Parses `DATE_FORMAT(x, 'fmt')` / `TIME_FORMAT(x, 'fmt')` (the name in
@@ -8648,6 +8649,40 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
         acc = ast::Expr::binary(acc, ast::Operator::Concat, next);
     }
     Ok(acc)
+}
+
+/// Wraps a `datetime(target, '<modifier>')` month/year step with MySQL's
+/// end-of-month clamping. The engine rolls an overflowing day into the next
+/// month (`Jan 31 + 1 month` → March 3), whereas MySQL clamps to the month's last
+/// day (`Feb 28`). When the rolled result's day-of-month is smaller than the
+/// input's — i.e. it overflowed a shorter month — subtract that many days to land
+/// on the previous month's last day, which preserves the time of day. A NULL
+/// target makes the comparison NULL, so the `CASE` falls to the unclamped (also
+/// NULL) result, matching MySQL.
+fn clamp_month_overflow(target: ast::Expr, modifier: &str) -> ast::Expr {
+    let string_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+    let rolled = || call_fn("datetime", vec![target.clone(), string_lit(modifier)]);
+    let overflowed = ast::Expr::binary(
+        cast_strftime_int("%d", rolled()),
+        ast::Operator::Less,
+        cast_strftime_int("%d", target.clone()),
+    );
+    // `'-' || strftime('%d', rolled) || ' days'`, the days to step back.
+    let back = ast::Expr::binary(
+        ast::Expr::binary(
+            string_lit("-"),
+            ast::Operator::Concat,
+            strftime_text("%d", rolled()),
+        ),
+        ast::Operator::Concat,
+        string_lit(" days"),
+    );
+    let clamped = call_fn("datetime", vec![rolled(), back]);
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(overflowed), Box::new(clamped))],
+        else_expr: Some(Box::new(rolled())),
+    }
 }
 
 /// Builds the two-digit year (`%y`) — `substr(strftime('%Y', arg), 3, 2)`, the
@@ -11521,11 +11556,12 @@ mod tests {
             parse_expr("DATE_FORMAT(d, '%D')").unwrap(),
             ast::Expr::Binary(_, ast::Operator::Concat, _)
         ));
-        // Specifiers still without a lowering are rejected (12-hour time `%r`,
-        // microseconds `%f`, week-year `%X`).
+        // Specifiers still without a lowering are rejected (microseconds `%f`,
+        // and the week-of-year modes `%u`/`%V`/`%X`/`%x`).
         for fmt in [
-            "DATE_FORMAT(d, '%r')",
             "DATE_FORMAT(d, '%f')",
+            "DATE_FORMAT(d, '%u')",
+            "DATE_FORMAT(d, '%V')",
             "DATE_FORMAT(d, '%X')",
         ] {
             assert!(matches!(
@@ -11552,12 +11588,13 @@ mod tests {
 
     #[test]
     fn date_add_sub_lower_to_datetime_modifier() {
-        // Each lowers to datetime(target, '<signed-n> <unit>').
+        // Each day/time interval lowers to datetime(target, '<signed-n> <unit>').
+        // (MONTH/YEAR steps add a clamping CASE — see
+        // `month_and_year_intervals_clamp_to_month_end`.)
         let cases = [
             ("DATE_ADD(d, INTERVAL 5 DAY)", "'+5 days'"),
             ("DATE_SUB(d, INTERVAL 1 DAY)", "'-1 days'"),
             ("DATE_ADD(d, INTERVAL 1 WEEK)", "'+7 days'"),
-            ("DATE_ADD(d, INTERVAL 2 MONTH)", "'+2 months'"),
             ("DATE_SUB(d, INTERVAL 3 HOUR)", "'-3 hours'"),
             // A quoted numeric string is coerced like MySQL does (WordPress
             // emits `INTERVAL '30' SECOND`).
@@ -11582,6 +11619,31 @@ mod tests {
         // A non-literal interval value, or a non-numeric string, is rejected.
         assert!(parse_expr("DATE_ADD(d, INTERVAL x DAY)").is_err());
         assert!(parse_expr("DATE_ADD(d, INTERVAL 'abc' DAY)").is_err());
+    }
+
+    #[test]
+    fn month_and_year_intervals_clamp_to_month_end() {
+        // MONTH / QUARTER / YEAR steps can overflow a shorter month, so they wrap
+        // the datetime() call in a CASE that clamps to the month's last day.
+        for sql in [
+            "DATE_ADD(d, INTERVAL 1 MONTH)",
+            "DATE_SUB(d, INTERVAL 1 MONTH)",
+            "DATE_ADD(d, INTERVAL 1 QUARTER)",
+            "DATE_ADD(d, INTERVAL 1 YEAR)",
+            "d + INTERVAL 1 MONTH",
+        ] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::Case { .. }),
+                "expected `{sql}` to clamp via a CASE"
+            );
+        }
+        // Day and time steps never overflow, so they stay a plain datetime() call.
+        for sql in ["DATE_ADD(d, INTERVAL 5 DAY)", "DATE_ADD(d, INTERVAL 3 HOUR)"] {
+            assert!(
+                matches!(parse_expr(sql).unwrap(), ast::Expr::FunctionCall { .. }),
+                "expected `{sql}` to stay a plain datetime() call"
+            );
+        }
     }
 
     #[test]
@@ -14137,7 +14199,7 @@ mod tests {
     #[test]
     fn function_call_not_in_allow_list_is_unsupported() {
         for input in [
-            "SLEEP(1)",
+            "CONV('A', 16, 2)",
             "CRC32('x')",
             "SOUNDEX('x')",
             "totally_made_up(1)",

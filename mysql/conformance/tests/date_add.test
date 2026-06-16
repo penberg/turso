@@ -6,10 +6,12 @@
 # both targets return 'YYYY-MM-DD HH:MM:SS'.
 #
 # Scope: the interval amount may be an integer literal or a quoted numeric
-# string (`INTERVAL '30' SECOND`, which WordPress emits and MySQL coerces). On a
-# bare DATE value MySQL returns a DATE (no time) while the engine keeps the time,
-# and MONTH/YEAR arithmetic that overflows a month end clamps in MySQL but rolls
-# over in the engine — both diverge and are avoided here (see mysql/COMPAT.md).
+# string (`INTERVAL '30' SECOND`, which WordPress emits and MySQL coerces).
+# MONTH/YEAR/QUARTER arithmetic that overflows a shorter month is clamped to that
+# month's last day, as in MySQL (the engine would otherwise roll into the next
+# month). The one remaining divergence, avoided here, is that on a bare DATE
+# value MySQL returns a DATE (no time) while the engine keeps the `00:00:00`
+# time, so the clamp cases below use DATETIME inputs (see mysql/COMPAT.md).
 #
 # Expected to pass against both turso-mysql-server and a real mysqld.
 
@@ -61,3 +63,42 @@ query
 SELECT DATE_SUB(d, INTERVAL '5' DAY) FROM dt_demo
 ----
 2020-01-26 10:20:30
+
+# Month-end clamping (DATETIME inputs, so the result is DATETIME on both): a step
+# that overflows a shorter month lands on that month's last day, keeping the
+# time. Jan 31 + 1 month is Feb 28, not the rolled-over March.
+query
+SELECT DATE_ADD('2026-01-31 10:30:45', INTERVAL 1 MONTH), DATE_ADD('2026-03-31 00:00:00', INTERVAL 1 MONTH)
+----
+2026-02-28 10:30:45	2026-04-30 00:00:00
+
+# DATE_SUB clamps the same way, and a leap day clamps when the target year is not
+# a leap year.
+query
+SELECT DATE_SUB('2026-03-31 12:00:00', INTERVAL 1 MONTH), DATE_ADD('2024-02-29 08:00:00', INTERVAL 1 YEAR)
+----
+2026-02-28 12:00:00	2025-02-28 08:00:00
+
+# QUARTER (three months) and a multi-year month count clamp too.
+query
+SELECT DATE_ADD('2026-01-31 09:00:00', INTERVAL 1 QUARTER), DATE_ADD('2026-01-30 06:00:00', INTERVAL 13 MONTH)
+----
+2026-04-30 09:00:00	2027-02-28 06:00:00
+
+# A step that does not overflow is unchanged (no clamping).
+query
+SELECT DATE_ADD('2026-01-15 10:00:00', INTERVAL 1 MONTH), DATE_ADD('2026-05-31 23:59:59', INTERVAL 1 MONTH)
+----
+2026-02-15 10:00:00	2026-06-30 23:59:59
+
+# The `date + INTERVAL` / `date - INTERVAL` operator forms clamp identically.
+query
+SELECT '2026-01-31 10:00:00' + INTERVAL 1 MONTH, '2026-03-31 10:00:00' - INTERVAL 1 MONTH
+----
+2026-02-28 10:00:00	2026-02-28 10:00:00
+
+# NULL propagates through the clamp.
+query
+SELECT DATE_ADD(NULL, INTERVAL 1 MONTH), DATE_ADD(NULL, INTERVAL 1 YEAR)
+----
+NULL	NULL
