@@ -2,12 +2,12 @@
 #
 # MySQL CAST is parsed as a real cast (not a function call) and mapped onto the
 # engine's affinity-based CAST. Supported targets: CHAR (text), SIGNED /
-# UNSIGNED (integer), DECIMAL (numeric), DOUBLE / FLOAT / REAL (real), BINARY
-# (blob). A length/precision (CHAR(n), DECIMAL(m,d)) is accepted but not
-# enforced, and rounding of fractional values when casting to an integer differs
-# from MySQL — see mysql/COMPAT.md. The DATE / DATETIME / TIME targets are
-# handled separately (lowered to date()/datetime()/time()) — see
-# cast_datetime.test.
+# UNSIGNED (integer), DECIMAL / DEC (fixed-point), DOUBLE / FLOAT / REAL (real),
+# BINARY (blob). A CHAR(n) length is accepted but not enforced. CAST to DECIMAL
+# rounds the value to its scale D (default 0, since bare DECIMAL is
+# DECIMAL(10,0)): D = 0 yields an integer, D > 0 keeps D places. The DATE /
+# DATETIME / TIME targets are handled separately (lowered to
+# date()/datetime()/time()) — see cast_datetime.test.
 #
 # These cases use integer/string inputs where both targets agree, so they pass
 # against both turso-mysql-server and a real mysqld.
@@ -45,3 +45,38 @@ SELECT CAST(a AS CHAR(4)) FROM cast_demo ORDER BY a
 ----
 2
 10
+
+# CAST to bare DECIMAL is DECIMAL(10,0): it rounds to an integer (half away from
+# zero), parsing a leading-numeric string and treating a non-numeric one as 0.
+query
+SELECT CAST(123.456 AS DECIMAL), CAST(2.5 AS DECIMAL), CAST(-2.5 AS DECIMAL), CAST('45.67' AS DECIMAL), CAST('abc' AS DECIMAL)
+----
+123	3	-3	46	0
+
+# DEC is a synonym, and an explicit scale rounds to that many places.
+query
+SELECT CAST(99.99 AS DEC), CAST(123.456 AS DECIMAL(10,2)), CAST(123.456 AS DECIMAL(10,1)), CONVERT(123.456, DECIMAL(10,2))
+----
+100	123.46	123.5	123.46
+
+# NULL propagates through the rounding cast.
+query
+SELECT CAST(NULL AS DECIMAL) IS NULL, CAST(NULL AS DECIMAL(10,2)) IS NULL
+----
+1	1
+
+# WordPress sorts text meta values numerically with CAST(... AS DECIMAL); the
+# rounding cast orders them by value, not lexically.
+statement ok
+CREATE TABLE cast_meta (id INT PRIMARY KEY, v VARCHAR(16))
+
+statement ok
+INSERT INTO cast_meta VALUES (1, '10.5'), (2, '9.99'), (3, '100'), (4, '2')
+
+query
+SELECT id FROM cast_meta ORDER BY CAST(v AS DECIMAL(10,2)) ASC
+----
+4
+2
+1
+3

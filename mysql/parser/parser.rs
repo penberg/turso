@@ -3843,6 +3843,10 @@ impl Parser {
             self.expect(&Token::RParen, "`)`")?;
             return Ok(unary_fn(func, expr));
         }
+        if let Some(rounded) = self.decimal_cast_round(&expr)? {
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(rounded);
+        }
 
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
@@ -3876,6 +3880,45 @@ impl Parser {
         Ok(Some(func))
     }
 
+    /// If the next token is a MySQL fixed-point cast target (`DECIMAL`, `DEC`,
+    /// `NUMERIC`, or `FIXED`), consumes it — with an optional `(M[, D])`
+    /// precision — and returns the rounding `CAST`/`CONVERT` lowers to. MySQL
+    /// rounds the value to the scale `D`, which defaults to `0` (so the bare
+    /// `DECIMAL` is `DECIMAL(10, 0)`). `D = 0` yields an integer, lowered to
+    /// `CAST(round(x) AS INTEGER)`; `D > 0` to `round(x, D)`. The engine's
+    /// `round` coerces a string to its numeric value (`'45.67'` → `46`, a
+    /// non-numeric string → `0`), matching MySQL. Returns `None`, consuming
+    /// nothing, for any other target. (The precision `M` is not enforced, and a
+    /// `D > 0` result is not padded to `D` trailing zeros — documented
+    /// divergences; see `mysql/COMPAT.md`.)
+    fn decimal_cast_round(&mut self, expr: &ast::Expr) -> Result<Option<ast::Expr>> {
+        let is_decimal = matches!(self.peek(), Some(Token::Word(w))
+            if matches!(
+                w.to_ascii_uppercase().as_str(),
+                "DECIMAL" | "DEC" | "NUMERIC" | "FIXED"
+            ));
+        if !is_decimal {
+            return Ok(None);
+        }
+        self.advance();
+        // The scale `D` is the second value of `(M, D)`; it defaults to 0 (no
+        // precision, or `(M)` with no scale).
+        let mut scale: i64 = 0;
+        if self.is(&Token::LParen) {
+            if let Some(ast::TypeSize::TypeSize(_, d)) = self.type_size()? {
+                if let ast::Expr::Literal(ast::Literal::Numeric(s)) = d.as_ref() {
+                    scale = s.trim().parse::<i64>().unwrap_or(0);
+                }
+            }
+        }
+        let rounded = if scale <= 0 {
+            cast_to_integer(call_fn("round", vec![expr.clone()]))
+        } else {
+            call_fn("round", vec![expr.clone(), *numeric_expr(&scale.to_string())])
+        };
+        Ok(Some(rounded))
+    }
+
     /// Parses `CONVERT(...)`, which has two MySQL forms:
     /// `CONVERT(expr USING charset)` coerces a string's charset — the engine is
     /// single-charset (UTF-8), so the charset is dropped and the value passes
@@ -3895,6 +3938,10 @@ impl Parser {
             self.expect(&Token::RParen, "`)`")?;
             return Ok(unary_fn(func, expr));
         }
+        if let Some(rounded) = self.decimal_cast_round(&expr)? {
+            self.expect(&Token::RParen, "`)`")?;
+            return Ok(rounded);
+        }
         let type_name = self.cast_type()?;
         self.expect(&Token::RParen, "`)`")?;
         Ok(build_cast(expr, type_name))
@@ -3902,11 +3949,14 @@ impl Parser {
 
     /// Parses and maps a MySQL `CAST` target type onto an engine type whose
     /// SQLite affinity matches the intended conversion: `CHAR`→text,
-    /// `SIGNED`/`UNSIGNED`→integer, `DECIMAL`→numeric, `DOUBLE`/`FLOAT`/`REAL`→
-    /// real, `BINARY`→blob. Date/time and JSON targets diverge from the engine
-    /// and are rejected. A length/precision is accepted but dropped (the engine
-    /// does not enforce it); rounding of fractional values to an integer also
-    /// differs from MySQL — see `mysql/COMPAT.md`.
+    /// `SIGNED`/`UNSIGNED`→integer, `DOUBLE`/`FLOAT`/`REAL`→real, `BINARY`→blob.
+    /// The fixed-point targets (`DECIMAL`/`DEC`/…) are handled earlier by
+    /// [`Self::decimal_cast_round`], and the temporal ones by
+    /// [`Self::temporal_cast_func`], so they never reach here. Date/time and JSON
+    /// targets diverge from the engine and are rejected. A length/precision is
+    /// accepted but dropped (the engine does not enforce it); rounding of
+    /// fractional values to an integer also differs from MySQL — see
+    /// `mysql/COMPAT.md`.
     fn cast_type(&mut self) -> Result<ast::Type> {
         let Some(Token::Word(w)) = self.peek() else {
             return Err(self.unexpected("a CAST target type"));
@@ -3924,7 +3974,6 @@ impl Parser {
                 self.eat_keyword("INTEGER");
                 "INTEGER"
             }
-            "DECIMAL" | "DEC" | "NUMERIC" | "FIXED" => "DECIMAL",
             "DOUBLE" | "FLOAT" | "REAL" => "REAL",
             "BINARY" => "BLOB",
             other => {
@@ -12657,7 +12706,6 @@ mod tests {
         // engine type with the matching affinity.
         let cases = [
             ("CAST(a AS CHAR)", "CHAR"),
-            ("CAST(a AS DECIMAL)", "DECIMAL"),
             ("CAST(a AS DOUBLE)", "REAL"),
             ("CAST(a AS BINARY)", "BLOB"),
             ("CAST(a AS CHAR(8))", "CHAR"), // length parses but is dropped
@@ -12706,6 +12754,39 @@ mod tests {
             parse_expr("CAST(a AS JSON)").unwrap_err(),
             ParseError::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn cast_to_decimal_rounds_to_its_scale() {
+        // CAST(x AS DECIMAL) is DECIMAL(10, 0), so it rounds to an integer:
+        // CAST(round(x) AS INTEGER). The bare and (M)-only forms both have scale 0.
+        for sql in ["CAST(a AS DECIMAL)", "CAST(a AS DECIMAL(10))", "CONVERT(a, DEC)"] {
+            let ast::Expr::Cast { expr, type_name } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to CAST(round(..) AS INTEGER)");
+            };
+            assert_eq!(type_name.unwrap().name, "INTEGER", "for `{sql}`");
+            let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+                panic!("expected a round() inside the cast for `{sql}`");
+            };
+            assert_eq!(name.as_str(), "round");
+            assert_eq!(args.len(), 1, "scale-0 round takes one argument for `{sql}`");
+        }
+        // A positive scale D rounds to D places: round(x, D), not an integer cast.
+        let ast::Expr::FunctionCall { name, args, .. } =
+            parse_expr("CAST(a AS DECIMAL(10, 2))").unwrap()
+        else {
+            panic!("expected DECIMAL(10,2) to lower to round(x, 2)");
+        };
+        assert_eq!(name.as_str(), "round");
+        assert!(
+            matches!(args[1].as_ref(), ast::Expr::Literal(ast::Literal::Numeric(s)) if s == "2"),
+            "the scale should be the round() precision"
+        );
+        // CONVERT(x, DECIMAL(m,d)) lowers identically to CAST(x AS DECIMAL(m,d)).
+        assert_eq!(
+            parse_expr("CONVERT(a, DECIMAL(8, 3))").unwrap(),
+            parse_expr("CAST(a AS DECIMAL(8, 3))").unwrap()
+        );
     }
 
     #[test]
