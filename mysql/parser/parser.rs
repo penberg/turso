@@ -2270,6 +2270,18 @@ impl Parser {
             ));
         }
 
+        // `information_schema.COLUMNS`, likewise, is synthesized from the engine
+        // catalog (see `information_schema_columns_select`). WordPress's charset
+        // detection and Site Health read per-column metadata from it.
+        if is_information_schema_columns(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_columns_select(),
+                alias,
+            ));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -9097,6 +9109,61 @@ fn information_schema_tables_select() -> Result<ast::Select> {
     }
 }
 
+/// Whether `name` refers to `information_schema.COLUMNS` (the schema qualifier and
+/// table name compared case-insensitively, as MySQL treats them).
+fn is_information_schema_columns(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("COLUMNS")
+}
+
+/// Builds the derived-table `SELECT` that emulates MySQL's
+/// `information_schema.COLUMNS` from the engine catalog, exposing the per-column
+/// metadata WordPress's charset detection (`get_table_charset`) and Site Health
+/// read. One row per column of every base table is produced by joining
+/// `sqlite_schema` with the `pragma_table_info` table-valued function. The fixed
+/// single charset is reported as `utf8mb4` / `utf8mb4_general_ci` on the character
+/// columns and NULL elsewhere, and `COLUMN_KEY` is `PRI` for a primary-key column.
+///
+/// Parsed with the engine parser (`turso_parser`) rather than the front-end's,
+/// because the front-end FROM grammar does not model the `pragma_table_info`
+/// table function.
+///
+/// Divergences from a real mysqld (see `mysql/COMPAT.md`): `TABLE_SCHEMA` is the
+/// placeholder `def` (the front-end does not track the connection's database, as
+/// with the `TABLES` emulation), so a query filtering on it matches nothing;
+/// `COLLATION_NAME` is the front-end's fixed `utf8mb4_general_ci` rather than a
+/// server's default (e.g. 8.4's `utf8mb4_0900_ai_ci`); and `COLUMN_TYPE` carries
+/// no length/precision (`varchar`, not `varchar(20)`) because the engine catalog
+/// drops it. `sqlite_%` and `__turso_internal_*` bookkeeping tables are excluded.
+fn information_schema_columns_select() -> ast::Select {
+    const SQL: &[u8] = b"SELECT \
+         'def' AS TABLE_CATALOG, \
+         'def' AS TABLE_SCHEMA, \
+         m.name AS TABLE_NAME, \
+         p.name AS COLUMN_NAME, \
+         p.cid + 1 AS ORDINAL_POSITION, \
+         p.dflt_value AS COLUMN_DEFAULT, \
+         CASE WHEN p.\"notnull\" = 1 OR p.pk > 0 THEN 'NO' ELSE 'YES' END AS IS_NULLABLE, \
+         lower(p.type) AS DATA_TYPE, \
+         CASE WHEN lower(p.type) IN ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext', 'enum', 'set') THEN 'utf8mb4' ELSE NULL END AS CHARACTER_SET_NAME, \
+         CASE WHEN lower(p.type) IN ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext', 'enum', 'set') THEN 'utf8mb4_general_ci' ELSE NULL END AS COLLATION_NAME, \
+         lower(p.type) AS COLUMN_TYPE, \
+         CASE WHEN p.pk > 0 THEN 'PRI' ELSE '' END AS COLUMN_KEY, \
+         '' AS EXTRA \
+         FROM sqlite_schema m \
+         JOIN pragma_table_info(m.name) p \
+         WHERE m.type = 'table' \
+         AND m.name NOT LIKE 'sqlite_%' \
+         AND substr(m.name, 1, 17) <> '__turso_internal_'";
+    let mut parser = turso_parser::parser::Parser::new(SQL);
+    match parser.next() {
+        Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,
+        _ => unreachable!("the information_schema.COLUMNS emulation parses as a SELECT"),
+    }
+}
+
 /// Whether `expr` calls an aggregate function anywhere in its own scope. Used to
 /// tell an aggregate `HAVING` (a whole-table aggregate the engine handles) from
 /// a non-aggregate one (a row filter, foldable into `WHERE`). Subqueries are not
@@ -14468,13 +14535,24 @@ mod tests {
             base_table("SELECT 1 FROM INFORMATION_SCHEMA.tables"),
             ast::SelectTable::Select(..)
         ));
-        // A plain table, and a different information_schema table, are unchanged.
+        // information_schema.COLUMNS rewrites the same way (and is case-insensitive).
+        assert!(matches!(
+            base_table(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_NAME = 'x'"
+            ),
+            ast::SelectTable::Select(..)
+        ));
+        assert!(matches!(
+            base_table("SELECT 1 FROM INFORMATION_SCHEMA.columns c"),
+            ast::SelectTable::Select(..)
+        ));
+        // A plain table, and an unemulated information_schema table, are unchanged.
         assert!(matches!(
             base_table("SELECT id FROM wp_posts"),
             ast::SelectTable::Table(..)
         ));
         assert!(matches!(
-            base_table("SELECT 1 FROM information_schema.COLUMNS"),
+            base_table("SELECT 1 FROM information_schema.STATISTICS"),
             ast::SelectTable::Table(..)
         ));
     }

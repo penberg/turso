@@ -1,0 +1,49 @@
+# information_schema.COLUMNS.
+#
+# MySQL exposes per-column metadata through information_schema.COLUMNS; WordPress
+# reads it for charset detection (`get_table_charset`) and Site Health. The engine
+# has no such schema, so the front-end rewrites a reference to it into a derived
+# table over the engine catalog (sqlite_schema joined with pragma_table_info),
+# one row per column.
+#
+# Limitations (not exercised here, see mysql/COMPAT.md): TABLE_SCHEMA is a
+# placeholder (`def`), so a query filtering on it matches nothing; COLLATION_NAME
+# is the front-end's fixed utf8mb4_general_ci rather than a server default (8.4's
+# utf8mb4_0900_ai_ci); and COLUMN_TYPE carries no length (`varchar`, not
+# `varchar(20)`). The columns tested below match MySQL 8.4. The query filters by
+# TABLE_NAME (not TABLE_SCHEMA), so the result is the same on both engines, and
+# uses a file-unique table name.
+
+statement ok
+CREATE TABLE iscols_t (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL DEFAULT '', body TEXT, n INT)
+
+# Per-column metadata: position, nullability, key, charset, base type — a primary
+# key reports NO nullability and PRI, character columns report utf8mb4, and
+# non-character columns report a NULL charset. (DATA_TYPE is selected last so no
+# row ends in the empty COLUMN_KEY value.)
+query
+SELECT COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, COLUMN_KEY, CHARACTER_SET_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_NAME = 'iscols_t' ORDER BY ORDINAL_POSITION
+----
+id	1	NO	PRI	NULL	int
+name	2	NO		utf8mb4	varchar
+body	3	YES		utf8mb4	text
+n	4	YES		NULL	int
+
+# A COUNT(*) over the columns of a table (a column-existence probe).
+query
+SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_NAME = 'iscols_t'
+----
+4
+
+# A predicate on a single column's metadata, with a table alias.
+query
+SELECT c.IS_NULLABLE FROM information_schema.COLUMNS c WHERE c.TABLE_NAME = 'iscols_t' AND c.COLUMN_NAME = 'name'
+----
+NO
+
+# Selecting the character columns of the table by charset.
+query
+SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_NAME = 'iscols_t' AND CHARACTER_SET_NAME = 'utf8mb4' ORDER BY ORDINAL_POSITION
+----
+name
+body
