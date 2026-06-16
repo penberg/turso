@@ -1,0 +1,57 @@
+# TO_BASE64 / FROM_BASE64.
+#
+# MySQL's TO_BASE64 base64-encodes a string and FROM_BASE64 decodes it. The
+# engine has no builtin, so these lower to the crypto extension's crypto_encode /
+# crypto_decode with a 'base64' format. The encode argument is cast to text, so a
+# numeric argument encodes as its string form (TO_BASE64(255) is the base64 of
+# '255'), and NULL propagates.
+#
+# Two documented divergences (not exercised here): TO_BASE64 does not insert
+# MySQL's 76-character line breaks for long output, and FROM_BASE64 returns text
+# (so it errors on base64 that decodes to non-UTF-8 bytes, where MySQL returns a
+# binary string). Verified against MySQL 8.4 for short text. Uses a file-unique
+# table name.
+
+# Standard base64 encodings, including the padded short cases and the empty
+# string (a trailing tab for the empty third column).
+query
+SELECT TO_BASE64('hello'), TO_BASE64('a'), TO_BASE64('')
+----
+aGVsbG8=	YQ==	
+
+# Decoding is the inverse, and a round trip is the identity.
+query
+SELECT FROM_BASE64('aGVsbG8='), FROM_BASE64(TO_BASE64('round trip!'))
+----
+hello	round trip!
+
+# A numeric argument is encoded as its string form.
+query
+SELECT TO_BASE64(255)
+----
+MjU1
+
+# The decoded bytes round-trip through HEX.
+query
+SELECT HEX(FROM_BASE64('aGVsbG8='))
+----
+68656C6C6F
+
+# NULL propagates through both directions.
+query
+SELECT TO_BASE64(NULL), FROM_BASE64(NULL)
+----
+NULL	NULL
+
+# Usable over a column.
+statement ok
+CREATE TABLE b64 (id INT PRIMARY KEY, v VARCHAR(50))
+
+statement ok
+INSERT INTO b64 VALUES (1, 'wordpress'), (2, 'turso')
+
+query
+SELECT id, FROM_BASE64(TO_BASE64(v)) FROM b64 ORDER BY id
+----
+1	wordpress
+2	turso

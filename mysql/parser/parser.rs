@@ -3932,6 +3932,15 @@ impl Parser {
             return Ok(call_fn("uuid4_str", Vec::new()));
         }
 
+        // `TO_BASE64(s)` / `FROM_BASE64(s)` base64-encode / -decode a string via
+        // the crypto extension (see `base64_call`).
+        if upper == "TO_BASE64" {
+            return self.base64_call("crypto_encode", true);
+        }
+        if upper == "FROM_BASE64" {
+            return self.base64_call("crypto_decode", false);
+        }
+
         // `HEX(x)` is overloaded: the uppercase hex of a number, or the hex of a
         // string's bytes (see `hex_call`).
         if upper == "HEX" {
@@ -5296,6 +5305,47 @@ impl Parser {
                 (Box::new(greater), numeric_expr("1")),
             ],
             else_expr: Some(numeric_expr("0")),
+        })
+    }
+
+    /// Parses a single-argument base64 function (`TO_BASE64`/`FROM_BASE64`) — the
+    /// name and `(` already consumed — and lowers it to the crypto extension's
+    /// `engine_fn` with a `'base64'` format argument: `<engine_fn>(s, 'base64')`.
+    /// For the encode direction (`cast_arg`), the argument is cast to text so a
+    /// numeric argument encodes as its string form (`TO_BASE64(255)` is the
+    /// base64 of `'255'`). A NULL argument yields NULL (the crypto functions
+    /// error on NULL). Note `TO_BASE64` does not insert MySQL's 76-character line
+    /// breaks, and `FROM_BASE64` errors on base64 that decodes to non-UTF-8 bytes
+    /// (it returns text, not a binary string) — see `mysql/COMPAT.md`.
+    fn base64_call(&mut self, engine_fn: &str, cast_arg: bool) -> Result<ast::Expr> {
+        let arg = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        let payload = if cast_arg {
+            ast::Expr::Cast {
+                expr: Box::new(arg.clone()),
+                type_name: Some(ast::Type {
+                    name: "TEXT".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            }
+        } else {
+            arg.clone()
+        };
+        let call = call_fn(
+            engine_fn,
+            vec![
+                payload,
+                ast::Expr::Literal(ast::Literal::String(requote("base64"))),
+            ],
+        );
+        Ok(ast::Expr::Case {
+            base: None,
+            when_then_pairs: vec![(
+                Box::new(ast::Expr::is_null(arg)),
+                Box::new(ast::Expr::Literal(ast::Literal::Null)),
+            )],
+            else_expr: Some(Box::new(call)),
         })
     }
 
@@ -13647,6 +13697,39 @@ mod tests {
         // rejected.
         assert!(parse_expr("SHA2(s, 224)").is_err());
         assert!(parse_expr("SHA2(s, n)").is_err());
+    }
+
+    #[test]
+    fn base64_functions_lower_to_crypto_encode_decode() {
+        // TO_BASE64(s) -> CASE WHEN s IS NULL THEN NULL ELSE
+        // crypto_encode(CAST(s AS TEXT), 'base64') END; FROM_BASE64 uses
+        // crypto_decode on the argument directly.
+        let crypto = |sql: &str| -> (String, ast::Expr) {
+            let ast::Expr::Case { else_expr, .. } = parse_expr(sql).unwrap() else {
+                panic!("expected `{sql}` to lower to a CASE");
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = else_expr.unwrap().as_ref().clone()
+            else {
+                panic!("expected the else branch to be a crypto call for `{sql}`");
+            };
+            // The format argument is the 'base64' literal.
+            assert!(matches!(
+                args[1].as_ref(),
+                ast::Expr::Literal(ast::Literal::String(s)) if s == "'base64'"
+            ));
+            (name.as_str().to_string(), args[0].as_ref().clone())
+        };
+        let (encode, payload) = crypto("TO_BASE64(s)");
+        assert_eq!(encode, "crypto_encode");
+        // The encode payload is CAST(s AS TEXT).
+        assert!(matches!(
+            payload,
+            ast::Expr::Cast { type_name: Some(t), .. } if t.name == "TEXT"
+        ));
+        let (decode, payload) = crypto("FROM_BASE64(s)");
+        assert_eq!(decode, "crypto_decode");
+        // The decode payload is the argument as-is.
+        assert_eq!(payload, col("s"));
     }
 
     #[test]
