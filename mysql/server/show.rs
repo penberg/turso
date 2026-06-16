@@ -1619,11 +1619,26 @@ fn build_variables(show: &ShowVariables) -> ColumnsResult {
 fn like_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let t: Vec<char> = text.to_ascii_lowercase().chars().collect();
-    // Classic two-pointer wildcard match with backtracking on `%`.
+    // Classic two-pointer wildcard match with backtracking on `%`. A backslash
+    // escapes the next pattern character to a literal (MySQL's default `LIKE`
+    // escape), so `\_` / `\%` match a literal underscore / percent rather than a
+    // wildcard — as a WordPress `esc_like()` pattern relies on.
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star, mut star_ti): (Option<usize>, usize) = (None, 0);
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+        let escaped = pi + 1 < p.len() && p[pi] == '\\';
+        if escaped {
+            if p[pi + 1] == t[ti] {
+                pi += 2;
+                ti += 1;
+            } else if let Some(s) = star {
+                pi = s + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        } else if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
             pi += 1;
             ti += 1;
         } else if pi < p.len() && p[pi] == '%' {
@@ -1638,6 +1653,8 @@ fn like_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
+    // Only a trailing `%` matches the empty remainder; a literal or escaped
+    // character still pending means no match.
     while pi < p.len() && p[pi] == '%' {
         pi += 1;
     }
@@ -1917,6 +1934,17 @@ mod tests {
         assert!(like_match("%", "anything"));
         assert!(!like_match("autocommi_", "autocommit_extra"));
         assert!(!like_match("xyz", "autocommit"));
+
+        // A backslash escapes the next character to a literal (MySQL's default
+        // LIKE escape), so `\_` matches a literal underscore, not any character.
+        assert!(like_match(r"sql\_mode", "sql_mode"));
+        assert!(!like_match(r"sql\_mode", "sqlXmode"));
+        assert!(like_match(r"a\%b", "a%b"));
+        assert!(!like_match(r"a\%b", "axb"));
+        // Escaped literals compose with real wildcards.
+        assert!(like_match(r"wp\_%", "wp_options"));
+        assert!(!like_match(r"wp\_%", "wpxoptions"));
+        assert!(like_match(r"%\_id", "user_id"));
     }
 
     #[test]

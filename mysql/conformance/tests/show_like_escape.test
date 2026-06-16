@@ -1,0 +1,37 @@
+# SHOW ... LIKE -- MySQL's default backslash escape (SHOW VARIABLES / SHOW COLUMNS).
+#
+# Companion to show_tables_like_escape: the in-memory matcher behind SHOW
+# VARIABLES / SHOW COLUMNS / SHOW INDEX LIKE filters now applies MySQL's default
+# backslash escape too, so `\_` matches a literal underscore. Without it, an
+# `esc_like()`-escaped variable or column name matched nothing.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses
+# read-only variables with fixed default values and lowercase column names so
+# value/case differences do not affect the comparison.
+
+# Escaped underscores in a SHOW VARIABLES pattern match the literal name.
+query
+SHOW VARIABLES LIKE 'group\_concat\_max\_len'
+----
+group_concat_max_len	1024
+
+query
+SHOW VARIABLES LIKE 'default\_storage\_engine'
+----
+default_storage_engine	InnoDB
+
+# An unescaped underscore is still a wildcard (matches the literal underscore here).
+query
+SHOW VARIABLES LIKE 'default_storage_engine'
+----
+default_storage_engine	InnoDB
+
+# SHOW COLUMNS LIKE with an escaped underscore matches only the literal-underscore
+# column, not the one an unescaped `_` wildcard would also match.
+statement ok
+CREATE TABLE IF NOT EXISTS lmesc (id INT PRIMARY KEY, user_id INT, userxid INT)
+
+query
+SHOW COLUMNS FROM lmesc LIKE 'user\_id'
+----
+user_id	int	YES		NULL	
