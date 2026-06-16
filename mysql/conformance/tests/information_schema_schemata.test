@@ -1,0 +1,41 @@
+# information_schema.SCHEMATA (the database catalog).
+#
+# MySQL lists one row per database in information_schema.SCHEMATA, carrying the
+# database's default character set and collation. WordPress reads it for charset
+# detection (`wpdb::determine_charset` / `get_table_charset`) and Site Health:
+# `SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME
+# = DATABASE()`. The view did not exist in the front-end, so the reference errored.
+#
+# This single-database engine synthesizes one constant row for the connection's
+# current database: SCHEMA_NAME is that database, CATALOG_NAME the constant 'def',
+# and the charset/collation the engine's fixed utf8mb4 / utf8mb4_general_ci (the
+# same values the COLUMNS view reports). DEFAULT_COLLATION_NAME therefore differs
+# from an 8.4 server's utf8mb4_0900_ai_ci -- the single-collation divergence noted
+# in mysql/COMPAT.md -- so it is not asserted here.
+#
+# Compares against DATABASE() rather than a literal so it holds whatever database
+# the connection selected, on both turso-mysql-server and a real mysqld.
+
+# The current database has a row, exposing the catalog, name, and charset.
+query
+SELECT CATALOG_NAME, SCHEMA_NAME = DATABASE(), DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()
+----
+def	1	utf8mb4
+
+# Exactly one row matches the current database.
+query
+SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()
+----
+1
+
+# A non-existent schema matches nothing.
+query
+SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'no_such_db'
+----
+0
+
+# SQL_PATH is always NULL and DEFAULT_ENCRYPTION defaults to NO, as in MySQL.
+query
+SELECT SQL_PATH, DEFAULT_ENCRYPTION FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()
+----
+NULL	NO

@@ -2386,6 +2386,20 @@ impl Parser {
             ));
         }
 
+        // `information_schema.SCHEMATA` (one row per database) is synthesized as a
+        // single constant row describing the connection's current database — all
+        // this single-database, single-charset engine has (see
+        // `information_schema_schemata_select`). WordPress's charset detection and
+        // Site Health read the database's default charset/collation from it.
+        if is_information_schema_schemata(&tbl_name) {
+            let alias = self.table_alias()?;
+            self.skip_index_hints()?;
+            return Ok(ast::SelectTable::Select(
+                information_schema_schemata_select(self.current_db.as_deref())?,
+                alias,
+            ));
+        }
+
         let alias = self.table_alias()?;
         self.skip_index_hints()?;
         Ok(ast::SelectTable::Table(tbl_name, alias, None))
@@ -10365,6 +10379,44 @@ fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Sel
     match Parser::new(sql.as_bytes())?.parse_statement()? {
         ast::Stmt::Select(select) => Ok(select),
         _ => unreachable!("the information_schema.TABLES emulation parses as a SELECT"),
+    }
+}
+
+/// Whether `name` refers to `information_schema.SCHEMATA` (schema qualifier and
+/// table name compared case-insensitively, as MySQL treats them).
+fn is_information_schema_schemata(name: &ast::QualifiedName) -> bool {
+    name.db_name
+        .as_ref()
+        .is_some_and(|db| db.as_str().eq_ignore_ascii_case("information_schema"))
+        && name.name.as_str().eq_ignore_ascii_case("SCHEMATA")
+}
+
+/// Builds the `SELECT` that emulates MySQL's `information_schema.SCHEMATA` — one
+/// row describing the connection's current database, which is all this single-
+/// database engine has. `SCHEMA_NAME` is the current database (the column
+/// WordPress filters on, `WHERE SCHEMA_NAME = DATABASE()`), `CATALOG_NAME` is
+/// MySQL's constant `def`, and the charset/collation are the engine's fixed
+/// `utf8mb4` / `utf8mb4_general_ci` — the same values the `COLUMNS` view and
+/// `SHOW FULL COLUMNS` report (`DEFAULT_COLLATION_NAME` therefore differs from a
+/// MySQL 8.4 server's `utf8mb4_0900_ai_ci`, the single-collation divergence noted
+/// in `mysql/COMPAT.md`). A connection with no current database falls back to the
+/// `def` placeholder the other views use. WordPress's charset detection and Site
+/// Health read the database default charset/collation from here.
+fn information_schema_schemata_select(current_db: Option<&str>) -> Result<ast::Select> {
+    let schema = current_db.unwrap_or("def");
+    let sql = format!(
+        "SELECT \
+         'def' AS CATALOG_NAME, \
+         '{}' AS SCHEMA_NAME, \
+         'utf8mb4' AS DEFAULT_CHARACTER_SET_NAME, \
+         'utf8mb4_general_ci' AS DEFAULT_COLLATION_NAME, \
+         NULL AS SQL_PATH, \
+         'NO' AS DEFAULT_ENCRYPTION",
+        schema.replace('\'', "''")
+    );
+    match Parser::new(sql.as_bytes())?.parse_statement()? {
+        ast::Stmt::Select(select) => Ok(select),
+        _ => unreachable!("the information_schema.SCHEMATA emulation parses as a SELECT"),
     }
 }
 
