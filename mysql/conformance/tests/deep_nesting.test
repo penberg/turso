@@ -1,0 +1,40 @@
+# Deeply nested expressions must not overflow the server's stack.
+#
+# Each connection is handled on a runtime thread that recurses through the parser
+# and the synchronous engine, so a deeply nested expression recurses deeply. The
+# default thread stack overflowed (aborting the whole process) on only a few
+# dozen levels of nesting; the server now runs its threads with a generous stack,
+# so the nesting depths a real query may reach are handled. MySQL accepts these
+# too, so the values match.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# 40 levels of parentheses around a literal.
+query
+SELECT ((((((((((((((((((((((((((((((((((((((((7))))))))))))))))))))))))))))))))))))))))
+----
+7
+
+# 40 nested function calls.
+query
+SELECT ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(ABS(-3))))))))))))))))))))))))))))))))))))))))
+----
+3
+
+# A long left-associative arithmetic chain (41 terms).
+query
+SELECT 100-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1
+----
+60
+
+# A deep chain of unary NOT (41 of them -> NOT 1 -> 0).
+query
+SELECT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT 1
+----
+0
+
+# Nesting composes inside a WHERE filter and still evaluates.
+query
+SELECT 1 WHERE ((((((((((((((((((((((((((((((((((((((((7)))))))))))))))))))))))))))))))))))))))) = 7
+----
+1

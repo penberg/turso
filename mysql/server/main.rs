@@ -71,8 +71,21 @@ fn open_database(path: &str) -> anyhow::Result<Arc<Database>> {
     Ok(db)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Each connection is handled on a blocking-pool thread that recurses through
+    // the parser and the synchronous engine, so a deeply nested expression
+    // recurses deeply. The default ~2 MiB thread stack overflows (and aborts the
+    // whole process) on only a few dozen levels of nesting, so give the runtime's
+    // threads a generous stack — applied to the worker *and* blocking-pool
+    // threads — to tolerate the nesting depths a real query may reach.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -68,6 +68,10 @@ The proof of concept currently:
 * Handles `COM_QUERY` by running the SQL through the engine and streaming a
   **text-protocol** result set (or an `OK`/`ERR` packet).
 * Handles `COM_PING`, `COM_INIT_DB` (acknowledged as a no-op), and `COM_QUIT`.
+* Runs each connection on a runtime thread with a **generous stack** (the parser
+  and synchronous engine recurse with the expression's nesting), so a deeply
+  nested expression no longer overflows the thread stack and aborts the process —
+  it is handled to far past any depth a real query reaches.
 
 Everything else — binary protocol, prepared statements, TLS, real
 authentication, MySQL dialect translation, the `information_schema`, `SHOW`,
