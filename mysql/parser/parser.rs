@@ -934,8 +934,21 @@ impl Parser {
                 // `ON UPDATE <expr>` / `ON DELETE <expr>`: skip both tokens.
                 let _ = self.name()?;
                 let _ = self.default_value()?;
+            } else if self.eat_keyword("CHECK") {
+                // MySQL 8.0+ enforces CHECK, and so does the engine. Pass the
+                // constraint through when its expression translates; if it uses
+                // something the front-end cannot model, drop it (as before) so the
+                // table is still created.
+                let saved = self.pos;
+                match self.check_constraint_expr() {
+                    Ok(expr) => out.push(named(ast::ColumnConstraint::Check(Box::new(expr)))),
+                    Err(_) => {
+                        self.pos = saved;
+                        self.skip_to_item_boundary();
+                        break;
+                    }
+                }
             } else if self.is_keyword("REFERENCES")
-                || self.is_keyword("CHECK")
                 || self.is_keyword("GENERATED")
                 || self.is_keyword("AS")
                 || self.is_keyword("KEY")
@@ -1054,10 +1067,23 @@ impl Parser {
                     conflict_clause: None,
                 },
             });
+        } else if self.eat_keyword("CHECK") {
+            // A table-level CHECK, enforced by the engine like MySQL 8.0+. Pass it
+            // through when translatable, else drop it (keeping the symbol name).
+            let saved = self.pos;
+            match self.check_constraint_expr() {
+                Ok(expr) => out.push(ast::NamedTableConstraint {
+                    name,
+                    constraint: ast::TableConstraint::Check(Box::new(expr)),
+                }),
+                Err(_) => {
+                    self.pos = saved;
+                    self.skip_to_item_boundary();
+                }
+            }
         } else if self.is_keyword("KEY")
             || self.is_keyword("INDEX")
             || self.is_keyword("FOREIGN")
-            || self.is_keyword("CHECK")
             || self.is_keyword("FULLTEXT")
             || self.is_keyword("SPATIAL")
         {
@@ -1067,6 +1093,15 @@ impl Parser {
             return Err(self.unexpected("a table constraint"));
         }
         Ok(())
+    }
+
+    /// Parses a `CHECK (expr)` constraint body (the `CHECK` keyword is already
+    /// consumed), returning the bracketed expression.
+    fn check_constraint_expr(&mut self) -> Result<ast::Expr> {
+        self.expect(&Token::LParen, "`(`")?;
+        let expr = self.expr()?;
+        self.expect(&Token::RParen, "`)`")?;
+        Ok(expr)
     }
 
     fn sorted_column_list(&mut self) -> Result<Vec<ast::SortedColumn>> {
@@ -7156,6 +7191,46 @@ mod tests {
         assert!(has_autoinc);
         // Retyped to INTEGER so the engine treats it as an auto-assigning rowid alias.
         assert_eq!(columns[0].col_type.as_ref().unwrap().name, "INTEGER");
+    }
+
+    #[test]
+    fn check_constraints_pass_through_or_fall_back() {
+        fn body(sql: &str) -> (Vec<ast::ColumnDefinition>, Vec<ast::NamedTableConstraint>) {
+            let ast::Stmt::CreateTable { body, .. } = parse(sql).unwrap() else {
+                panic!("expected CREATE TABLE");
+            };
+            let ast::CreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                ..
+            } = body
+            else {
+                panic!("expected a column/constraint body");
+            };
+            (columns, constraints)
+        }
+
+        // A translatable column-level CHECK is kept as a Check constraint.
+        let (columns, _) = body("CREATE TABLE t (id INT PRIMARY KEY, c INT CHECK (c > 0))");
+        assert!(columns[1]
+            .constraints
+            .iter()
+            .any(|c| matches!(c.constraint, ast::ColumnConstraint::Check(_))));
+
+        // A translatable table-level CHECK is kept (the symbol name preserved).
+        let (_, constraints) =
+            body("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, CONSTRAINT ab CHECK (a < b))");
+        assert!(constraints
+            .iter()
+            .any(|c| matches!(c.constraint, ast::TableConstraint::Check(_))));
+
+        // A CHECK the front-end cannot translate (an unsupported function) is
+        // dropped, so the table still parses with no Check constraint.
+        let (columns, _) = body("CREATE TABLE t (id INT PRIMARY KEY, s TEXT CHECK (REVERSE(s) = s))");
+        assert!(!columns[1]
+            .constraints
+            .iter()
+            .any(|c| matches!(c.constraint, ast::ColumnConstraint::Check(_))));
     }
 
     #[test]

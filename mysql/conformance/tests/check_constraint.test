@@ -1,0 +1,54 @@
+# CHECK constraints.
+#
+# MySQL 8.0.16+ enforces CHECK constraints, and so does the engine. The
+# front-end previously dropped CHECK clauses (parsed but ignored), so a row
+# violating one was wrongly accepted. It now passes a translatable CHECK through
+# to the engine, which enforces it.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld. Uses its
+# own table names.
+
+# A column-level CHECK rejects a violating row and accepts a valid one.
+statement ok
+CREATE TABLE IF NOT EXISTS ck_col (id INT PRIMARY KEY, c INT CHECK (c > 0))
+
+statement error
+INSERT INTO ck_col (id, c) VALUES (1, -5)
+
+statement ok
+INSERT INTO ck_col (id, c) VALUES (2, 10)
+
+query
+SELECT id, c FROM ck_col ORDER BY id
+----
+2	10
+
+# A table-level (and named) CHECK over two columns.
+statement ok
+CREATE TABLE IF NOT EXISTS ck_tbl (id INT PRIMARY KEY, a INT, b INT, CONSTRAINT chk_ab CHECK (a < b))
+
+statement error
+INSERT INTO ck_tbl (id, a, b) VALUES (1, 5, 3)
+
+statement ok
+INSERT INTO ck_tbl (id, a, b) VALUES (2, 3, 5)
+
+query
+SELECT id FROM ck_tbl ORDER BY id
+----
+2
+
+# A CHECK using a set membership is enforced too.
+statement ok
+CREATE TABLE IF NOT EXISTS ck_in (id INT PRIMARY KEY, s VARCHAR(5) CHECK (s IN ('a', 'b')))
+
+statement error
+INSERT INTO ck_in (id, s) VALUES (1, 'z')
+
+statement ok
+INSERT INTO ck_in (id, s) VALUES (2, 'a')
+
+query
+SELECT s FROM ck_in ORDER BY id
+----
+a
