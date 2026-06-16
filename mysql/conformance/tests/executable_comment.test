@@ -1,0 +1,76 @@
+# MySQL version-gated executable comments `/*!##### ... */`.
+#
+# MySQL runs the contents of `/*! ... */` (and `/*!##### ... */` when the server
+# version is at least #####) as ordinary SQL, rather than discarding it like a
+# plain `/* ... */` comment. mysqldump output and WordPress/plugin migrations
+# lean on this: `/*!40101 SET NAMES utf8mb4 */`, `SELECT /*!40001 SQL_NO_CACHE */
+# ...`, `/*!40000 ALTER TABLE ... */`. The lexer used to strip these like any
+# comment, so a statement that was entirely wrapped in one became empty input.
+#
+# The lexer now skips only the `/*!#####` opener and the matching `*/`, lexing
+# the contents as SQL; a gate above the reported server version (8.0) is skipped
+# like a plain comment. Expected to pass against both turso-mysql-server and a
+# real mysqld. (Server version differs, so every gate tested is either well below
+# both or well above both.)
+
+# A whole statement wrapped in an executable comment runs.
+query
+/*!40100 SELECT 7 */
+----
+7
+
+# A bare `/*! ... */` with no version always runs.
+query
+/*! SELECT 42 */
+----
+42
+
+# A mid-statement hint comment runs its contents (the SQL_NO_CACHE modifier is
+# accepted and ignored), so the surrounding query is unaffected.
+query
+SELECT /*!40001 SQL_NO_CACHE */ 1
+----
+1
+
+# Contents in the middle of an expression are spliced in: `1 + 2`.
+query
+SELECT 1 /*!40101 + 2 */
+----
+3
+
+# A gate above the reported server version is skipped, so only `1` remains.
+query
+SELECT 1 /*!99999 , 2 */
+----
+1
+
+# A gate the server meets is run, so both columns appear.
+query
+SELECT 1 /*!50000 , 2 */
+----
+1	2
+
+# The markers are recognized lexically, so an identical sequence inside a string
+# literal is left untouched.
+query
+SELECT '/*!40101 not executed */' AS s
+----
+/*!40101 not executed */
+
+# An empty executable comment is a no-op.
+query
+SELECT 5 /*!*/
+----
+5
+
+# DDL works through an executable comment: the table is created and usable.
+statement ok
+/*!40100 CREATE TABLE IF NOT EXISTS ec_demo (id INT PRIMARY KEY) */
+
+statement ok
+INSERT INTO ec_demo VALUES (5)
+
+query
+SELECT id FROM ec_demo
+----
+5

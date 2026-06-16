@@ -12,6 +12,12 @@
 use crate::error::{ParseError, Result};
 use crate::token::Token;
 
+/// The server version the front-end reports (`8.0.0` → `80000`), used to decide
+/// whether a MySQL version-gated executable comment `/*!##### ... */` runs. It
+/// mirrors the `8.0.0-turso` banner the server sends; every gate WordPress and
+/// `mysqldump` emit (e.g. `40101`, `50503`) is below it, so they execute.
+const SERVER_VERSION_ID: u32 = 80000;
+
 /// Lexes a byte slice into a vector of `(token, byte offset)` pairs.
 pub struct Lexer<'a> {
     input: &'a [u8],
@@ -132,6 +138,39 @@ impl<'a> Lexer<'a> {
                     self.pos += 2;
                     self.skip_line();
                 }
+                // MySQL version-gated executable comment `/*!##### ... */`: its
+                // content runs as ordinary SQL when the server version is at least
+                // `#####` (a missing version always runs), so `/*!40101 SET NAMES
+                // utf8mb4 */` executes the `SET`. We report 8.0, so we execute the
+                // content by skipping only the `/*!#####` opener here and the `*/`
+                // closer below; a higher gate is skipped like a plain comment.
+                Some(b'/') if self.peek_at(1) == Some(b'*') && self.peek_at(2) == Some(b'!') => {
+                    self.pos += 3; // `/*!`
+                    let digits_start = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                        self.pos += 1;
+                    }
+                    let gate: u32 = std::str::from_utf8(&self.input[digits_start..self.pos])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    if gate > SERVER_VERSION_ID {
+                        // Gate too new: skip the whole comment like `/* ... */`.
+                        while self.pos < self.input.len() {
+                            if self.peek() == Some(b'*') && self.peek_at(1) == Some(b'/') {
+                                self.pos += 2;
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                    }
+                    // Otherwise the content is lexed as SQL; its closing `*/` is
+                    // consumed by the `*/` case below.
+                }
+                // The `*/` closing an executed version-gated comment (whose content
+                // was lexed as SQL). A `*/` is invalid SQL anywhere else, so
+                // treating a stray one as trivia is harmless.
+                Some(b'*') if self.peek_at(1) == Some(b'/') => self.pos += 2,
                 // `/* ... */` block comment.
                 Some(b'/') if self.peek_at(1) == Some(b'*') => {
                     self.pos += 2;
@@ -483,6 +522,27 @@ mod tests {
 
     fn word(w: &str) -> Token {
         Token::Word(w.to_string())
+    }
+
+    #[test]
+    fn version_gated_executable_comments_run_their_contents() {
+        // `/*! ... */` and `/*!##### ... */` (a gate at most the reported 8.0)
+        // lex their contents as SQL; the opener, version, and closing `*/` are
+        // skipped, so a wholly wrapped statement is not empty.
+        assert_eq!(tokens("/*!40100 SELECT 7 */"), vec![word("SELECT"), Token::Num("7".into())]);
+        assert_eq!(tokens("/*! SELECT 7 */"), vec![word("SELECT"), Token::Num("7".into())]);
+        // Mid-statement contents splice into the surrounding tokens (`1 + 2`).
+        assert_eq!(
+            tokens("1 /*!40101 + 2 */"),
+            vec![Token::Num("1".into()), Token::Plus, Token::Num("2".into())]
+        );
+        // A gate above the reported server version is discarded like a comment.
+        assert_eq!(tokens("1 /*!99999 + 2 */"), vec![Token::Num("1".into())]);
+        // A plain `/* ... */` comment is still discarded entirely.
+        assert_eq!(tokens("1 /* + 2 */"), vec![Token::Num("1".into())]);
+        // The markers are lexical, so an identical sequence inside a string
+        // literal is left untouched.
+        assert_eq!(first_string("SELECT '/*!40101 x */'"), "/*!40101 x */");
     }
 
     #[test]
