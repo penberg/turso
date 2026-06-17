@@ -1,0 +1,33 @@
+# information_schema.TABLES — TABLE_CATALOG / VERSION / ROW_FORMAT / TABLE_COMMENT.
+#
+# MySQL's `information_schema.TABLES` exposes more than the name/engine/type/row
+# columns the front-end emulated; a query selecting `TABLE_CATALOG`, `VERSION`,
+# `ROW_FORMAT`, or `TABLE_COMMENT` (which WordPress Site Health and migration /
+# backup tools read) errored with "no such column". These now report the same
+# fixed values MySQL does and `SHOW TABLE STATUS` already uses: a base table is
+# `def` / `10` / `Dynamic` / `''`, and a view is `def` / NULL / NULL / `VIEW`
+# (the engine/row columns already treat a view as NULL).
+#
+# Filters by the current database and file-unique names. Expected to pass against
+# both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE istab_base (id INT PRIMARY KEY AUTO_INCREMENT, v INT)
+
+statement ok
+CREATE VIEW istab_view AS SELECT id FROM istab_base
+
+# A base table reports the catalog `def`, frm version `10`, `Dynamic` row format,
+# and an empty comment; a view reports `def`, NULL version / row format, and the
+# `VIEW` comment. (Ordered with a never-empty last column.)
+query
+SELECT TABLE_NAME, TABLE_CATALOG, TABLE_COMMENT, VERSION, ROW_FORMAT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('istab_base', 'istab_view') ORDER BY TABLE_NAME
+----
+istab_base	def		10	Dynamic
+istab_view	def	VIEW	NULL	NULL
+
+# The fixed TABLE_CATALOG is selectable as a filter, too.
+query
+SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'istab\_%' AND TABLE_CATALOG = 'def'
+----
+2

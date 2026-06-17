@@ -10701,18 +10701,27 @@ fn info_schema_with_schema(sql: &str, current_db: Option<&str>) -> String {
 }
 
 fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Select> {
+    // `TABLE_CATALOG` is MySQL's constant `def`. `ROW_FORMAT` / `VERSION` /
+    // `TABLE_COMMENT` follow MySQL: a base table reports `Dynamic` / `10` /
+    // `''` (the same fixed values `SHOW TABLE STATUS` uses), while a view reports
+    // NULL / NULL / `VIEW` (as the ENGINE / TABLE_ROWS columns already treat a
+    // view as NULL). Site Health and migration tools select these columns.
     const SQL: &str = "SELECT \
+         'def' AS TABLE_CATALOG, \
          name AS TABLE_NAME, \
          'def' AS TABLE_SCHEMA, \
          CASE WHEN type = 'view' THEN NULL ELSE 'InnoDB' END AS ENGINE, \
          CASE WHEN type = 'view' THEN 'VIEW' ELSE 'BASE TABLE' END AS TABLE_TYPE, \
+         CASE WHEN type = 'view' THEN NULL ELSE 10 END AS VERSION, \
+         CASE WHEN type = 'view' THEN NULL ELSE 'Dynamic' END AS ROW_FORMAT, \
          CASE WHEN type = 'view' THEN NULL ELSE 0 END AS TABLE_ROWS, \
          CASE WHEN type = 'view' THEN NULL ELSE 0 END AS DATA_LENGTH, \
          CASE WHEN type = 'view' THEN NULL ELSE 0 END AS INDEX_LENGTH, \
          CASE WHEN type = 'table' AND sqlite_schema.sql LIKE '%AUTOINCREMENT%' \
               THEN (SELECT seq + 1 FROM sqlite_sequence \
                     WHERE sqlite_sequence.name = sqlite_schema.name) \
-              ELSE NULL END AS AUTO_INCREMENT \
+              ELSE NULL END AS AUTO_INCREMENT, \
+         CASE WHEN type = 'view' THEN 'VIEW' ELSE '' END AS TABLE_COMMENT \
          FROM sqlite_schema \
          WHERE type IN ('table', 'view') \
          AND name NOT LIKE 'sqlite_%' \
