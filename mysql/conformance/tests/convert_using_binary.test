@@ -1,0 +1,47 @@
+# CONVERT(expr USING binary) produces a binary (byte) string.
+#
+# The engine is single-charset, so CONVERT(expr USING <charset>) is a no-op
+# passthrough for a named text charset. But CONVERT(expr USING binary) is
+# different: in MySQL it yields a binary string whose bytes are unchanged but
+# whose type is a byte string, so LENGTH / CHAR_LENGTH count bytes and LEFT
+# truncates by byte rather than by character. The front-end dropped the charset
+# unconditionally, so `CHAR_LENGTH(CONVERT('café' USING binary))` was 4 (the
+# character count) instead of MySQL's 5 (the byte count). `USING binary` now
+# lowers to a BLOB cast.
+#
+# WordPress's wpdb::strip_invalid_text() relies on exactly this to truncate a
+# value to a byte length: CONVERT(LEFT(CONVERT(value USING binary), n) USING
+# charset). Expected to pass against both turso-mysql-server and a real mysqld.
+
+# A multibyte string converted to binary counts its bytes, not its characters
+# (`café` is 4 characters but 5 bytes: the `é` is two bytes).
+query
+SELECT CHAR_LENGTH(CONVERT('café' USING binary)), LENGTH(CONVERT('café' USING binary))
+----
+5	5
+
+# The bytes are unchanged: it still renders as the same text and hexes the same.
+query
+SELECT CONVERT('café' USING binary), HEX(CONVERT('café' USING binary))
+----
+café	636166C3A9
+
+# LEFT truncates the binary string by byte, so taking 3 bytes of `café` keeps
+# `caf` and splits before the multibyte `é`.
+query
+SELECT LEFT(CONVERT('café' USING binary), 3), HEX(LEFT(CONVERT('café' USING binary), 3))
+----
+caf	636166
+
+# The exact strip_invalid_text shape: truncate to a byte length, then read back
+# as text. Five bytes of `héllo wörld` is `héll` (h, é=2 bytes, l, l).
+query
+SELECT CONVERT(LEFT(CONVERT('héllo wörld' USING binary), 5) USING utf8mb4)
+----
+héll
+
+# A named text charset is still a passthrough: CHAR_LENGTH counts characters.
+query
+SELECT CHAR_LENGTH(CONVERT('café' USING utf8mb4)), CONVERT('café' USING latin1)
+----
+4	café

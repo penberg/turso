@@ -4397,17 +4397,29 @@ impl Parser {
     }
 
     /// Parses `CONVERT(...)`, which has two MySQL forms:
-    /// `CONVERT(expr USING charset)` coerces a string's charset — the engine is
-    /// single-charset (UTF-8), so the charset is dropped and the value passes
-    /// through unchanged — and `CONVERT(expr, type)` is identical to
-    /// `CAST(expr AS type)`. `CONVERT` has already been consumed.
+    /// `CONVERT(expr USING charset)` coerces a string's charset and
+    /// `CONVERT(expr, type)` is identical to `CAST(expr AS type)`. `CONVERT` has
+    /// already been consumed.
+    ///
+    /// The engine is single-charset (UTF-8), so a named text charset (`utf8mb4`,
+    /// `latin1`, …) is a no-op and the value passes through unchanged. The one
+    /// exception is `USING binary`, which in MySQL produces a *binary string*:
+    /// its bytes are unchanged but its type becomes a byte string, so `LENGTH` /
+    /// `CHAR_LENGTH` count bytes and `LEFT` truncates by byte rather than by
+    /// character (`CHAR_LENGTH(CONVERT('café' USING binary))` is 5, not 4). That
+    /// is exactly how WordPress's `strip_invalid_text` measures and truncates a
+    /// value, so `USING binary` lowers to a BLOB cast — the same lowering as
+    /// `CAST(expr AS BINARY)`.
     fn convert_expr(&mut self) -> Result<ast::Expr> {
         self.expect(&Token::LParen, "`(`")?;
         let expr = self.expr()?;
         if self.eat_keyword("USING") {
-            // Charset name (an identifier such as `utf8mb4`); consumed and dropped.
-            self.name()?;
+            // Charset name (an identifier such as `utf8mb4` or `binary`).
+            let charset = self.name()?;
             self.expect(&Token::RParen, "`)`")?;
+            if charset.as_str().eq_ignore_ascii_case("binary") {
+                return Ok(build_cast(expr, blob_type()));
+            }
             return Ok(expr);
         }
         self.expect(&Token::Comma, "`,` or `USING`")?;
@@ -9281,6 +9293,16 @@ fn char_truncated_cast(expr: ast::Expr, type_name: ast::Type, char_len: Option<i
             vec![cast, *numeric_expr("1"), *numeric_expr(&n.to_string())],
         ),
         None => cast,
+    }
+}
+
+/// The engine BLOB type, the target a MySQL `BINARY` cast / `CONVERT(... USING
+/// binary)` lowers to (a byte string).
+fn blob_type() -> ast::Type {
+    ast::Type {
+        name: "BLOB".to_string(),
+        size: None,
+        array_dimensions: 0,
     }
 }
 
@@ -16313,8 +16335,22 @@ mod tests {
 
     #[test]
     fn convert_using_drops_charset_and_type_form_is_a_cast() {
-        // CONVERT(expr USING charset) drops the charset and yields the bare expr.
+        // CONVERT(expr USING charset) drops a named text charset and yields the
+        // bare expr.
         assert_eq!(parse_expr("CONVERT(a USING utf8mb4)").unwrap(), col("a"));
+        assert_eq!(parse_expr("CONVERT(a USING latin1)").unwrap(), col("a"));
+        // CONVERT(expr USING binary) is the exception: it lowers to a BLOB cast
+        // (a byte string), exactly like CAST(expr AS BINARY), so length and LEFT
+        // operate on bytes. The charset name is case-insensitive.
+        assert_eq!(
+            parse_expr("CONVERT(a USING binary)").unwrap(),
+            parse_expr("CAST(a AS BINARY)").unwrap()
+        );
+        let ast::Expr::Cast { type_name, .. } = parse_expr("CONVERT(a USING BINARY)").unwrap()
+        else {
+            panic!("expected CONVERT(a USING binary) to parse as a Cast");
+        };
+        assert_eq!(type_name.unwrap().name, "BLOB");
         // CONVERT(expr, type) is the same as CAST(expr AS type): a non-integer
         // target is a plain Cast, ...
         let ast::Expr::Cast { type_name, .. } = parse_expr("CONVERT(a, CHAR)").unwrap() else {
