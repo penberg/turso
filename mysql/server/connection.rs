@@ -537,14 +537,27 @@ fn is_row_count_query(sql: &str) -> bool {
 /// modifier. The modifier always appears immediately after `SELECT`.
 fn has_sql_calc_found_rows(sql: &str) -> bool {
     let s = sql.trim_start();
-    if s.len() < 6 || !s[..6].eq_ignore_ascii_case("SELECT") {
+    // Compare the leading keyword on raw bytes. `s[..6]` is not guaranteed to
+    // land on a UTF-8 char boundary — a query whose text has a multibyte
+    // character straddling that index would panic the worker (a crash on any
+    // accented `SELECT`, common in WordPress content) — but a byte-slice never
+    // does, and `eq_ignore_ascii_case` on bytes folds the ASCII keyword.
+    if !s
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|kw| kw.eq_ignore_ascii_case(b"SELECT"))
+    {
         return false;
     }
+    // Byte 6 follows the ASCII "SELECT", so it is a char boundary.
     let after = s[6..].trim_start();
     const MODIFIER: &str = "SQL_CALC_FOUND_ROWS";
-    after.len() >= MODIFIER.len()
-        && after[..MODIFIER.len()].eq_ignore_ascii_case(MODIFIER)
-        // The next character must not extend the identifier.
+    after
+        .as_bytes()
+        .get(..MODIFIER.len())
+        .is_some_and(|m| m.eq_ignore_ascii_case(MODIFIER.as_bytes()))
+        // The next character must not extend the identifier. Byte MODIFIER.len()
+        // follows the matched ASCII modifier, so slicing there is boundary-safe.
         && after[MODIFIER.len()..]
             .chars()
             .next()
@@ -1315,6 +1328,44 @@ mod tests {
             "SELECT 1",
         ] {
             assert!(!is_row_count_query(sql), "should not match `{sql}`");
+        }
+    }
+
+    #[test]
+    fn detects_sql_calc_found_rows_modifier() {
+        for sql in [
+            "SELECT SQL_CALC_FOUND_ROWS a FROM t",
+            "  select   sql_calc_found_rows  a FROM t",
+            "SELECT SQL_CALC_FOUND_ROWS * FROM t LIMIT 2",
+        ] {
+            assert!(has_sql_calc_found_rows(sql), "should detect `{sql}`");
+        }
+        for sql in [
+            "SELECT a FROM t",
+            "SELECT SQL_CALC_FOUND_ROWSX a FROM t",
+            "UPDATE t SET a = 1",
+        ] {
+            assert!(!has_sql_calc_found_rows(sql), "should not detect `{sql}`");
+        }
+    }
+
+    #[test]
+    fn sql_calc_found_rows_detection_is_utf8_safe() {
+        // A multibyte character straddling the `SELECT`/modifier slice boundaries
+        // must not panic the worker — these once crashed the connection. The
+        // `é` here lands at byte 19 of the text after `SELECT `, exactly the
+        // length of `SQL_CALC_FOUND_ROWS`.
+        for sql in [
+            "SELECT 'aaaaaaaaaaaaaaaaaé'",
+            "SÉLECT cölumn FROM tÄble",
+            "SELECT '日本語のテキスト'",
+            "héllo",
+            "🦀",
+            "",
+        ] {
+            // The assertion is that the call returns at all (no panic); the value
+            // is incidental — none of these begin with the modifier.
+            assert!(!has_sql_calc_found_rows(sql), "should not detect `{sql}`");
         }
     }
 

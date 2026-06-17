@@ -1,0 +1,45 @@
+# A SELECT whose text contains a multibyte UTF-8 character must not crash.
+#
+# Before dispatching a statement the server checks the raw SQL text for the
+# SQL_CALC_FOUND_ROWS modifier by slicing the bytes after SELECT. The slice
+# (`after[..19]`, the length of "SQL_CALC_FOUND_ROWS") was taken without
+# respecting UTF-8 char boundaries, so a SELECT whose text had a multibyte
+# character straddling byte 19 panicked the connection worker ("byte index 19 is
+# not a char boundary") -- the client saw "Lost connection to server during
+# query". WordPress content is full of accented and non-Latin text, so this
+# crashed ordinary queries. The check now compares on raw bytes, which can never
+# split a character.
+#
+# In the first query the `é` lands exactly at byte 19 of the text after
+# `SELECT ` (17 leading 'a's plus the opening quote), the offset that used to
+# panic. Expected to pass against both turso-mysql-server and a real mysqld.
+
+# The exact byte-19 straddle that triggered the crash.
+query
+SELECT 'aaaaaaaaaaaaaaaaaé'
+----
+aaaaaaaaaaaaaaaaaé
+
+# Other multibyte payloads at assorted offsets, all returned verbatim.
+query
+SELECT '日本語のテキスト'
+----
+日本語のテキスト
+
+query
+SELECT 'café', 'naïve', 'Ω≈ç√'
+----
+café	naïve	Ω≈ç√
+
+# Cyrillic text in a SELECT, returned verbatim.
+query
+SELECT 'Это текст на русском языке'
+----
+Это текст на русском языке
+
+# A multibyte character right after the SELECT list, exercising the `SELECT `
+# keyword-boundary byte check.
+query
+SELECT 'ключ' = 'ключ'
+----
+1
