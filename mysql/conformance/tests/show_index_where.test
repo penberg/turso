@@ -7,8 +7,9 @@
 # built rows accordingly.
 #
 # Like the base SHOW INDEX output (see show_index.test), these rows are the
-# engine's representation (Cardinality NULL, etc.) and are NOT byte-identical to
-# a real mysqld; they exercise the front-end's filtering only.
+# engine's representation (Cardinality 0, Sub_part/Packed NULL); a single-index
+# filter is byte-identical to a real mysqld, while a multi-index filter differs
+# only in row order (the engine's PRAGMA order vs MySQL's PRIMARY-first).
 
 statement ok
 CREATE TABLE IF NOT EXISTS siw (id INT PRIMARY KEY, a INT, b INT)
@@ -23,27 +24,27 @@ CREATE UNIQUE INDEX siw_b ON siw (b)
 query
 SHOW INDEX FROM siw WHERE Key_name = 'siw_a'
 ----
-siw	1	siw_a	1	a	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+siw	1	siw_a	1	a	A	0	NULL	NULL	YES	BTREE			YES	NULL
 
 # The no-space form WordPress emits, selecting the primary key.
 query
 SHOW INDEX FROM siw WHERE Key_name='PRIMARY'
 ----
-siw	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+siw	0	PRIMARY	1	id	A	0	NULL	NULL		BTREE			YES	NULL
 
 # A `LIKE` pattern matches the two secondary indexes (PRAGMA order).
 query
 SHOW INDEX FROM siw WHERE Key_name LIKE 'siw%'
 ----
-siw	0	siw_b	1	b	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-siw	1	siw_a	1	a	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+siw	0	siw_b	1	b	A	0	NULL	NULL	YES	BTREE			YES	NULL
+siw	1	siw_a	1	a	A	0	NULL	NULL	YES	BTREE			YES	NULL
 
 # A filter on a non-string column (the unique indexes plus the primary key).
 query
 SHOW INDEX FROM siw WHERE Non_unique = 0
 ----
-siw	0	siw_b	1	b	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-siw	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+siw	0	siw_b	1	b	A	0	NULL	NULL	YES	BTREE			YES	NULL
+siw	0	PRIMARY	1	id	A	0	NULL	NULL		BTREE			YES	NULL
 
 # A predicate that matches nothing yields an empty result.
 query

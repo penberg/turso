@@ -1,0 +1,35 @@
+# SHOW INDEX reports Cardinality 0 (not NULL) for the engine's indexes.
+#
+# MySQL's SHOW INDEX `Cardinality` is the estimated number of distinct values; on
+# an unanalyzed or empty table it is 0, never NULL. The front-end keeps no index
+# statistics and reported NULL, which both diverged from MySQL and was
+# inconsistent with information_schema.STATISTICS, whose `CARDINALITY` was already
+# 0 for the same indexes. SHOW INDEX now reports 0 too.
+#
+# Each query selects a single index (by WHERE Key_name) so its one row is order-
+# independent and byte-identical to a real mysqld. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE sic (id INT PRIMARY KEY, slug VARCHAR(40), n INT)
+
+statement ok
+CREATE INDEX sic_n ON sic (n)
+
+# The primary key reports Cardinality 0 (7th column), with Sub_part / Packed NULL.
+query
+SHOW INDEX FROM sic WHERE Key_name = 'PRIMARY'
+----
+sic	0	PRIMARY	1	id	A	0	NULL	NULL		BTREE			YES	NULL
+
+# A secondary index likewise reports Cardinality 0.
+query
+SHOW INDEX FROM sic WHERE Key_name = 'sic_n'
+----
+sic	1	sic_n	1	n	A	0	NULL	NULL	YES	BTREE			YES	NULL
+
+# The same value appears in information_schema.STATISTICS for the secondary index.
+query
+SELECT CARDINALITY FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sic' AND INDEX_NAME = 'sic_n'
+----
+0

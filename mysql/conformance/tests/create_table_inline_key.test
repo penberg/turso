@@ -9,8 +9,9 @@
 # a column prefix length (`col(191)`) is dropped (the whole column is indexed).
 #
 # The SHOW INDEX rows are the schema-derived columns (see show_index.test):
-# Cardinality/Sub_part/Packed are NULL and the row order is unspecified, so each
-# index is checked with a `WHERE Key_name = ...` filter. Uses its own table name.
+# Cardinality is 0, Sub_part/Packed are NULL, and the row order is unspecified, so
+# each index is checked with a `WHERE Key_name = ...` filter. Uses its own table
+# name.
 
 statement ok
 CREATE TABLE IF NOT EXISTS ikd (id INT PRIMARY KEY, a INT, b INT, c INT, KEY ikd_a (a), KEY ikd_bc (b, c))
@@ -19,14 +20,14 @@ CREATE TABLE IF NOT EXISTS ikd (id INT PRIMARY KEY, a INT, b INT, c INT, KEY ikd
 query
 SHOW INDEX FROM ikd WHERE Key_name = 'ikd_a'
 ----
-ikd	1	ikd_a	1	a	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+ikd	1	ikd_a	1	a	A	0	NULL	NULL	YES	BTREE			YES	NULL
 
 # The composite inline key has one row per column, in declaration order.
 query
 SHOW INDEX FROM ikd WHERE Key_name = 'ikd_bc'
 ----
-ikd	1	ikd_bc	1	b	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-ikd	1	ikd_bc	2	c	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+ikd	1	ikd_bc	1	b	A	0	NULL	NULL	YES	BTREE			YES	NULL
+ikd	1	ikd_bc	2	c	A	0	NULL	NULL	YES	BTREE			YES	NULL
 
 # Since the inline index already exists, re-adding it by the same name fails
 # (it would not, if the inline key had been dropped at CREATE TABLE).

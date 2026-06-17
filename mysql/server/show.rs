@@ -952,8 +952,11 @@ fn index_row(
         Some(seq.to_string()),
         Some(column.to_string()),
         Some("A".to_string()), // Collation (ascending)
-        None,                  // Cardinality (the engine has no index statistics)
-        None,                  // Sub_part (no prefix length tracked)
+        // Cardinality: the engine keeps no index statistics, so report 0 — the
+        // value MySQL gives for an unanalyzed/empty table, and the value
+        // `information_schema.STATISTICS` already reports for the same indexes.
+        Some("0".to_string()),
+        None, // Sub_part (no prefix length tracked)
         None,                  // Packed
         Some(null.to_string()),
         Some("BTREE".to_string()), // Index_type
@@ -966,9 +969,10 @@ fn index_row(
 
 /// Reads the table's indexes via `PRAGMA index_list` / `index_info` and reshapes
 /// them into the MySQL `SHOW INDEX` result set. The engine keeps no index
-/// statistics, so `Cardinality` is reported as NULL (likewise `Sub_part`,
-/// `Packed`, `Expression`); `Collation` is `A`, `Index_type` is `BTREE`, and
-/// `Visible` is `YES`. A primary key is reported under MySQL's `PRIMARY` name,
+/// statistics, so `Cardinality` is reported as `0` (matching MySQL on an
+/// unanalyzed/empty table and `information_schema.STATISTICS`), while `Sub_part`,
+/// `Packed`, and `Expression` are NULL; `Collation` is `A`, `Index_type` is
+/// `BTREE`, and `Visible` is `YES`. A primary key is reported under MySQL's `PRIMARY` name,
 /// including the rowid-alias integer primary key the engine keeps out of
 /// `index_list`. `dbDelta()` reads this output to learn which indexes exist.
 fn build_index(conn: &Arc<Connection>, show: &ShowIndex) -> Result<ShowOutcome, LimboError> {

@@ -6,13 +6,14 @@
 # Index_comment, Visible, Expression). WordPress's dbDelta() reads it -- by
 # column name, order-independently -- to learn which indexes already exist.
 #
-# This is the engine's representation of that output and is NOT byte-identical
-# to a real mysqld: the engine keeps no index statistics, so Cardinality (and
-# Sub_part / Packed / Expression) is NULL; Collation is 'A', Index_type 'BTREE',
-# Visible 'YES'; and the row order follows the engine's PRAGMA order rather than
-# MySQL's PRIMARY-first ordering. The values dbDelta keys on (Key_name,
-# Column_name, Non_unique, Seq_in_index) match. The PRIMARY KEY is reported under
-# the name PRIMARY with Null=''.
+# This is the engine's representation of that output. The engine keeps no index
+# statistics, so Cardinality is 0 (as MySQL reports for an unanalyzed/empty table
+# and as information_schema.STATISTICS reports), while Sub_part / Packed /
+# Expression are NULL; Collation is 'A', Index_type 'BTREE', Visible 'YES'. It is
+# NOT byte-identical to a real mysqld only in the row order, which follows the
+# engine's PRAGMA order rather than MySQL's PRIMARY-first ordering. The values
+# dbDelta keys on (Key_name, Column_name, Non_unique, Seq_in_index) match. The
+# PRIMARY KEY is reported under the name PRIMARY with Null=''.
 
 statement ok
 CREATE TABLE IF NOT EXISTS si_demo (id INT PRIMARY KEY, email VARCHAR(40), tag VARCHAR(20) NOT NULL)
@@ -28,17 +29,17 @@ CREATE INDEX si_tag_idx ON si_demo (tag)
 query
 SHOW INDEX FROM si_demo
 ----
-si_demo	1	si_tag_idx	1	tag	A	NULL	NULL	NULL		BTREE			YES	NULL
-si_demo	0	si_email_u	1	email	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-si_demo	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+si_demo	1	si_tag_idx	1	tag	A	0	NULL	NULL		BTREE			YES	NULL
+si_demo	0	si_email_u	1	email	A	0	NULL	NULL	YES	BTREE			YES	NULL
+si_demo	0	PRIMARY	1	id	A	0	NULL	NULL		BTREE			YES	NULL
 
 # SHOW KEYS is a synonym.
 query
 SHOW KEYS FROM si_demo
 ----
-si_demo	1	si_tag_idx	1	tag	A	NULL	NULL	NULL		BTREE			YES	NULL
-si_demo	0	si_email_u	1	email	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-si_demo	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+si_demo	1	si_tag_idx	1	tag	A	0	NULL	NULL		BTREE			YES	NULL
+si_demo	0	si_email_u	1	email	A	0	NULL	NULL	YES	BTREE			YES	NULL
+si_demo	0	PRIMARY	1	id	A	0	NULL	NULL		BTREE			YES	NULL
 
 # A compound unique index reports one row per column, in key order.
 statement ok
@@ -47,11 +48,11 @@ CREATE UNIQUE INDEX si_pair ON si_demo (email, tag)
 query
 SHOW INDEX FROM si_demo
 ----
-si_demo	0	si_pair	1	email	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-si_demo	0	si_pair	2	tag	A	NULL	NULL	NULL		BTREE			YES	NULL
-si_demo	1	si_tag_idx	1	tag	A	NULL	NULL	NULL		BTREE			YES	NULL
-si_demo	0	si_email_u	1	email	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
-si_demo	0	PRIMARY	1	id	A	NULL	NULL	NULL		BTREE			YES	NULL
+si_demo	0	si_pair	1	email	A	0	NULL	NULL	YES	BTREE			YES	NULL
+si_demo	0	si_pair	2	tag	A	0	NULL	NULL		BTREE			YES	NULL
+si_demo	1	si_tag_idx	1	tag	A	0	NULL	NULL		BTREE			YES	NULL
+si_demo	0	si_email_u	1	email	A	0	NULL	NULL	YES	BTREE			YES	NULL
+si_demo	0	PRIMARY	1	id	A	0	NULL	NULL		BTREE			YES	NULL
 
 # SHOW INDEX on a missing table errors (MySQL 1146).
 statement error

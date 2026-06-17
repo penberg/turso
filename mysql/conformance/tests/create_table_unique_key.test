@@ -7,7 +7,7 @@
 # the table -- preserving the name while still enforcing uniqueness. An *unnamed*
 # UNIQUE (cols) stays a table constraint (its index is auto-named).
 #
-# The SHOW INDEX row is the schema-derived form (Cardinality/Sub_part NULL, see
+# The SHOW INDEX row is the schema-derived form (Cardinality 0, Sub_part NULL, see
 # show_index.test), checked with a WHERE filter. Uses its own table name.
 
 statement ok
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS uqkey (id INT PRIMARY KEY, slug VARCHAR(50), UNIQUE K
 query
 SHOW INDEX FROM uqkey WHERE Key_name = 'uqkey_slug'
 ----
-uqkey	0	uqkey_slug	1	slug	A	NULL	NULL	NULL	YES	BTREE			YES	NULL
+uqkey	0	uqkey_slug	1	slug	A	0	NULL	NULL	YES	BTREE			YES	NULL
 
 # The Key column of SHOW COLUMNS reports the column as UNI.
 query
