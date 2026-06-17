@@ -1,14 +1,17 @@
-# CONVERT_TZ with the named zone 'UTC' / 'GMT'.
+# CONVERT_TZ with the named zones 'UTC' / 'GMT' / 'SYSTEM'.
 #
 # CONVERT_TZ(dt, from_tz, to_tz) shifts a datetime between time zones. The
 # front-end lowers it to numeric ±HH:MM-offset arithmetic, so a numeric offset
-# works but a named zone yielded NULL. MySQL accepts the named zones 'UTC' and
-# 'GMT' even without the optional time-zone tables loaded, so the front-end now
-# normalizes those literals to the +00:00 offset.
+# works but a named zone yielded NULL. The front-end now normalizes the zones the
+# engine resolves to UTC -- 'UTC' / 'GMT' (universal, available without the
+# optional time-zone tables) and 'SYSTEM' (the server's own zone, which is UTC for
+# this engine and the value @@time_zone reports) -- to the +00:00 offset, so
+# `CONVERT_TZ(dt, '+00:00', @@time_zone)` also works.
 #
 # (Other named zones like 'America/New_York' still need the time-zone tables the
-# engine lacks, so they remain NULL; not exercised here.) Expected to pass against
-# both turso-mysql-server and a real mysqld.
+# engine lacks, so they remain NULL; not exercised here. The conformance MySQL
+# container's system time zone is UTC.) Expected to pass against both
+# turso-mysql-server and a real mysqld.
 
 # UTC -> UTC is the identity.
 query
@@ -38,3 +41,22 @@ query
 SELECT CONVERT_TZ('2024-06-15 12:00:00', '+00:00', '-08:00')
 ----
 2024-06-15 04:00:00
+
+# 'SYSTEM' (the engine's UTC server zone) combines with a numeric offset.
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', 'SYSTEM', '+02:00')
+----
+2024-06-15 14:00:00
+
+# The @@time_zone session variable folds to 'SYSTEM', so converting to/from it
+# works -- here a no-op since both sides resolve to UTC.
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', '+00:00', @@time_zone)
+----
+2024-06-15 12:00:00
+
+# 'SYSTEM' to 'UTC' is the identity (both resolve to +00:00).
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', 'system', 'utc')
+----
+2024-06-15 12:00:00
