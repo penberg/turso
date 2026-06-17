@@ -1,0 +1,55 @@
+# A function result compared to a number is coerced to a number.
+#
+# MySQL coerces a string operand to a number when comparing it to a number, so
+# `'12.3' = 12.3` is true. The engine compares a string and a number by type, so
+# they never compare equal -- which broke WP_Date_Query: a time filter compiles
+# to `DATE_FORMAT(post_date, '%H.%i%s') = 12.3045`, where DATE_FORMAT returns the
+# string '12.3045' and the comparison was always false. The front-end now
+# evaluates a function call in a numeric context (adds `+ 0`) when it is compared
+# to a numeric literal, so the comparison is numeric as MySQL does.
+#
+# Only a *function* operand is coerced -- a bare column is left untouched so the
+# coercion never defeats an index (the general string/number divergence on a
+# column stays, documented in mysql/COMPAT.md). Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+# The DATE_FORMAT time idiom WP_Date_Query emits, with each comparison operator.
+query
+SELECT DATE_FORMAT('2024-06-17 12:30:45', '%H.%i%s') = 12.3045, DATE_FORMAT('2024-06-17 12:30:45', '%H') = 12
+----
+1	1
+
+query
+SELECT DATE_FORMAT('2024-06-17 09:05:03', '%H.%i%s') > 9.0, DATE_FORMAT('2024-06-17 09:05:03', '%H.%i%s') <= 9.0503
+----
+1	1
+
+query
+SELECT DATE_FORMAT('2024-06-17 09:05:03', '%H.%i%s') <> 12.3045, 12.3045 = DATE_FORMAT('2024-06-17 12:30:45', '%H.%i%s')
+----
+1	1
+
+# A numeric-valued function compared to a number is unaffected (the coercion is a
+# no-op), and a non-numeric string folds to 0 as MySQL does.
+query
+SELECT LENGTH('hello') = 5, CONCAT('a', 'b') = 5
+----
+1	0
+
+# The WP_Date_Query shape against a real column.
+statement ok
+CREATE TABLE dfcoerce (ID INT PRIMARY KEY, post_date DATETIME)
+
+statement ok
+INSERT INTO dfcoerce VALUES (1, '2024-06-17 12:30:45'), (2, '2024-06-17 09:05:03'), (3, '2024-06-18 00:15:00')
+
+query
+SELECT ID FROM dfcoerce WHERE DATE_FORMAT(post_date, '%H.%i%s') = 12.3045
+----
+1
+
+query
+SELECT ID FROM dfcoerce WHERE DATE_FORMAT(post_date, '%H.%i%s') >= 9.0 AND DATE_FORMAT(post_date, '%H.%i%s') < 13.0 ORDER BY ID
+----
+1
+2

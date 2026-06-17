@@ -3773,7 +3773,23 @@ impl Parser {
             } else {
                 rhs
             };
-            lhs = ast::Expr::binary(lhs, op, rhs);
+            // MySQL coerces a string operand to a number when comparing it to a
+            // number (`'12.3' = 12.3` is true), but the engine compares a string
+            // and a number by type, so they never compare equal. When one side is
+            // a numeric literal and the other is a function call — whose result is
+            // computed, not read from a column, so adding `+ 0` does not defeat an
+            // index the way wrapping a bare column would — evaluate the call in a
+            // numeric context so the comparison is numeric, as MySQL does. This is
+            // what `WP_Date_Query` relies on: a time filter compiles to
+            // `DATE_FORMAT(post_date, '%H.%i%s') = 12.3045`.
+            let (lhs_operand, rhs) = if is_numeric_literal(&rhs) && is_function_call(&lhs) {
+                (numeric_coerce(lhs), rhs)
+            } else if is_numeric_literal(&lhs) && is_function_call(&rhs) {
+                (lhs, numeric_coerce(rhs))
+            } else {
+                (lhs, rhs)
+            };
+            lhs = ast::Expr::binary(lhs_operand, op, rhs);
         }
     }
 
@@ -9094,6 +9110,27 @@ fn is_string_literal(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Literal(ast::Literal::String(_)))
 }
 
+/// Whether `expr` is a bare numeric literal (`12`, `12.3`).
+fn is_numeric_literal(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Literal(ast::Literal::Numeric(_)))
+}
+
+/// Whether `expr` is a function call (`DATE_FORMAT(...)`, `LENGTH(...)`), whose
+/// result is computed rather than read from a (possibly indexed) column.
+fn is_function_call(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::FunctionCall { .. } | ast::Expr::FunctionCallStar { .. }
+    )
+}
+
+/// Wraps `expr` in `+ 0` so the engine evaluates it in a numeric context,
+/// coercing a string result to its numeric value (`'12.3'` → `12.3`,
+/// `'abc'` → `0`) as MySQL does when comparing a string to a number.
+fn numeric_coerce(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::binary(expr, ast::Operator::Add, *numeric_expr("0"))
+}
+
 /// Concatenates `pieces` with a *balanced* `||` tree, so the AST stays shallow
 /// (depth ~log₂ n) instead of the depth-n chain a left-linear fold builds —
 /// keeping a long argument list under the engine's expression-evaluator stack
@@ -12509,6 +12546,47 @@ mod tests {
             panic!("expected an equality comparison");
         };
         assert!(matches!(*rhs, ast::Expr::Literal(ast::Literal::Numeric(_))));
+    }
+
+    #[test]
+    fn function_compared_to_number_is_coerced() {
+        // `f(...) = 12.3` adds `+ 0` to the function so the comparison is numeric,
+        // as MySQL coerces a string result to a number.
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, _) =
+            parse_expr("DATE_FORMAT(x, '%H.%i%s') = 12.3045").unwrap()
+        else {
+            panic!("expected an equality comparison");
+        };
+        assert!(
+            matches!(&*lhs, ast::Expr::Binary(_, ast::Operator::Add, z)
+                if matches!(&**z, ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0")),
+            "the function operand should be wrapped in `+ 0`"
+        );
+
+        // The coercion applies on whichever side is the number, for any comparison
+        // operator.
+        let ast::Expr::Binary(_, ast::Operator::Greater, rhs) =
+            parse_expr("10 > LENGTH(x)").unwrap()
+        else {
+            panic!("expected a greater-than comparison");
+        };
+        assert!(matches!(&*rhs, ast::Expr::Binary(_, ast::Operator::Add, _)));
+
+        // A bare column compared to a number is NOT coerced (coercing it would
+        // defeat an index); it stays a plain column reference.
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, _) = parse_expr("col = 5").unwrap()
+        else {
+            panic!("expected an equality comparison");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Column { .. } | ast::Expr::Id(_)));
+
+        // Two functions, or a function vs a non-numeric literal, are not coerced.
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, _) =
+            parse_expr("LENGTH(x) = 'a'").unwrap()
+        else {
+            panic!("expected an equality comparison");
+        };
+        assert!(matches!(&*lhs, ast::Expr::FunctionCall { .. }));
     }
 
     #[test]
