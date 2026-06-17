@@ -54,6 +54,13 @@ const ER_CANT_DROP_FIELD_OR_KEY: u16 = 1091;
 /// `ER_WRONG_VALUE_COUNT_ON_ROW`: an `INSERT` row supplied a number of values
 /// that does not match the column count.
 const ER_WRONG_VALUE_COUNT_ON_ROW: u16 = 1136;
+/// `ER_MULTIPLE_PRI_KEY`: a `CREATE TABLE` declared more than one primary key.
+const ER_MULTIPLE_PRI_KEY: u16 = 1068;
+/// `ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT`: the two sides of a `UNION` (etc.)
+/// select a different number of columns.
+const ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT: u16 = 1222;
+/// `ER_CHECK_CONSTRAINT_VIOLATED`: a write violated a `CHECK` constraint.
+const ER_CHECK_CONSTRAINT_VIOLATED: u16 = 3819;
 
 /// Wraps the blocking socket with a frame decoder and a write buffer.
 struct Wire {
@@ -1032,6 +1039,8 @@ fn error_code_and_state(error: &LimboError) -> (u16, [u8; 5]) {
                 (ER_DUP_ENTRY, *b"23000")
             } else if msg.contains("NOT NULL CONSTRAINT") {
                 (ER_BAD_NULL_ERROR, *b"23000")
+            } else if msg.contains("CHECK CONSTRAINT") {
+                (ER_CHECK_CONSTRAINT_VIOLATED, *b"HY000")
             } else {
                 (ER_ERROR_GENERAL, *b"HY000")
             }
@@ -1056,6 +1065,15 @@ fn error_code_and_state(error: &LimboError) -> (u16, [u8; 5]) {
                 // `INSERT` with a row whose value count != the column count
                 // ("table t has N columns but M values were supplied").
                 (ER_WRONG_VALUE_COUNT_ON_ROW, *b"21S01")
+            } else if msg.contains("term out of range") {
+                // An `ORDER BY` / `GROUP BY` positional column past the select
+                // list — MySQL reports it as an unknown column.
+                (ER_BAD_FIELD_ERROR, *b"42S22")
+            } else if msg.contains("same number of result columns") {
+                // The two sides of a `UNION` select different column counts.
+                (ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, *b"21000")
+            } else if msg.contains("more than one primary key") {
+                (ER_MULTIPLE_PRI_KEY, *b"42000")
             } else {
                 (ER_ERROR_GENERAL, *b"HY000")
             }
@@ -1187,6 +1205,34 @@ mod tests {
                 ER_WRONG_VALUE_COUNT_ON_ROW,
                 *b"21S01",
             ),
+            // A CHECK constraint violation (a runtime `Constraint`).
+            (
+                LimboError::Constraint("CHECK constraint failed: age >= 0 (19)".into()),
+                ER_CHECK_CONSTRAINT_VIOLATED,
+                *b"HY000",
+            ),
+            // An out-of-range positional `ORDER BY` / `GROUP BY` column.
+            (
+                LimboError::ParseError("1st ORDER BY term out of range".into()),
+                ER_BAD_FIELD_ERROR,
+                *b"42S22",
+            ),
+            // A `UNION` whose sides select different column counts.
+            (
+                LimboError::ParseError(
+                    "SELECTs to the left and right of UNION do not have the same number of result \
+                     columns"
+                        .into(),
+                ),
+                ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                *b"21000",
+            ),
+            // More than one primary key in a `CREATE TABLE`.
+            (
+                LimboError::ParseError("table \"t\" has more than one primary key".into()),
+                ER_MULTIPLE_PRI_KEY,
+                *b"42000",
+            ),
         ];
         for (err, code, state) in cases {
             assert_eq!(error_code_and_state(&err), (code, state), "for {err:?}");
@@ -1197,9 +1243,9 @@ mod tests {
             error_code_and_state(&LimboError::InternalError("boom".into())),
             (ER_ERROR_GENERAL, *b"HY000")
         );
-        // A CHECK constraint is a constraint but not one we map specifically.
+        // An unrecognized constraint keeps the generic code and SQLSTATE.
         assert_eq!(
-            error_code_and_state(&LimboError::Constraint("CHECK constraint failed".into())),
+            error_code_and_state(&LimboError::Constraint("FOREIGN KEY constraint failed".into())),
             (ER_ERROR_GENERAL, *b"HY000")
         );
     }

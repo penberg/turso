@@ -1,0 +1,41 @@
+# Schema/query semantic error codes.
+#
+# MySQL gives several schema- and query-level failures specific error numbers
+# that tools and `$wpdb` branch on via mysql_errno(): a CHECK constraint
+# violation is ER_CHECK_CONSTRAINT_VIOLATED (3819), an out-of-range positional
+# ORDER BY / GROUP BY column is ER_BAD_FIELD_ERROR (1054, "Unknown column"), a
+# UNION whose sides select different column counts is
+# ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT (1222), and more than one primary key in a
+# CREATE TABLE is ER_MULTIPLE_PRI_KEY (1068). The front-end collapsed all of
+# these to the generic 1105.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (the
+# `statement error <code>` directive pins the MySQL error number, so the differing
+# message text does not matter). Uses file-unique table names.
+
+statement ok
+CREATE TABLE semerr (id INT PRIMARY KEY, age INT CHECK (age >= 0))
+
+# A CHECK constraint violation is 3819.
+statement error 3819
+INSERT INTO semerr VALUES (1, -5)
+
+# A value that satisfies the constraint inserts.
+statement ok
+INSERT INTO semerr VALUES (1, 5)
+
+# A positional ORDER BY / GROUP BY column past the select list is "Unknown
+# column" (1054).
+statement error 1054
+SELECT id FROM semerr ORDER BY 99
+
+statement error 1054
+SELECT id FROM semerr GROUP BY 99
+
+# A UNION whose branches select different column counts is 1222.
+statement error 1222
+SELECT id FROM semerr UNION SELECT id, age FROM semerr
+
+# More than one primary key in CREATE TABLE is 1068.
+statement error 1068
+CREATE TABLE semerr_pk (a INT PRIMARY KEY, b INT PRIMARY KEY)
