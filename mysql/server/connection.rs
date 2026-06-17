@@ -51,6 +51,9 @@ const ER_DUP_FIELDNAME: u16 = 1060;
 /// `ER_CANT_DROP_FIELD_OR_KEY`: a `DROP INDEX` / `DROP COLUMN` named one that
 /// does not exist.
 const ER_CANT_DROP_FIELD_OR_KEY: u16 = 1091;
+/// `ER_WRONG_VALUE_COUNT_ON_ROW`: an `INSERT` row supplied a number of values
+/// that does not match the column count.
+const ER_WRONG_VALUE_COUNT_ON_ROW: u16 = 1136;
 
 /// Wraps the blocking socket with a frame decoder and a write buffer.
 struct Wire {
@@ -1049,6 +1052,10 @@ fn error_code_and_state(error: &LimboError) -> (u16, [u8; 5]) {
                 (ER_DUP_KEYNAME, *b"42000")
             } else if msg.contains("already exists") {
                 (ER_TABLE_EXISTS_ERROR, *b"42S01")
+            } else if msg.contains("values were supplied") {
+                // `INSERT` with a row whose value count != the column count
+                // ("table t has N columns but M values were supplied").
+                (ER_WRONG_VALUE_COUNT_ON_ROW, *b"21S01")
             } else {
                 (ER_ERROR_GENERAL, *b"HY000")
             }
@@ -1173,6 +1180,12 @@ mod tests {
                 LimboError::InvalidArgument("No such index: k".into()),
                 ER_CANT_DROP_FIELD_OR_KEY,
                 *b"42000",
+            ),
+            // An `INSERT` whose value count does not match the column count.
+            (
+                LimboError::ParseError("table t has 3 columns but 1 values were supplied".into()),
+                ER_WRONG_VALUE_COUNT_ON_ROW,
+                *b"21S01",
             ),
         ];
         for (err, code, state) in cases {
