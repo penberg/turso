@@ -1,0 +1,50 @@
+# SHOW VARIABLES renders a boolean variable's value as ON / OFF.
+#
+# MySQL's SHOW VARIABLES displays a BOOLEAN-typed system variable as ON / OFF,
+# while `SELECT @@var` returns 1 / 0. The front-end answers SHOW VARIABLES from
+# its value table, which stores 1 / 0, and previously showed those raw — so the
+# Value column differed from a real mysqld for boolean variables. It now renders
+# a boolean variable as ON / OFF (and an integer-valued flag still shows its
+# number).
+#
+# Uses boolean variables whose front-end value equals a WordPress-configured
+# mysqld's. Expected to pass against both turso-mysql-server and a real mysqld.
+
+# Boolean variables read ON when set, OFF when clear.
+query
+SHOW VARIABLES LIKE 'autocommit'
+----
+autocommit	ON
+
+query
+SHOW VARIABLES LIKE 'foreign_key_checks'
+----
+foreign_key_checks	ON
+
+query
+SHOW VARIABLES LIKE 'unique_checks'
+----
+unique_checks	ON
+
+query
+SHOW VARIABLES LIKE 'sql_safe_updates'
+----
+sql_safe_updates	OFF
+
+query
+SHOW VARIABLES LIKE 'big_tables'
+----
+big_tables	OFF
+
+# `SELECT @@var` still returns the numeric 1 / 0 (not ON / OFF), as in MySQL.
+query
+SELECT @@autocommit, @@sql_safe_updates
+----
+1	0
+
+# A WHERE filter on the Value column matches the rendered ON / OFF text, as MySQL
+# evaluates it; an integer flag keeps its number.
+query
+SHOW VARIABLES WHERE Variable_name = 'lower_case_table_names'
+----
+lower_case_table_names	0

@@ -6,11 +6,11 @@
 # (the same table that backs `SELECT @@var`), returning the MySQL-shaped
 # `Variable_name` / `Value` result set ordered by name. The `LIKE` pattern uses
 # SQL wildcards (`%`, `_`) and is case-insensitive; an unknown variable yields an
-# empty result set (so get_mysql_var returns null). The `WHERE` form is not
-# handled and is left to the parser (rejected).
+# empty result set (so get_mysql_var returns null). A boolean variable's value
+# is rendered ON/OFF, as a real mysqld does.
 #
 # The asserted values are front-end constants chosen to also match a
-# WordPress-configured mysqld (autocommit on, utf8mb4 client charset). Bare
+# WordPress-configured mysqld (autocommit ON, utf8mb4 client charset). Bare
 # `SHOW VARIABLES` is intentionally not asserted (a real mysqld returns hundreds
 # of rows). This test needs no tables.
 
@@ -18,13 +18,13 @@
 query
 SHOW VARIABLES LIKE 'autocommit'
 ----
-autocommit	1
+autocommit	ON
 
 # The GLOBAL / SESSION scope is accepted (and ignored).
 query
 SHOW SESSION VARIABLES LIKE 'autocommit'
 ----
-autocommit	1
+autocommit	ON
 
 query
 SHOW GLOBAL VARIABLES LIKE 'max_allowed_packet'
@@ -42,13 +42,13 @@ character_set_connection	utf8mb4
 query
 SHOW VARIABLES LIKE 'AUTOCOMMIT'
 ----
-autocommit	1
+autocommit	ON
 
 # A `_` wildcard matches a single character.
 query
 SHOW VARIABLES LIKE 'autocommi_'
 ----
-autocommit	1
+autocommit	ON
 
 # An unknown variable yields an empty result set.
 query

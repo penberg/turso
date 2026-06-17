@@ -1804,18 +1804,22 @@ fn parse_show_variables(sql: &str) -> Option<ShowVariables> {
 }
 
 /// Builds the `SHOW VARIABLES` result set (`Variable_name`, `Value`) from the
-/// shared system-variable table, filtered by the optional `LIKE` pattern and
-/// ordered by name as MySQL reports it.
+/// shared system-variable table, filtered by the optional `LIKE` pattern and/or
+/// `WHERE` predicate and ordered by name as MySQL reports it. A boolean
+/// variable's value is rendered `ON`/`OFF` (see [`render_variable_value`]); the
+/// `WHERE` predicate over `Value` matches against that rendered text, as MySQL
+/// does.
 fn build_variables(show: &ShowVariables) -> ColumnsResult {
     let mut rows: Vec<Vec<Option<String>>> = crate::session::SYSTEM_VARIABLES
         .iter()
+        .map(|(name, value)| (*name, render_variable_value(name, value)))
         .filter(|(name, _)| match &show.like {
             Some(pattern) => like_match(pattern, name),
             None => true,
         })
-        .filter(|(name, value)| match &show.where_filter {
+        .filter(|(name, rendered)| match &show.where_filter {
             Some(f) => {
-                let target = if f.on_value { value } else { name };
+                let target = if f.on_value { rendered.as_str() } else { *name };
                 if f.like {
                     like_match(&f.value, target)
                 } else {
@@ -1824,13 +1828,49 @@ fn build_variables(show: &ShowVariables) -> ColumnsResult {
             }
             None => true,
         })
-        .map(|(name, value)| vec![Some((*name).to_string()), Some((*value).to_string())])
+        .map(|(name, rendered)| vec![Some(name.to_string()), Some(rendered)])
         .collect();
     rows.sort_by(|a, b| a[0].cmp(&b[0]));
     ColumnsResult {
         columns: vec!["Variable_name", "Value"],
         rows,
     }
+}
+
+/// Renders a system variable's stored value as MySQL's `SHOW VARIABLES` does: a
+/// boolean variable's `1`/`0` is shown as `ON`/`OFF` (whereas `SELECT @@var`
+/// returns the `1`/`0`), and every other variable's value is shown verbatim.
+fn render_variable_value(name: &str, value: &str) -> String {
+    if is_boolean_variable(name) {
+        match value {
+            "1" => return "ON".to_string(),
+            "0" => return "OFF".to_string(),
+            _ => {}
+        }
+    }
+    value.to_string()
+}
+
+/// Whether a modeled system variable is MySQL `BOOLEAN`-typed, so `SHOW
+/// VARIABLES` renders its value `ON`/`OFF` rather than `1`/`0`. (Integer-valued
+/// flags like `lower_case_table_names` are excluded — MySQL shows their number.)
+fn is_boolean_variable(name: &str) -> bool {
+    matches!(
+        name,
+        "autocommit"
+            | "big_tables"
+            | "foreign_key_checks"
+            | "innodb_strict_mode"
+            | "performance_schema"
+            | "sql_auto_is_null"
+            | "sql_big_selects"
+            | "sql_notes"
+            | "sql_safe_updates"
+            | "sql_warnings"
+            | "transaction_read_only"
+            | "tx_read_only"
+            | "unique_checks"
+    )
 }
 
 /// Case-insensitive SQL `LIKE` match for `SHOW ... LIKE` patterns: `%` matches
@@ -2185,7 +2225,8 @@ mod tests {
         });
         assert_eq!(one.rows.len(), 1);
         assert_eq!(one.rows[0][0].as_deref(), Some("autocommit"));
-        assert_eq!(one.rows[0][1].as_deref(), Some("1"));
+        // A boolean variable renders ON/OFF in SHOW VARIABLES (not 1/0).
+        assert_eq!(one.rows[0][1].as_deref(), Some("ON"));
 
         // A `%` wildcard matches several, ordered by name; `_` matches one char;
         // matching is case-insensitive.
