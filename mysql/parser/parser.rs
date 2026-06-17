@@ -10694,8 +10694,9 @@ fn info_schema_with_schema(sql: &str, current_db: Option<&str>) -> String {
     match current_db {
         Some(db) => {
             let db = db.replace('\'', "''");
-            // `STATISTICS` also carries an `INDEX_SCHEMA` placeholder (the index's
-            // schema, the same database); substitute it the same way.
+            // `STATISTICS` also carries an `INDEX_SCHEMA` placeholder, and
+            // `TABLE_CONSTRAINTS` / `KEY_COLUMN_USAGE` a `CONSTRAINT_SCHEMA` one
+            // (each the same database as `TABLE_SCHEMA`); substitute them too.
             sql.replace(
                 "'def' AS TABLE_SCHEMA",
                 &format!("'{db}' AS TABLE_SCHEMA"),
@@ -10703,6 +10704,10 @@ fn info_schema_with_schema(sql: &str, current_db: Option<&str>) -> String {
             .replace(
                 "'def' AS INDEX_SCHEMA",
                 &format!("'{db}' AS INDEX_SCHEMA"),
+            )
+            .replace(
+                "'def' AS CONSTRAINT_SCHEMA",
+                &format!("'{db}' AS CONSTRAINT_SCHEMA"),
             )
         }
         None => sql.to_string(),
@@ -11066,10 +11071,11 @@ fn is_information_schema_table_constraints(name: &ast::QualifiedName) -> bool {
 ///
 /// Parsed with the engine parser (`turso_parser`), like the other
 /// `information_schema` emulations, because of the `pragma_*` table functions.
-/// Divergences (see `mysql/COMPAT.md`): `TABLE_SCHEMA` / `CONSTRAINT_SCHEMA` are
-/// the placeholder `def` (filtering on them matches nothing); and `FOREIGN KEY` /
-/// `CHECK` constraints and unnamed unique constraints are not reported (the engine
-/// does not enforce or name them as MySQL does).
+/// `TABLE_SCHEMA` / `CONSTRAINT_SCHEMA` report the connection's current database
+/// (substituted in both UNION branches), so filtering on them selects the
+/// expected rows. Divergences (see `mysql/COMPAT.md`): `FOREIGN KEY` / `CHECK`
+/// constraints and unnamed unique constraints are not reported (the engine does
+/// not enforce or name them as MySQL does).
 fn information_schema_table_constraints_select(current_db: Option<&str>) -> ast::Select {
     const SQL: &str = "SELECT DISTINCT \
          'def' AS CONSTRAINT_CATALOG, \
@@ -11087,7 +11093,7 @@ fn information_schema_table_constraints_select(current_db: Option<&str>) -> ast:
          UNION ALL \
          SELECT \
          'def', \
-         'def', \
+         'def' AS CONSTRAINT_SCHEMA, \
          il.name, \
          'def' AS TABLE_SCHEMA, \
          m.name, \
@@ -11126,9 +11132,10 @@ fn is_information_schema_key_column_usage(name: &ast::QualifiedName) -> bool {
 ///
 /// This engine has no foreign keys, so the foreign-key columns
 /// (`POSITION_IN_UNIQUE_CONSTRAINT`, `REFERENCED_*`) are always NULL. Parsed with
-/// the engine parser (`turso_parser`), like the other emulations. Same
-/// `TABLE_SCHEMA` placeholder limitation as `TABLES` (filtering on it matches
-/// nothing); see `mysql/COMPAT.md`.
+/// the engine parser (`turso_parser`), like the other emulations. `TABLE_SCHEMA`
+/// / `CONSTRAINT_SCHEMA` report the connection's current database (substituted in
+/// both UNION branches), so filtering on them selects the expected rows; see
+/// `mysql/COMPAT.md`.
 fn information_schema_key_column_usage_select(current_db: Option<&str>) -> ast::Select {
     const SQL: &str = "SELECT \
          'def' AS CONSTRAINT_CATALOG, \
@@ -11151,7 +11158,7 @@ fn information_schema_key_column_usage_select(current_db: Option<&str>) -> ast::
          UNION ALL \
          SELECT \
          'def', \
-         'def', \
+         'def' AS CONSTRAINT_SCHEMA, \
          il.name, \
          'def', \
          'def' AS TABLE_SCHEMA, \

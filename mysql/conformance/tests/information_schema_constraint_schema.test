@@ -1,0 +1,52 @@
+# information_schema.TABLE_CONSTRAINTS / KEY_COLUMN_USAGE — CONSTRAINT_SCHEMA.
+#
+# MySQL's `CONSTRAINT_SCHEMA` is the constraint's database (the same value as
+# `TABLE_SCHEMA`). The front-end substituted the current database into
+# `TABLE_SCHEMA` but left `CONSTRAINT_SCHEMA` as the `def` placeholder, so a query
+# filtering on it -- `WHERE CONSTRAINT_SCHEMA = DATABASE()`, which ORMs and
+# migration tools use to introspect a table's primary / unique keys -- matched no
+# rows (and the second UNION branch emitted a bare `def` with no alias to
+# substitute).
+#
+# The fix substitutes the current database into `CONSTRAINT_SCHEMA` in both UNION
+# branches of both views, so it equals `TABLE_SCHEMA` and the filter selects the
+# expected rows. Filters by a single constraint name (these views order mixed-case
+# CONSTRAINT_NAMEs case-sensitively, unlike MySQL). Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE cstr (id INT PRIMARY KEY, email VARCHAR(40), n INT, UNIQUE KEY cstr_email (email), KEY cstr_n (n))
+
+# CONSTRAINT_SCHEMA equals TABLE_SCHEMA (both the current database) for the
+# primary key, so a `CONSTRAINT_SCHEMA = DATABASE()` filter selects the row.
+query
+SELECT CONSTRAINT_TYPE, CONSTRAINT_SCHEMA = TABLE_SCHEMA FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'cstr' AND CONSTRAINT_NAME = 'PRIMARY'
+----
+PRIMARY KEY	1
+
+# The named unique constraint is likewise selectable by CONSTRAINT_SCHEMA.
+query
+SELECT CONSTRAINT_TYPE, CONSTRAINT_SCHEMA = TABLE_SCHEMA FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'cstr' AND CONSTRAINT_NAME = 'cstr_email'
+----
+UNIQUE	1
+
+# Both constraints (PRIMARY, cstr_email) are found by the CONSTRAINT_SCHEMA filter
+# (the non-unique key cstr_n is not a constraint).
+query
+SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'cstr'
+----
+2
+
+# KEY_COLUMN_USAGE: CONSTRAINT_SCHEMA also equals the database, so its filter
+# selects the primary-key column.
+query
+SELECT COLUMN_NAME, CONSTRAINT_SCHEMA = TABLE_SCHEMA FROM information_schema.KEY_COLUMN_USAGE WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'cstr' AND CONSTRAINT_NAME = 'PRIMARY'
+----
+id	1
+
+# The unique constraint's column is found, too; the count covers PRIMARY +
+# cstr_email (one column each).
+query
+SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'cstr'
+----
+2
