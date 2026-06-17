@@ -16,16 +16,21 @@
 //! display-width stripping) and the exact `Collation`/`Extra` text are not
 //! modeled — see `mysql/COMPAT.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use turso_core::{Connection, LimboError, Value};
 
 /// `Privileges` is a constant in MySQL's `SHOW FULL COLUMNS` output.
 const PRIVILEGES: &str = "select,insert,update,references";
-/// Collation reported for text columns (non-text columns report SQL `NULL`).
-/// Matches the value the rest of the front-end advertises in [`crate::session`].
+/// Collation reported for a default (case-insensitive) text column. Non-text
+/// columns report SQL `NULL`. Matches the value the rest of the front-end
+/// advertises in [`crate::session`].
 const COLLATION: &str = "utf8mb4_general_ci";
+/// Collation reported for a case-sensitive text column — one declared with a
+/// MySQL `*_bin`/`*_cs` collation, which the front-end maps to the engine's
+/// `BINARY` default. MySQL reports such a column's collation as `utf8mb4_bin`.
+const BINARY_COLLATION: &str = "utf8mb4_bin";
 
 /// A synthesized result set: column headers plus text rows (`None` = SQL `NULL`).
 pub struct ColumnsResult {
@@ -325,6 +330,7 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
             pk,
             key: "",
             auto_increment: false,
+            binary: false,
         });
         Ok(())
     })?;
@@ -346,6 +352,16 @@ fn build(conn: &Arc<Connection>, show: &ShowColumns) -> Result<ShowOutcome, Limb
         if let Some(ty) = declared.get(&col.name.to_ascii_lowercase()) {
             col.ty = ty.clone();
         }
+    }
+
+    // A text column the front-end declared with `COLLATE NOCASE` is
+    // case-insensitive (a default / `*_ci` MySQL collation); a text column
+    // without it was declared case-sensitive (`*_bin`/`*_cs`, stored as the
+    // engine's `BINARY` default), which MySQL reports as a `*_bin` collation.
+    let nocase = nocase_collation_columns(conn, &show.table);
+    for col in &mut info {
+        col.binary =
+            is_text_type(&col.ty) && !nocase.contains(&col.name.to_ascii_lowercase());
     }
 
     // The `Key` flag (`UNI`/`MUL`) for columns that lead a non-primary index, so
@@ -546,19 +562,7 @@ fn table_is_autoincrement(conn: &Arc<Connection>, table: &str) -> bool {
 
 fn declared_column_types(conn: &Arc<Connection>, table: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    let query = format!(
-        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '{}'",
-        table.replace('\'', "''")
-    );
-    let Ok(Some(mut stmt)) = conn.query(&query) else {
-        return out;
-    };
-    let mut create_sql = None;
-    let _ = stmt.run_with_row_callback(|row| {
-        create_sql = value_to_string(row.get_value(0));
-        Ok(())
-    });
-    let Some(create_sql) = create_sql else {
+    let Some(create_sql) = table_create_sql(conn, table) else {
         return out;
     };
     // The column list is the contents of the first parenthesized group.
@@ -571,6 +575,66 @@ fn declared_column_types(conn: &Arc<Connection>, table: &str) -> HashMap<String,
         }
     }
     out
+}
+
+/// Reads the table's stored `CREATE TABLE` text, which the engine preserves even
+/// though `PRAGMA table_info` drops the size/collation detail.
+fn table_create_sql(conn: &Arc<Connection>, table: &str) -> Option<String> {
+    let query = format!(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '{}'",
+        table.replace('\'', "''")
+    );
+    let mut stmt = conn.query(&query).ok()??;
+    let mut create_sql = None;
+    let _ = stmt.run_with_row_callback(|row| {
+        create_sql = value_to_string(row.get_value(0));
+        Ok(())
+    });
+    create_sql
+}
+
+/// Reads which columns the front-end declared `COLLATE NOCASE` (a default /
+/// `*_ci` MySQL collation). A text column missing it was declared case-sensitive
+/// (`*_bin`/`*_cs`, stored as the engine's `BINARY` default), so `SHOW FULL
+/// COLUMNS` reports it as `utf8mb4_bin`. Names are lowercased.
+fn nocase_collation_columns(conn: &Arc<Connection>, table: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(create_sql) = table_create_sql(conn, table) else {
+        return out;
+    };
+    let Some(open) = create_sql.find('(') else {
+        return out;
+    };
+    for segment in split_column_list(&create_sql[open + 1..]) {
+        if let Some(name) = column_name_of(&segment) {
+            if segment.to_ascii_uppercase().contains("COLLATE NOCASE") {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// Extracts the lowercased column name from a `CREATE TABLE` column definition,
+/// or `None` for a table constraint (`PRIMARY KEY (...)`, ...). Unlike
+/// [`parse_column_def`], it does not require a declared size, so it also names a
+/// sizeless column such as `note TEXT COLLATE NOCASE`.
+fn column_name_of(segment: &str) -> Option<String> {
+    let segment = segment.trim();
+    let name = if let Some(after) = segment.strip_prefix('`') {
+        let end = after.find('`')?;
+        after[..end].to_string()
+    } else {
+        let end = segment
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(segment.len());
+        segment[..end].to_string()
+    };
+    let name_lower = name.to_ascii_lowercase();
+    if name_lower.is_empty() || is_table_constraint_keyword(&name_lower) {
+        return None;
+    }
+    Some(name_lower)
 }
 
 /// Splits a `CREATE TABLE` column list into its top-level comma-separated
@@ -1102,6 +1166,10 @@ struct ColumnInfo {
     /// Whether the column auto-increments, reported as `auto_increment` in the
     /// MySQL `Extra` column.
     auto_increment: bool,
+    /// Whether a text column is case-sensitive (declared with a `*_bin`/`*_cs`
+    /// MySQL collation, stored as the engine's `BINARY` default). Such a column
+    /// reports `utf8mb4_bin` rather than the default `utf8mb4_general_ci`.
+    binary: bool,
 }
 
 impl ColumnInfo {
@@ -1115,7 +1183,7 @@ impl ColumnInfo {
         // index, or empty.
         let key = if self.pk { "PRI" } else { self.key };
         let collation = if is_text_type(&self.ty) {
-            Some(COLLATION.to_string())
+            Some(if self.binary { BINARY_COLLATION } else { COLLATION }.to_string())
         } else {
             None
         };
@@ -2394,6 +2462,39 @@ mod tests {
         assert!(is_text_type("LONGTEXT"));
         assert!(!is_text_type("INT"));
         assert!(!is_text_type("BIGINT"));
+    }
+
+    #[test]
+    fn column_name_of_extracts_the_name() {
+        assert_eq!(column_name_of("a VARCHAR (20)").as_deref(), Some("a"));
+        assert_eq!(column_name_of("  Note TEXT COLLATE NOCASE").as_deref(), Some("note"));
+        assert_eq!(column_name_of("`my col` int").as_deref(), Some("my col"));
+        // A table constraint is not a column.
+        assert_eq!(column_name_of("PRIMARY KEY (id)"), None);
+    }
+
+    #[test]
+    fn text_column_collation_depends_on_case_sensitivity() {
+        let column = |ty: &str, binary: bool| ColumnInfo {
+            name: "c".to_string(),
+            ty: ty.to_string(),
+            notnull: false,
+            default: None,
+            pk: false,
+            key: "",
+            auto_increment: false,
+            binary,
+        };
+        // The Collation column is index 2 of the FULL row.
+        let collation = |c: ColumnInfo| c.into_row(true)[2].clone();
+        // A case-insensitive (NOCASE) text column reports the default collation;
+        // a case-sensitive (BINARY) one reports utf8mb4_bin.
+        assert_eq!(collation(column("varchar(20)", false)).as_deref(), Some(COLLATION));
+        assert_eq!(collation(column("varchar(20)", true)).as_deref(), Some(BINARY_COLLATION));
+        assert_eq!(collation(column("text", true)).as_deref(), Some(BINARY_COLLATION));
+        // A non-text column has no collation regardless.
+        assert_eq!(collation(column("int", false)), None);
+        assert_eq!(collation(column("blob", true)), None);
     }
 
     #[test]

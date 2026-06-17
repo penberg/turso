@@ -1,0 +1,26 @@
+# SHOW FULL COLUMNS reports a *_bin column's collation as utf8mb4_bin.
+#
+# WordPress's wpdb::get_column_charset() derives a column's charset from the
+# Collation column of SHOW FULL COLUMNS. The front-end declares a text column
+# with the engine's case-insensitive COLLATE NOCASE for a default/*_ci MySQL
+# collation and the engine's BINARY default for a *_bin/*_cs one, but SHOW FULL
+# COLUMNS hard-coded utf8mb4_general_ci for every text column -- so a column
+# declared COLLATE utf8mb4_bin was wrongly reported as case-insensitive. It now
+# reports utf8mb4_bin for a case-sensitive text column.
+#
+# A default-collation column still reports utf8mb4_general_ci, which differs from
+# a MySQL 8.4 server's utf8mb4_0900_ai_ci (the documented single-collation
+# divergence), so this filters to the *_bin columns. The filter returning only
+# the two *_bin columns -- not plaincol -- also proves the report is per-column,
+# not a blanket change. A BLOB column is not character data (NULL collation) and
+# is likewise excluded. Uses a file-unique table name. Expected to pass against
+# both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE collbincol (id INT PRIMARY KEY, bincol VARCHAR(20) COLLATE utf8mb4_bin, txtbin TEXT COLLATE utf8mb4_bin, plaincol VARCHAR(20), raw BLOB)
+
+query
+SHOW FULL COLUMNS FROM collbincol WHERE Collation = 'utf8mb4_bin'
+----
+bincol	varchar(20)	utf8mb4_bin	YES		NULL		select,insert,update,references	
+txtbin	text	utf8mb4_bin	YES		NULL		select,insert,update,references	
