@@ -44,6 +44,13 @@ const ER_BAD_NULL_ERROR: u16 = 1048;
 const ER_BAD_FIELD_ERROR: u16 = 1054;
 /// `ER_TABLE_EXISTS_ERROR`: a `CREATE TABLE` named an existing table.
 const ER_TABLE_EXISTS_ERROR: u16 = 1050;
+/// `ER_DUP_KEYNAME`: a `CREATE INDEX` / `ADD KEY` reused an existing index name.
+const ER_DUP_KEYNAME: u16 = 1061;
+/// `ER_DUP_FIELDNAME`: an `ADD COLUMN` named a column the table already has.
+const ER_DUP_FIELDNAME: u16 = 1060;
+/// `ER_CANT_DROP_FIELD_OR_KEY`: a `DROP INDEX` / `DROP COLUMN` named one that
+/// does not exist.
+const ER_CANT_DROP_FIELD_OR_KEY: u16 = 1091;
 
 /// Wraps the blocking socket with a frame decoder and a write buffer.
 struct Wire {
@@ -1015,10 +1022,25 @@ fn error_code_and_state(error: &LimboError) -> (u16, [u8; 5]) {
             let msg = msg.to_ascii_lowercase();
             if msg.contains("such table") {
                 (ER_NO_SUCH_TABLE, *b"42S02")
+            } else if msg.contains("duplicate column name") {
+                // `ALTER TABLE ... ADD COLUMN` of an existing column.
+                (ER_DUP_FIELDNAME, *b"42S21")
             } else if msg.contains("such column") || msg.contains("column named") {
                 (ER_BAD_FIELD_ERROR, *b"42S22")
+            } else if msg.contains("index with name") && msg.contains("already exists") {
+                // A reused index name (`CREATE INDEX` / `ADD KEY`) — a duplicate
+                // key name, distinct from the duplicate *table* name below.
+                (ER_DUP_KEYNAME, *b"42000")
             } else if msg.contains("already exists") {
                 (ER_TABLE_EXISTS_ERROR, *b"42S01")
+            } else {
+                (ER_ERROR_GENERAL, *b"HY000")
+            }
+        }
+        // `DROP INDEX` of a missing index surfaces as `InvalidArgument`.
+        LimboError::InvalidArgument(msg) => {
+            if msg.to_ascii_lowercase().contains("no such index") {
+                (ER_CANT_DROP_FIELD_OR_KEY, *b"42000")
             } else {
                 (ER_ERROR_GENERAL, *b"HY000")
             }
@@ -1100,6 +1122,23 @@ mod tests {
                 LimboError::ParseError("table t already exists".into()),
                 ER_TABLE_EXISTS_ERROR,
                 *b"42S01",
+            ),
+            // A reused index name is a duplicate *key* name, not a duplicate table.
+            (
+                LimboError::ParseError("Error: index with name 'k' already exists.".into()),
+                ER_DUP_KEYNAME,
+                *b"42000",
+            ),
+            (
+                LimboError::ParseError("duplicate column name: c".into()),
+                ER_DUP_FIELDNAME,
+                *b"42S21",
+            ),
+            // `DROP INDEX` of a missing index arrives as `InvalidArgument`.
+            (
+                LimboError::InvalidArgument("No such index: k".into()),
+                ER_CANT_DROP_FIELD_OR_KEY,
+                *b"42000",
             ),
         ];
         for (err, code, state) in cases {

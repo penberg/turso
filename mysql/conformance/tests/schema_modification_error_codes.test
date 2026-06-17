@@ -1,0 +1,44 @@
+# Schema-modification error codes: duplicate / missing keys and columns.
+#
+# MySQL gives schema-modification failures specific error numbers that tools and
+# `$wpdb` branch on via mysql_errno(): a duplicate index name is ER_DUP_KEYNAME
+# (1061), a duplicate column name is ER_DUP_FIELDNAME (1060), and dropping a
+# missing index or column is ER_CANT_DROP_FIELD_OR_KEY (1091). The front-end
+# collapsed these to generic / wrong codes (a reused index name even reported the
+# duplicate-*table* code 1050).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (the
+# `statement error <code>` directive pins the MySQL error number, so the differing
+# message text does not matter).
+
+statement ok
+CREATE TABLE smec (id INT PRIMARY KEY, a INT, b INT)
+
+statement ok
+CREATE INDEX smec_a ON smec (a)
+
+# A reused index name is a duplicate key name (1061), not a duplicate table (1050).
+statement error 1061
+CREATE INDEX smec_a ON smec (b)
+
+# The ALTER form of adding a key reports the same code.
+statement error 1061
+ALTER TABLE smec ADD KEY smec_a (b)
+
+# Adding a column the table already has is a duplicate column name (1060).
+statement error 1060
+ALTER TABLE smec ADD COLUMN a INT
+
+# Dropping a nonexistent index is "can't DROP ...; check that column/key exists"
+# (1091).
+statement error 1091
+DROP INDEX smec_absent ON smec
+
+# A duplicate CREATE TABLE still reports the duplicate-table code (1050), and an
+# unrelated missing column still reports ER_BAD_FIELD_ERROR (1054) -- the new
+# mappings do not disturb them.
+statement error 1050
+CREATE TABLE smec (id INT)
+
+statement error 1054
+SELECT smec_missing_col FROM smec
