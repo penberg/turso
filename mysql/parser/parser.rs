@@ -10874,7 +10874,27 @@ fn is_information_schema_columns(name: &ast::QualifiedName) -> bool {
 /// no length/precision (`varchar`, not `varchar(20)`) because the engine catalog
 /// drops it. `sqlite_%` and `__turso_internal_*` bookkeeping tables are excluded.
 fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
-    const SQL: &str = "SELECT \
+    // MySQL's `DATA_TYPE` is the base type name only -- no length/precision and no
+    // `unsigned`/`zerofill` attribute -- whereas `p.type` is the engine's declared
+    // column type (the front-end's lowering of the MySQL type, e.g. `integer`,
+    // `bigint unsigned`, `boolean`). Reduce the type to its first word (dropping a
+    // trailing ` unsigned`), then map the engine spellings that differ from
+    // MySQL's reported name: `integer` -> `int` (as `SHOW COLUMNS` already
+    // normalizes via `normalize_column_type`) and `bool`/`boolean` -> `tinyint`.
+    // `COLUMN_TYPE` keeps the fuller `lower(p.type)` (which still carries the
+    // `unsigned` attribute but not the length the engine catalog drops -- a
+    // documented divergence).
+    let base = "substr(lower(p.type), 1, \
+         CASE WHEN instr(lower(p.type), ' ') > 0 \
+              THEN instr(lower(p.type), ' ') - 1 \
+              ELSE length(lower(p.type)) END)";
+    let data_type = format!(
+        "CASE WHEN {base} = 'integer' THEN 'int' \
+              WHEN {base} IN ('bool', 'boolean') THEN 'tinyint' \
+              ELSE {base} END"
+    );
+    let sql = format!(
+        "SELECT \
          'def' AS TABLE_CATALOG, \
          'def' AS TABLE_SCHEMA, \
          m.name AS TABLE_NAME, \
@@ -10882,7 +10902,7 @@ fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
          p.cid + 1 AS ORDINAL_POSITION, \
          p.dflt_value AS COLUMN_DEFAULT, \
          CASE WHEN p.\"notnull\" = 1 OR p.pk > 0 THEN 'NO' ELSE 'YES' END AS IS_NULLABLE, \
-         lower(p.type) AS DATA_TYPE, \
+         {data_type} AS DATA_TYPE, \
          CASE WHEN lower(p.type) IN ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext', 'enum', 'set') THEN 'utf8mb4' ELSE NULL END AS CHARACTER_SET_NAME, \
          CASE WHEN lower(p.type) IN ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext', 'enum', 'set') THEN 'utf8mb4_general_ci' ELSE NULL END AS COLLATION_NAME, \
          lower(p.type) AS COLUMN_TYPE, \
@@ -10892,8 +10912,9 @@ fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
          JOIN pragma_table_info(m.name) p \
          WHERE m.type = 'table' \
          AND m.name NOT LIKE 'sqlite_%' \
-         AND substr(m.name, 1, 17) <> '__turso_internal_'";
-    let sql = info_schema_with_schema(SQL, current_db);
+         AND substr(m.name, 1, 17) <> '__turso_internal_'"
+    );
+    let sql = info_schema_with_schema(&sql, current_db);
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     match parser.next() {
         Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) => select,

@@ -1,0 +1,56 @@
+# information_schema.COLUMNS.DATA_TYPE — base type name, MySQL-normalized.
+#
+# MySQL's `DATA_TYPE` is the base type name only: no length/precision and no
+# `unsigned` / `zerofill` attribute (those live in `COLUMN_TYPE`). The front-end
+# derives the column metadata from the engine catalog, whose declared type keeps
+# the engine's spelling -- `integer` (not MySQL's `int`), `bigint unsigned` (with
+# the attribute), `boolean` -- so `DATA_TYPE` diverged from MySQL even though
+# `SHOW COLUMNS` already normalizes the type. WordPress (`wpdb`) and migration
+# tools read `information_schema.COLUMNS` for column types, so this should match.
+#
+# The fix reduces the type to its first word (dropping a trailing ` unsigned`)
+# and maps the engine spellings that differ: `integer` -> `int` and
+# `bool`/`boolean` -> `tinyint`.
+#
+# Filters by the current database (`TABLE_SCHEMA = DATABASE()`) and a file-unique
+# table name, so other tests' tables do not affect the comparison. Expected to
+# pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE iscoldt (
+    a INT,
+    b BIGINT,
+    c SMALLINT,
+    d TINYINT,
+    e MEDIUMINT,
+    f INTEGER,
+    g VARCHAR(10),
+    h DECIMAL(5,2),
+    i BOOLEAN,
+    j BIGINT UNSIGNED,
+    k INT UNSIGNED
+)
+
+# `DATA_TYPE` is the bare base type for every column: `INTEGER` reports `int`,
+# `BOOLEAN` reports `tinyint`, and the `UNSIGNED` attribute is dropped.
+query
+SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscoldt' ORDER BY ORDINAL_POSITION
+----
+a	int
+b	bigint
+c	smallint
+d	tinyint
+e	mediumint
+f	int
+g	varchar
+h	decimal
+i	tinyint
+j	bigint
+k	int
+
+# The same normalization applies when filtering a single column by DATA_TYPE: the
+# two `*INT ... UNSIGNED` columns and the plain/`INTEGER` ints all count as `int`.
+query
+SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscoldt' AND DATA_TYPE = 'int'
+----
+3
