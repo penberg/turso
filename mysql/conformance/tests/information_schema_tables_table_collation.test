@@ -1,0 +1,39 @@
+# information_schema.TABLES.TABLE_COLLATION.
+#
+# WordPress's wpdb::get_table_charset() reads a table's collation from
+# information_schema.TABLES.TABLE_COLLATION to decide how to sanitize text. The
+# TABLES emulation exposed the engine/type/size columns but not TABLE_COLLATION,
+# so the query errored with "no such column". It now reports the engine's fixed
+# collation for a base table and NULL for a view, as MySQL does.
+#
+# The exact collation name is NOT pinned: this engine reports utf8mb4_general_ci
+# while MySQL 8.4 reports utf8mb4_0900_ai_ci (the documented single-collation
+# divergence). The test checks the column exists, is a utf8mb4 collation for a
+# base table, and is NULL for a view -- all of which hold on both targets.
+#
+# Filters by the current database and file-unique names. Expected to pass against
+# both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE tcoll_base (id INT PRIMARY KEY, name VARCHAR(50))
+
+statement ok
+CREATE VIEW tcoll_view AS SELECT id FROM tcoll_base
+
+# A base table reports a non-NULL utf8mb4 collation.
+query
+SELECT TABLE_COLLATION IS NOT NULL, TABLE_COLLATION LIKE 'utf8mb4%' FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tcoll_base'
+----
+1	1
+
+# A view reports NULL for TABLE_COLLATION.
+query
+SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tcoll_view'
+----
+NULL
+
+# The column can be selected alongside the other table metadata WordPress reads.
+query
+SELECT TABLE_NAME, TABLE_TYPE, TABLE_COLLATION IS NOT NULL FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tcoll_base'
+----
+tcoll_base	BASE TABLE	1

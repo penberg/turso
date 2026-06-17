@@ -10786,6 +10786,11 @@ fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Sel
     // `''` (the same fixed values `SHOW TABLE STATUS` uses), while a view reports
     // NULL / NULL / `VIEW` (as the ENGINE / TABLE_ROWS columns already treat a
     // view as NULL). Site Health and migration tools select these columns.
+    // `TABLE_COLLATION` is the engine's fixed `utf8mb4_general_ci` for a base
+    // table and NULL for a view, as MySQL reports — WordPress's
+    // `wpdb::get_table_charset()` derives a table's charset from it. (It differs
+    // from a MySQL 8.4 server's `utf8mb4_0900_ai_ci`, the single-collation
+    // divergence the `COLUMNS` view and `SHOW FULL COLUMNS` already carry.)
     const SQL: &str = "SELECT \
          'def' AS TABLE_CATALOG, \
          name AS TABLE_NAME, \
@@ -10806,6 +10811,7 @@ fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Sel
               ELSE NULL END AS AUTO_INCREMENT, \
          NULL AS UPDATE_TIME, \
          NULL AS CHECK_TIME, \
+         CASE WHEN type = 'view' THEN NULL ELSE 'utf8mb4_general_ci' END AS TABLE_COLLATION, \
          NULL AS CHECKSUM, \
          CASE WHEN type = 'view' THEN NULL ELSE '' END AS CREATE_OPTIONS, \
          CASE WHEN type = 'view' THEN 'VIEW' ELSE '' END AS TABLE_COMMENT \
