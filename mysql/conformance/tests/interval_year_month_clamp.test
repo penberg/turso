@@ -1,0 +1,49 @@
+# A YEAR_MONTH interval clamps a month overflow to the month's last day.
+#
+# MySQL clamps a month/year step that overflows a shorter target month to that
+# month's last day: Jan 31 + 1 month is Feb 28/29, not Mar 2/3. The front-end
+# applied this clamp to the single MONTH/YEAR units but lowered the compound
+# YEAR_MONTH straight through datetime(), which rolls the overflow into the next
+# month, so DATE_ADD('2024-01-31', INTERVAL '0-1' YEAR_MONTH) was 2024-03-02
+# instead of 2024-02-29. YEAR_MONTH now shares the clamp.
+#
+# The clamp keeps the DATE-vs-DATETIME type (a date stays a date) and the time of
+# day on a datetime target. Expected to pass against both turso-mysql-server and a
+# real mysqld.
+
+# Jan 31 + 1 month clamps to the last day of February (leap and non-leap years).
+query
+SELECT DATE_ADD('2024-01-31', INTERVAL '0-1' YEAR_MONTH), DATE_ADD('2023-01-31', INTERVAL '0-1' YEAR_MONTH)
+----
+2024-02-29	2023-02-28
+
+# A multi-year YEAR_MONTH step clamps the same way.
+query
+SELECT DATE_ADD('2024-01-31', INTERVAL '1-1' YEAR_MONTH)
+----
+2025-02-28
+
+# Jan 30 also clamps (30 > 29), and the result of a clamped date stays a DATE.
+query
+SELECT DATE_ADD('2024-01-30', INTERVAL '0-1' YEAR_MONTH)
+----
+2024-02-29
+
+# DATE_SUB clamps too: Mar 31 - 1 month is the last day of February.
+query
+SELECT DATE_SUB('2024-03-31', INTERVAL '0-1' YEAR_MONTH)
+----
+2024-02-29
+
+# A datetime target clamps the date and keeps the time of day.
+query
+SELECT DATE_ADD('2024-01-31 10:30:00', INTERVAL '0-1' YEAR_MONTH)
+----
+2024-02-29 10:30:00
+
+# A non-overflowing YEAR_MONTH step is unaffected, and matches the single MONTH
+# unit which already clamped.
+query
+SELECT DATE_ADD('2024-06-17', INTERVAL '0-2' YEAR_MONTH), DATE_ADD('2024-01-31', INTERVAL 1 MONTH)
+----
+2024-08-17	2024-02-29

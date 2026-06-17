@@ -8201,7 +8201,7 @@ impl Parser {
         // target month is clamped to that month's last day (`Jan 31 + 1 month` →
         // `Feb 28`), as in MySQL, while a day/time step is a plain `datetime()`.
         let shifted = if engine_unit == "months" || engine_unit == "years" {
-            clamp_month_overflow(target.clone(), &modifier)
+            clamp_month_overflow(target.clone(), &[&modifier])
         } else {
             call_fn(
                 "datetime",
@@ -8856,7 +8856,7 @@ fn build_interval(target: ast::Expr, spec: &IntervalSpec, subtract: bool) -> Res
     // returns a datetime — see `date_unit_result`.
     match engine_unit {
         "months" | "years" => {
-            let rolled = clamp_month_overflow(target.clone(), &modifier);
+            let rolled = clamp_month_overflow(target.clone(), &[&modifier]);
             Ok(date_unit_result(&target, rolled))
         }
         "days" => {
@@ -8946,17 +8946,37 @@ fn build_compound_interval(
 
     // Keep a copy of the target for the date-vs-datetime result check below.
     let target_for_result = target.clone();
-    let mut args = vec![Box::new(target)];
+    // The per-field engine modifiers, e.g. `'+1 years'`, `'+2 months'`.
+    let mut modifiers: Vec<String> = Vec::new();
     for (part, field) in parts.iter().zip(fields) {
         let value: i64 = part.parse().map_err(|_| {
             ParseError::Unsupported(format!("INTERVAL '{raw}' {unit} has a non-integer field"))
         })?;
         let signed = if negate { -value } else { value };
-        args.push(Box::new(ast::Expr::Literal(ast::Literal::String(requote(
-            &format!("{signed:+} {field}"),
-        )))));
+        modifiers.push(format!("{signed:+} {field}"));
     }
-    let datetime_result = ast::Expr::FunctionCall {
+    // A compound unit whose fields are all date units — only `YEAR_MONTH` — is
+    // handled like the single date-unit intervals: its month/year step is clamped
+    // to the target month's last day on overflow (`Jan 31 + 1 month` → `Feb 28`,
+    // as MySQL does), and the result is a DATE when the target has no time of day
+    // (`DATE_ADD(DATE '2024-06-17', INTERVAL '1-2' YEAR_MONTH)` → `2025-08-17`). A
+    // unit with a time field (`DAY_HOUR`, `MINUTE_SECOND`, …) always returns a
+    // datetime and is not clamped.
+    let all_date_fields = fields
+        .iter()
+        .all(|f| matches!(*f, "years" | "months" | "days"));
+    if all_date_fields {
+        let mod_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+        let rolled = clamp_month_overflow(target, &mod_refs);
+        return Ok(date_unit_result(&target_for_result, rolled));
+    }
+    let mut args = vec![Box::new(target)];
+    args.extend(
+        modifiers
+            .iter()
+            .map(|m| Box::new(ast::Expr::Literal(ast::Literal::String(requote(m))))),
+    );
+    Ok(ast::Expr::FunctionCall {
         name: ast::Name::from_string("datetime"),
         distinctness: None,
         args,
@@ -8966,20 +8986,7 @@ fn build_compound_interval(
             filter_clause: None,
             over_clause: None,
         },
-    };
-    // A compound unit whose fields are all date units (`YEAR_MONTH`) returns a
-    // DATE when the target has no time of day, like the single date-unit
-    // intervals — `DATE_ADD(DATE '2024-06-17', INTERVAL '1-2' YEAR_MONTH)` is the
-    // date `2025-08-17`, not a datetime. A unit with a time field (`DAY_HOUR`,
-    // `MINUTE_SECOND`, …) always returns a datetime.
-    let all_date_fields = fields
-        .iter()
-        .all(|f| matches!(*f, "years" | "months" | "days"));
-    if all_date_fields {
-        Ok(date_unit_result(&target_for_result, datetime_result))
-    } else {
-        Ok(datetime_result)
-    }
+    })
 }
 
 /// Builds `CAST(a / b AS INTEGER)` — the integer quotient (truncated toward
@@ -10690,9 +10697,13 @@ fn date_format_expr(mysql_fmt: &str, target: ast::Expr) -> Result<ast::Expr> {
 /// on the previous month's last day, which preserves the time of day. A NULL
 /// target makes the comparison NULL, so the `CASE` falls to the unclamped (also
 /// NULL) result, matching MySQL.
-fn clamp_month_overflow(target: ast::Expr, modifier: &str) -> ast::Expr {
+fn clamp_month_overflow(target: ast::Expr, modifiers: &[&str]) -> ast::Expr {
     let string_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
-    let rolled = || call_fn("datetime", vec![target.clone(), string_lit(modifier)]);
+    let rolled = || {
+        let mut args = vec![target.clone()];
+        args.extend(modifiers.iter().map(|m| string_lit(m)));
+        call_fn("datetime", args)
+    };
     let overflowed = ast::Expr::binary(
         cast_strftime_int("%d", rolled()),
         ast::Operator::Less,
@@ -14699,15 +14710,22 @@ mod tests {
             ["'+1 hours'", "'+2 minutes'", "'+3 seconds'"]
         );
         // `YEAR_MONTH` is date-only, so its result is wrapped in the date-vs-
-        // datetime guard (a `CASE`) like the single date-unit intervals; the
-        // datetime() call with its modifiers lives in the `THEN` branch.
+        // datetime guard (a `CASE`), and because it is a month/year step it is
+        // also wrapped in the month-overflow clamp (another `CASE`). The bare
+        // `datetime(d, mods...)` is the clamp's ELSE branch (the non-overflow
+        // case): outer CASE THEN → clamp CASE ELSE → the datetime() call.
         let ast::Expr::Case { when_then_pairs, .. } =
             parse_expr("DATE_ADD(d, INTERVAL '2-3' YEAR_MONTH)").unwrap()
         else {
             panic!("expected a date-vs-datetime CASE for a YEAR_MONTH interval");
         };
-        let ast::Expr::FunctionCall { name, args, .. } = &*when_then_pairs[0].1 else {
-            panic!("expected the THEN branch to be a datetime() call");
+        let ast::Expr::Case { else_expr, .. } = &*when_then_pairs[0].1 else {
+            panic!("expected the THEN branch to be the month-overflow clamp CASE");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } =
+            &**else_expr.as_ref().expect("clamp CASE has an ELSE")
+        else {
+            panic!("expected the clamp ELSE to be a datetime() call");
         };
         assert_eq!(name.as_str(), "datetime");
         let mods: Vec<&str> = args[1..]
