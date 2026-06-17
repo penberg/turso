@@ -7391,13 +7391,19 @@ impl Parser {
             ));
         }
 
+        // The calendar-year modes. YEARWEEK never returns week 0 — a date in the
+        // year's leading partial week is attributed to the previous year's last
+        // week — so the 0–53 and 1–53 siblings coincide here: mode 2 equals mode 0
+        // (Sunday weeks) and mode 7 equals mode 5 (Monday weeks). The "4 or more
+        // days" modes 4 and 6 also attribute a late-December week to the *next*
+        // year, which the engine has no week function for, so they stay rejected.
         let code = match mode {
-            0 => "%U",
-            5 => "%W",
+            0 | 2 => "%U",
+            5 | 7 => "%W",
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "YEARWEEK() mode {other} is not supported yet \
-                     (only modes 0, 1, 3, and 5 map to an engine week number)"
+                     (only modes 0, 1, 2, 3, 5, and 7 map to an engine week number)"
                 )))
             }
         };
@@ -15184,9 +15190,16 @@ mod tests {
             assert!(matches!(args[0].as_ref(), ast::Expr::Literal(ast::Literal::String(s)) if s == "'%V'"));
         }
 
-        // Modes 0 (default, %U) and 5 (%W) lower to a CASE with the week-zero
-        // backward-push guard.
-        for (sql, code) in [("YEARWEEK(d)", "'%U'"), ("YEARWEEK(d, 0)", "'%U'"), ("YEARWEEK(d, 5)", "'%W'")] {
+        // Modes 0/2 (Sunday, %U) and 5/7 (Monday, %W) lower to a CASE with the
+        // week-zero backward-push guard — mode 2 equals mode 0 and mode 7 equals
+        // mode 5, since YEARWEEK never returns week 0.
+        for (sql, code) in [
+            ("YEARWEEK(d)", "'%U'"),
+            ("YEARWEEK(d, 0)", "'%U'"),
+            ("YEARWEEK(d, 2)", "'%U'"),
+            ("YEARWEEK(d, 5)", "'%W'"),
+            ("YEARWEEK(d, 7)", "'%W'"),
+        ] {
             let ast::Expr::Case { when_then_pairs, .. } = parse_expr(sql).unwrap() else {
                 panic!("expected `{sql}` to lower to a CASE");
             };
@@ -15204,8 +15217,8 @@ mod tests {
             );
         }
 
-        // The unclean modes are rejected, as for WEEK.
-        for mode in [2, 4, 6, 7] {
+        // The "4 or more days" modes have no engine week function and are rejected.
+        for mode in [4, 6] {
             assert!(parse_expr(&format!("YEARWEEK(d, {mode})")).is_err());
         }
     }

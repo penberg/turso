@@ -7,7 +7,10 @@
 #   modes 1 and 3 -> the ISO year-week, strftime %G * 100 + %V (they coincide);
 #   mode 0 (Sunday weeks, %U) and mode 5 (Monday weeks, %W) number within the
 #   calendar year, pushing a "week 0" date into the previous year's last week.
-# Modes 2/4/6/7 are rejected, as for WEEK. NULL propagates.
+# Since YEARWEEK never returns week 0, the 0-53 and 1-53 siblings coincide here:
+# mode 2 equals mode 0 and mode 7 equals mode 5. Modes 4 and 6 (the "4 or more
+# days" rule, which also pulls a late-December week into the next year) have no
+# engine week function and are rejected. NULL propagates.
 #
 # Expected to pass against both turso-mysql-server and a real mysqld (values from
 # MySQL 8.4), verified across 2014-2031. This test needs no tables.
@@ -50,9 +53,22 @@ SELECT YEARWEEK(NULL) IS NULL, YEARWEEK(NULL, 1) IS NULL, YEARWEEK(NULL, 5) IS N
 ----
 1	1	1
 
-# Modes without a clean engine week number are rejected.
-statement error
-SELECT YEARWEEK('2026-06-15', 2)
+# Mode 2 equals mode 0 (Sunday weeks) and mode 7 equals mode 5 (Monday weeks),
+# since YEARWEEK never returns week 0 so the 0-53 vs 1-53 range never differs.
+query
+SELECT YEARWEEK('2026-06-15', 2), YEARWEEK('2026-01-01', 2), YEARWEEK('2025-12-31', 2)
+----
+202624	202552	202552
+
+query
+SELECT YEARWEEK('2026-01-01', 7), YEARWEEK('2026-01-05', 7), YEARWEEK('2023-01-01', 7)
+----
+202552	202601	202252
+
+query
+SELECT YEARWEEK('2026-06-15', 2) = YEARWEEK('2026-06-15', 0), YEARWEEK('2023-01-01', 7) = YEARWEEK('2023-01-01', 5)
+----
+1	1
 
 # Usable over a column and in a GROUP BY (the archive-by-week shape).
 statement ok
