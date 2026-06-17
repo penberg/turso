@@ -3760,6 +3760,19 @@ impl Parser {
             }
 
             let rhs = self.bitor_expr()?;
+            // MySQL compares two string operands under the default
+            // (case-insensitive) collation, but the engine compares bare string
+            // literals case-sensitively (`'A' = 'a'` is false). When BOTH sides
+            // are string literals — so no column collation is in play — wrap the
+            // right side in `COLLATE NOCASE` to fold ASCII case as MySQL does. A
+            // column comparison is left untouched: the column already carries the
+            // collation that governs it (`NOCASE` by default, `BINARY` for a
+            // `_bin`/`_cs` column), which this must not override.
+            let rhs = if is_string_literal(&lhs) && is_string_literal(&rhs) {
+                nocase_collate(rhs)
+            } else {
+                rhs
+            };
             lhs = ast::Expr::binary(lhs, op, rhs);
         }
     }
@@ -9062,6 +9075,13 @@ fn nocase_collate(expr: ast::Expr) -> ast::Expr {
     ast::Expr::collate(expr, ast::Name::from_string("NOCASE"))
 }
 
+/// Whether `expr` is a bare string literal (`'text'`), the operand shape whose
+/// comparison the engine evaluates case-sensitively but MySQL's default
+/// collation folds.
+fn is_string_literal(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Literal(ast::Literal::String(_)))
+}
+
 /// Concatenates `pieces` with a *balanced* `||` tree, so the AST stays shallow
 /// (depth ~log₂ n) instead of the depth-n chain a left-linear fold builds —
 /// keeping a long argument list under the engine's expression-evaluator stack
@@ -12426,6 +12446,41 @@ mod tests {
             parse_expr("a = any").unwrap(),
             ast::Expr::Binary(_, ast::Operator::Equals, _)
         ));
+    }
+
+    #[test]
+    fn string_literal_comparison_wraps_nocase() {
+        // `'A' = 'a'` wraps the right literal in COLLATE NOCASE so the comparison
+        // folds ASCII case as MySQL's default collation does.
+        let ast::Expr::Binary(_, ast::Operator::Equals, rhs) = parse_expr("'A' = 'a'").unwrap()
+        else {
+            panic!("expected an equality comparison");
+        };
+        assert!(matches!(
+            *rhs,
+            ast::Expr::Collate(_, name) if name.as_str().eq_ignore_ascii_case("NOCASE")
+        ));
+        // The ordering operators fold too.
+        let ast::Expr::Binary(_, ast::Operator::Less, rhs) = parse_expr("'A' < 'b'").unwrap()
+        else {
+            panic!("expected a less-than comparison");
+        };
+        assert!(matches!(*rhs, ast::Expr::Collate(..)));
+
+        // A comparison involving a column is left untouched — the column carries
+        // the collation that governs it.
+        let ast::Expr::Binary(_, ast::Operator::Equals, rhs) = parse_expr("col = 'a'").unwrap()
+        else {
+            panic!("expected an equality comparison");
+        };
+        assert!(matches!(*rhs, ast::Expr::Literal(ast::Literal::String(_))));
+
+        // A non-string literal (a number) is not wrapped.
+        let ast::Expr::Binary(_, ast::Operator::Equals, rhs) = parse_expr("'a' = 1").unwrap()
+        else {
+            panic!("expected an equality comparison");
+        };
+        assert!(matches!(*rhs, ast::Expr::Literal(ast::Literal::Numeric(_))));
     }
 
     #[test]

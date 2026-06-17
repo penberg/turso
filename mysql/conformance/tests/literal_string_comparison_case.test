@@ -1,0 +1,59 @@
+# Case-insensitive comparison of two string literals.
+#
+# MySQL's default collation (utf8mb4_general_ci) is case-insensitive, so a
+# comparison of two string literals folds ASCII case: 'A' = 'a' is 1. The engine
+# compares bare string literals case-sensitively (it relies on a column's
+# declared collation to fold, which a literal has none of), so 'A' = 'a' was 0.
+# The front-end now wraps the right side in COLLATE NOCASE when BOTH operands are
+# string literals, leaving column comparisons -- which carry the correct
+# collation -- untouched.
+#
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+# Equality of two string literals folds case.
+query
+SELECT 'A' = 'a', 'abc' = 'ABC', 'A' = 'b'
+----
+1	1	0
+
+# The ordering comparisons fold case too (so 'A' and 'a' compare equal).
+query
+SELECT 'A' < 'a', 'B' > 'a', 'a' <= 'A', 'A' >= 'a'
+----
+0	1	1	1
+
+# Inequality.
+query
+SELECT 'A' <> 'a', 'A' != 'B'
+----
+0	1
+
+# A BINARY operand forces a case-sensitive comparison, on either side.
+query
+SELECT 'A' = BINARY 'a', BINARY 'A' = 'a'
+----
+0	0
+
+# Comparisons that involve a column are governed by the column's collation, not
+# the literal-folding rule: a default column folds case, a _bin column does not.
+statement ok
+CREATE TABLE litcmp (id INT PRIMARY KEY, ci VARCHAR(10), cb VARCHAR(10) COLLATE utf8mb4_bin)
+
+statement ok
+INSERT INTO litcmp VALUES (1, 'Hello', 'Hello')
+
+query
+SELECT id FROM litcmp WHERE ci = 'hello'
+----
+1
+
+query
+SELECT COUNT(*) FROM litcmp WHERE cb = 'hello'
+----
+0
+
+# A number comparison is unaffected.
+query
+SELECT 1 = 1, 5 > 3, 'a' = 'a'
+----
+1	1	1
