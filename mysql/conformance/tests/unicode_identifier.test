@@ -1,0 +1,59 @@
+# Unquoted identifiers containing multibyte (non-ASCII) characters.
+#
+# MySQL admits Unicode characters in an unquoted identifier -- a column name or
+# alias may be `café`, `naïve`, `Ω`, or `текст`. The lexer scanned identifiers
+# byte by byte and accepted only ASCII letters/digits/`_`/`$`, so the first
+# multibyte byte ended the word and the next character (`Ã`, the lead byte of
+# `é`) was rejected as a stray token: `SELECT 1 AS café` failed with a syntax
+# error. The lexer now treats any byte >= 0x80 as an identifier character, so a
+# multibyte UTF-8 character is consumed whole.
+#
+# The backtick-quoted form (`SELECT 1 AS ``café```) already worked; this covers
+# the bare form. Uses file-unique table names. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+# A multibyte column alias parses, and the value comes back under it.
+query
+SELECT 'x' AS café
+----
+x
+
+# The alias is a real identifier: it can be referenced from an outer query.
+query
+SELECT café FROM (SELECT 'hi' AS café) AS t
+----
+hi
+
+# Several scripts in one statement (Latin-1 supplement, Greek, Cyrillic).
+query
+SELECT 1 AS naïve, 2 AS Ω, 3 AS текст
+----
+1	2	3
+
+# A multibyte column name in a real table round-trips through CREATE / INSERT /
+# SELECT, and is usable in a WHERE predicate.
+statement ok
+CREATE TABLE uniqident (id INT PRIMARY KEY, café INT, числó INT)
+
+statement ok
+INSERT INTO uniqident VALUES (1, 42, 7)
+
+query
+SELECT café, числó FROM uniqident WHERE id = 1
+----
+42	7
+
+query
+SELECT id FROM uniqident WHERE café = 42 AND числó = 7
+----
+1
+
+# A multibyte identifier in ORDER BY.
+statement ok
+INSERT INTO uniqident VALUES (2, 10, 99)
+
+query
+SELECT id FROM uniqident ORDER BY café
+----
+2
+1

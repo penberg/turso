@@ -209,7 +209,9 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        // Identifier bytes are ASCII by construction, so this is valid UTF-8.
+        // The run is ASCII identifier bytes and/or whole multibyte UTF-8
+        // characters (every byte of one is `>= 0x80`, so a character is never
+        // split), which is valid UTF-8; `from_utf8_lossy` is a safe fallback.
         let s = String::from_utf8_lossy(&self.input[start..self.pos]).into_owned();
         Token::Word(s)
     }
@@ -483,11 +485,21 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 }
 
 fn is_ident_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c == b'$'
+    c.is_ascii_alphabetic() || c == b'_' || c == b'$' || is_ident_multibyte(c)
 }
 
 fn is_ident_cont(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || is_ident_multibyte(c)
+}
+
+/// Whether `c` is a byte of a multibyte UTF-8 character (a lead or continuation
+/// byte, `>= 0x80`). MySQL admits Unicode characters in the basic multilingual
+/// plane in an unquoted identifier (`SELECT 1 AS café`), so the lexer treats any
+/// non-ASCII byte as an identifier character: a multibyte sequence is consumed
+/// whole, since all of its bytes are `>= 0x80`. (An ASCII-only identifier still
+/// goes through the cheaper checks first.)
+fn is_ident_multibyte(c: u8) -> bool {
+    c >= 0x80
 }
 
 #[cfg(test)]
@@ -605,6 +617,27 @@ mod tests {
         // The markers are lexical, so an identical sequence inside a string
         // literal is left untouched.
         assert_eq!(first_string("SELECT '/*!40101 x */'"), "/*!40101 x */");
+    }
+
+    #[test]
+    fn unquoted_identifiers_admit_multibyte_characters() {
+        // A multibyte UTF-8 character is consumed whole as one identifier word,
+        // matching MySQL's Unicode unquoted identifiers.
+        assert_eq!(tokens("café"), vec![word("café")]);
+        assert_eq!(tokens("naïve"), vec![word("naïve")]);
+        assert_eq!(tokens("Ω"), vec![word("Ω")]);
+        assert_eq!(tokens("текст"), vec![word("текст")]);
+        // An identifier may mix ASCII and multibyte characters, and stops at a
+        // separator just like an ASCII one.
+        assert_eq!(
+            tokens("SELECT café AS x"),
+            vec![word("SELECT"), word("café"), word("AS"), word("x")]
+        );
+        // A `.` still separates a qualified name (it is not an identifier byte).
+        assert_eq!(
+            tokens("tÄble.cölumn"),
+            vec![word("tÄble"), Token::Dot, word("cölumn")]
+        );
     }
 
     #[test]
