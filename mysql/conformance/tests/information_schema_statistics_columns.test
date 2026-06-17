@@ -1,0 +1,44 @@
+# information_schema.STATISTICS — INDEX_SCHEMA / SUB_PART / PACKED / COMMENT /
+# INDEX_COMMENT / IS_VISIBLE / EXPRESSION columns.
+#
+# The STATISTICS emulation exposed only the catalog/schema/name/seq/column/
+# non-unique/nullable/collation/cardinality/index-type columns, so a query
+# selecting `INDEX_SCHEMA`, `SUB_PART`, `PACKED`, `COMMENT`, `INDEX_COMMENT`,
+# `IS_VISIBLE`, or `EXPRESSION` (which dbDelta and index-introspection tools read)
+# errored with "no such column". These now report the same fixed values MySQL and
+# `SHOW INDEX` already use: `INDEX_SCHEMA` is the index's database (like
+# `TABLE_SCHEMA`), `SUB_PART` / `PACKED` / `EXPRESSION` are NULL, `COMMENT` /
+# `INDEX_COMMENT` are empty, and `IS_VISIBLE` is `YES`.
+#
+# Filters by a single index name (STATISTICS orders mixed-case INDEX_NAMEs
+# case-sensitively, unlike MySQL, so a multi-index ORDER BY would diverge).
+# Expected to pass against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE wstats (id INT PRIMARY KEY, email VARCHAR(40), n INT, KEY wstats_n (n), UNIQUE KEY wstats_email (email))
+
+# A secondary (non-unique) index: schema present, prefix/packing/expression NULL,
+# comments empty, visible.
+query
+SELECT INDEX_SCHEMA, NON_UNIQUE, SUB_PART, PACKED, COMMENT, INDEX_COMMENT, IS_VISIBLE, EXPRESSION FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wstats' AND INDEX_NAME = 'wstats_n'
+----
+conformance	1	NULL	NULL			YES	NULL
+
+# The unique secondary index reports NON_UNIQUE = 0; the new columns are the same.
+query
+SELECT INDEX_SCHEMA, NON_UNIQUE, SUB_PART, PACKED, IS_VISIBLE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wstats' AND INDEX_NAME = 'wstats_email'
+----
+conformance	0	NULL	NULL	YES
+
+# The primary key likewise reports INDEX_SCHEMA and IS_VISIBLE.
+query
+SELECT INDEX_SCHEMA, COLUMN_NAME, IS_VISIBLE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wstats' AND INDEX_NAME = 'PRIMARY'
+----
+conformance	id	YES
+
+# Filtering on the fixed IS_VISIBLE flag selects every index row of the table
+# (one per index column: PRIMARY, wstats_n, wstats_email).
+query
+SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wstats' AND IS_VISIBLE = 'YES'
+----
+3

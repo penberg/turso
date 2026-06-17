@@ -10692,10 +10692,19 @@ fn is_information_schema_tables(name: &ast::QualifiedName) -> bool {
 /// database (rare) keeps the placeholder, since the real schema is then unknown.
 fn info_schema_with_schema(sql: &str, current_db: Option<&str>) -> String {
     match current_db {
-        Some(db) => sql.replace(
-            "'def' AS TABLE_SCHEMA",
-            &format!("'{}' AS TABLE_SCHEMA", db.replace('\'', "''")),
-        ),
+        Some(db) => {
+            let db = db.replace('\'', "''");
+            // `STATISTICS` also carries an `INDEX_SCHEMA` placeholder (the index's
+            // schema, the same database); substitute it the same way.
+            sql.replace(
+                "'def' AS TABLE_SCHEMA",
+                &format!("'{db}' AS TABLE_SCHEMA"),
+            )
+            .replace(
+                "'def' AS INDEX_SCHEMA",
+                &format!("'{db}' AS INDEX_SCHEMA"),
+            )
+        }
         None => sql.to_string(),
     }
 }
@@ -10964,24 +10973,39 @@ fn is_information_schema_statistics(name: &ast::QualifiedName) -> bool {
 /// `SHOW INDEX` form is also supported.
 ///
 /// Parsed with the engine parser (`turso_parser`), like the `COLUMNS` emulation,
-/// because of the `pragma_*` table functions. Divergences (see `mysql/COMPAT.md`):
-/// `TABLE_SCHEMA` is the placeholder `def` (filtering on it matches nothing);
-/// `CARDINALITY` is `0` (no statistics); and an unnamed unique constraint
-/// (SQLite's `origin = 'u'` auto-index) is not reported, since its engine name is
-/// not MySQL's.
+/// because of the `pragma_*` table functions. `TABLE_SCHEMA` / `INDEX_SCHEMA`
+/// report the connection's current database (substituted in both UNION branches),
+/// so filtering on them selects the expected rows. Divergences (see
+/// `mysql/COMPAT.md`): `CARDINALITY` is `0` (no statistics), `SUB_PART` / `PACKED`
+/// / `EXPRESSION` are NULL, and an unnamed unique constraint (SQLite's
+/// `origin = 'u'` auto-index) is not reported, since its engine name is not
+/// MySQL's.
 fn information_schema_statistics_select(current_db: Option<&str>) -> ast::Select {
+    // `INDEX_SCHEMA` mirrors `TABLE_SCHEMA` (the index lives in the same schema);
+    // it carries the `AS INDEX_SCHEMA` alias in both branches so
+    // `info_schema_with_schema` substitutes the current database into it too.
+    // `SUB_PART` / `PACKED` / `EXPRESSION` are NULL (no prefix length, packing, or
+    // functional-index expression tracked), `COMMENT` / `INDEX_COMMENT` are empty,
+    // and `IS_VISIBLE` is `YES` -- the same fixed values `SHOW INDEX` reports.
     const SQL: &str = "SELECT \
          'def' AS TABLE_CATALOG, \
          'def' AS TABLE_SCHEMA, \
          m.name AS TABLE_NAME, \
          0 AS NON_UNIQUE, \
+         'def' AS INDEX_SCHEMA, \
          'PRIMARY' AS INDEX_NAME, \
          ROW_NUMBER() OVER (PARTITION BY m.name ORDER BY p.cid) AS SEQ_IN_INDEX, \
          p.name AS COLUMN_NAME, \
          'A' AS COLLATION, \
          0 AS CARDINALITY, \
+         NULL AS SUB_PART, \
+         NULL AS PACKED, \
          '' AS NULLABLE, \
-         'BTREE' AS INDEX_TYPE \
+         'BTREE' AS INDEX_TYPE, \
+         '' AS COMMENT, \
+         '' AS INDEX_COMMENT, \
+         'YES' AS IS_VISIBLE, \
+         NULL AS EXPRESSION \
          FROM sqlite_schema m \
          JOIN pragma_table_info(m.name) p \
          WHERE m.type = 'table' AND p.pk > 0 \
@@ -10993,13 +11017,20 @@ fn information_schema_statistics_select(current_db: Option<&str>) -> ast::Select
          'def' AS TABLE_SCHEMA, \
          m.name, \
          CASE WHEN il.\"unique\" = 1 THEN 0 ELSE 1 END, \
+         'def' AS INDEX_SCHEMA, \
          il.name, \
          ii.seqno + 1, \
          ii.name, \
          'A', \
          0, \
+         NULL, \
+         NULL, \
          CASE WHEN ti.\"notnull\" = 1 THEN '' ELSE 'YES' END, \
-         'BTREE' \
+         'BTREE', \
+         '', \
+         '', \
+         'YES', \
+         NULL \
          FROM sqlite_schema m \
          JOIN pragma_index_list(m.name) il \
          JOIN pragma_index_info(il.name) ii \
