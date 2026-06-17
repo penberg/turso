@@ -1,0 +1,65 @@
+# SHOW [FULL] TABLES WHERE — row filter over the output columns.
+#
+# Besides `LIKE 'pat'`, MySQL's `SHOW TABLES` accepts a `WHERE` clause filtering
+# its output rows on the name column (`Tables_in_<db>`) and, under `FULL`, the
+# `Table_type` column (`BASE TABLE` / `VIEW`). WordPress's `wpdb` recognizes this
+# form (`SHOW TABLES WHERE Name = 'wp_posts'`) in its query parser, and tools /
+# ORMs use `WHERE Table_type = 'BASE TABLE'` to list base tables excluding views.
+# The front-end previously rejected any `WHERE` form ("SHOW is not supported
+# yet"); it now applies `=` / `LIKE` predicates (optionally `AND`-combined) over
+# those columns.
+#
+# Runs against the shared `conformance` database, so the name column is
+# `Tables_in_conformance` on both targets. Uses a file-unique `swtw_` prefix and
+# bounds the multi-row queries with a `LIKE` on the name so other tests' tables
+# do not affect the comparison. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE swtw_one (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE swtw_two (id INT PRIMARY KEY)
+
+statement ok
+CREATE VIEW swtw_view AS SELECT id FROM swtw_one
+
+# `WHERE Tables_in_<db> = 'name'` matches that one table by exact name.
+query
+SHOW TABLES WHERE Tables_in_conformance = 'swtw_one'
+----
+swtw_one
+
+# A `LIKE` predicate on the name column honors MySQL's backslash escape, so `\_`
+# is a literal underscore; plain SHOW TABLES lists the view too.
+query
+SHOW TABLES WHERE Tables_in_conformance LIKE 'swtw\_%'
+----
+swtw_one
+swtw_two
+swtw_view
+
+# `SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'` excludes the view; the
+# `AND` bounds the result to this test's tables.
+query
+SHOW FULL TABLES WHERE Table_type = 'BASE TABLE' AND Tables_in_conformance LIKE 'swtw\_%'
+----
+swtw_one	BASE TABLE
+swtw_two	BASE TABLE
+
+# `Table_type = 'VIEW'` selects only the view.
+query
+SHOW FULL TABLES WHERE Table_type = 'VIEW' AND Tables_in_conformance LIKE 'swtw\_%'
+----
+swtw_view	VIEW
+
+# A name-column predicate under FULL still tags the row by its type.
+query
+SHOW FULL TABLES WHERE Tables_in_conformance = 'swtw_view'
+----
+swtw_view	VIEW
+
+# A non-matching predicate returns no rows.
+query
+SHOW TABLES WHERE Tables_in_conformance = 'swtw_nope'
+----

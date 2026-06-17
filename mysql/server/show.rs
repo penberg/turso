@@ -681,6 +681,29 @@ fn is_table_constraint_keyword(word: &str) -> bool {
 struct ShowTables {
     full: bool,
     like: Option<String>,
+    /// Predicates from a trailing `WHERE ...` clause (empty if none). MySQL's
+    /// `SHOW TABLES WHERE` filters the output rows on its two columns; only `=` /
+    /// `LIKE` predicates over the name column (`Tables_in_<db>`) and the
+    /// `Table_type` column (present under `FULL`), optionally `AND`-combined, are
+    /// recognized — a more complex `WHERE` falls through as unsupported.
+    where_filters: Vec<TableFilter>,
+}
+
+/// Which `SHOW [FULL] TABLES` output column a [`TableFilter`] matches.
+enum TableFilterColumn {
+    /// The table-name column, `Tables_in_<db>` in MySQL.
+    Name,
+    /// The `Table_type` column (`BASE TABLE` / `VIEW`), present under `FULL`.
+    Type,
+}
+
+/// A single `col {= | LIKE} 'value'` predicate from a `SHOW [FULL] TABLES WHERE`
+/// clause.
+struct TableFilter {
+    column: TableFilterColumn,
+    /// `true` for `LIKE` (wildcard match), `false` for `=` (exact match).
+    like: bool,
+    value: String,
 }
 
 /// Selects user base tables from the engine schema for `SHOW TABLES` / `SHOW
@@ -712,6 +735,27 @@ fn build_tables(conn: &Arc<Connection>, show: &ShowTables) -> Result<ColumnsResu
             " AND name LIKE '{}' ESCAPE '\\'",
             pat.replace('\'', "''")
         ));
+    }
+    // Apply a trailing `WHERE` clause's predicates (MySQL filters the output rows
+    // on the name / `Table_type` columns). The name column maps to `name`; the
+    // `Table_type` column maps to the rendered `BASE TABLE` / `VIEW` string so a
+    // `=` / `LIKE` over it compares against what the result set shows.
+    for filter in &show.where_filters {
+        let escaped = filter.value.replace('\'', "''");
+        let column = match filter.column {
+            TableFilterColumn::Name => "name".to_string(),
+            // `view` is the only non-table row type listed; everything else is a
+            // base table.
+            TableFilterColumn::Type => {
+                "(CASE WHEN type = 'view' THEN 'VIEW' ELSE 'BASE TABLE' END)".to_string()
+            }
+        };
+        if filter.like {
+            // MySQL's `LIKE` honors the default backslash escape, as elsewhere.
+            query.push_str(&format!(" AND {column} LIKE '{escaped}' ESCAPE '\\'"));
+        } else {
+            query.push_str(&format!(" AND {column} = '{escaped}'"));
+        }
     }
     query.push_str(" ORDER BY name");
 
@@ -1325,8 +1369,13 @@ fn parse_describe(sql: &str) -> Option<ShowColumns> {
     })
 }
 
-/// Parses `SHOW [FULL] TABLES [{FROM|IN} db] [LIKE 'pat']`. Returns `None` for
-/// any other statement, including `SHOW TABLES ... WHERE ...` (not handled).
+/// Parses `SHOW [FULL] TABLES [{FROM|IN} db] [LIKE 'pat' | WHERE <preds>]`.
+/// Returns `None` for any other statement. The `WHERE` form recognizes one or
+/// more `col {= | LIKE} 'value'` predicates `AND`-combined, where `col` is the
+/// name column (`Tables_in_<db>`, any `Tables_in_*` identifier) or `Table_type`
+/// (only under `FULL`, since plain `SHOW TABLES` has no such column — matching
+/// MySQL); anything more complex (`OR`, a non-string value, an unknown column)
+/// falls through as unsupported.
 fn parse_show_tables(sql: &str) -> Option<ShowTables> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = tokenize(trimmed);
@@ -1369,11 +1418,58 @@ fn parse_show_tables(sql: &str) -> Option<ShowTables> {
         None
     };
 
-    // Any trailing tokens (e.g. WHERE) are not handled here.
+    // Optional `WHERE <pred> [AND <pred>]...` (mutually exclusive with `LIKE` in
+    // MySQL). Each predicate is `col {= | LIKE} 'value'`.
+    let mut where_filters = Vec::new();
+    if like.is_none() && toks.get(k).is_some_and(|t| kw(t, "WHERE")) {
+        k += 1;
+        loop {
+            // The column: the name column (`Tables_in_<db>`) or `Table_type`.
+            let col = toks.get(k)?;
+            let column = if col.to_ascii_lowercase().starts_with("tables_in_") {
+                TableFilterColumn::Name
+            } else if kw(col, "Table_type") && full {
+                TableFilterColumn::Type
+            } else {
+                return None;
+            };
+            k += 1;
+
+            let like = match toks.get(k)?.as_str() {
+                "=" => false,
+                t if kw(t, "LIKE") => true,
+                _ => return None,
+            };
+            k += 1;
+
+            let value = unquote_token(toks.get(k)?)?;
+            k += 1;
+
+            where_filters.push(TableFilter {
+                column,
+                like,
+                value,
+            });
+
+            // Continue only across an `AND`; anything else ends the clause.
+            if toks.get(k).is_some_and(|t| kw(t, "AND")) {
+                k += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Any further tokens (a trailing `WHERE` after `LIKE`, an `OR`, etc.) are
+    // not handled here, so the statement falls through as unsupported.
     if k != toks.len() {
         return None;
     }
-    Some(ShowTables { full, like })
+    Some(ShowTables {
+        full,
+        like,
+        where_filters,
+    })
 }
 
 /// The 18 columns of MySQL 8's `SHOW TABLE STATUS` result set, in order.
@@ -1789,6 +1885,45 @@ mod tests {
         // Not SHOW TABLES, or an unhandled WHERE form.
         assert!(parse_show_tables("SHOW COLUMNS FROM t").is_none());
         assert!(parse_show_tables("SHOW TABLES WHERE 1").is_none());
+    }
+
+    #[test]
+    fn parses_show_tables_where() {
+        // `WHERE Tables_in_<db> = 'name'` filters on the name column.
+        let p = parse_show_tables("SHOW TABLES WHERE Tables_in_conformance = 'swt'").unwrap();
+        assert!(!p.full);
+        assert_eq!(p.where_filters.len(), 1);
+        assert!(matches!(p.where_filters[0].column, TableFilterColumn::Name));
+        assert!(!p.where_filters[0].like);
+        assert_eq!(p.where_filters[0].value, "swt");
+
+        // `LIKE` on the name column.
+        let p = parse_show_tables("SHOW TABLES WHERE Tables_in_db LIKE 'wp\\_%'").unwrap();
+        assert!(p.where_filters[0].like);
+        assert_eq!(p.where_filters[0].value, "wp\\_%");
+
+        // `Table_type` is only a column under FULL; an `AND` combines predicates.
+        let p = parse_show_tables(
+            "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE' AND Tables_in_db = 'swt'",
+        )
+        .unwrap();
+        assert!(p.full);
+        assert_eq!(p.where_filters.len(), 2);
+        assert!(matches!(p.where_filters[0].column, TableFilterColumn::Type));
+        assert!(matches!(p.where_filters[1].column, TableFilterColumn::Name));
+
+        // A backtick-quoted name column is accepted.
+        assert!(parse_show_tables("SHOW TABLES WHERE `Tables_in_db` = 'x'").is_some());
+
+        // `Table_type` without FULL has no such column in MySQL, so it falls
+        // through as unsupported; so does an `OR`, a bare integer, or a trailing
+        // `WHERE` after `LIKE`.
+        assert!(parse_show_tables("SHOW TABLES WHERE Table_type = 'BASE TABLE'").is_none());
+        assert!(
+            parse_show_tables("SHOW TABLES WHERE Tables_in_db = 'a' OR Tables_in_db = 'b'")
+                .is_none()
+        );
+        assert!(parse_show_tables("SHOW TABLES LIKE 'a%' WHERE Tables_in_db = 'a'").is_none());
     }
 
     #[test]
