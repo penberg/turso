@@ -648,7 +648,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement   | Status | Comment |
 |-------------|--------|---------|
-| DESCRIBE / DESC | ✅ | Synonym for `SHOW COLUMNS FROM tbl` (non-FULL form). The `DESCRIBE tbl col_name` column-filter form is not supported. |
-| EXPLAIN     | ❌     | MySQL `EXPLAIN` output format not produced. |
+| DESCRIBE / DESC / EXPLAIN *tbl* | ✅ | Synonym for `SHOW COLUMNS FROM tbl` (non-FULL form) — `EXPLAIN tbl` is MySQL's alias for the same. A trailing column name or wildcard (`DESCRIBE tbl col_name` / `DESCRIBE tbl 'wild'`) filters the output to the columns whose `Field` matches it as a `LIKE` pattern (a plain name selects that one column). |
+| EXPLAIN *statement* (query plan) | ❌     | `EXPLAIN [FORMAT=… \| ANALYZE] <SELECT/INSERT/…>` — the MySQL query-plan output format is not produced (only the `EXPLAIN tbl` table form above is supported). |
 | HELP        | ❌     |         |
 | USE         | ❌     | Maps conceptually to `COM_INIT_DB`; single-schema no-op. |

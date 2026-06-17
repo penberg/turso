@@ -1347,11 +1347,13 @@ fn parse_show_columns(sql: &str) -> Option<ShowColumns> {
     })
 }
 
-/// Parses `{DESCRIBE | DESC} tbl` (optionally `db.tbl`), MySQL's synonym for
-/// `SHOW COLUMNS FROM tbl`. DESCRIBE always yields the non-FULL six-column
-/// shape. The `DESCRIBE tbl col_name` / `DESCRIBE tbl 'wild'` column-filter
-/// forms are not handled here, so they fall through (and are rejected as
-/// unsupported); WordPress only issues the bare `DESCRIBE tbl` form.
+/// Parses `{DESCRIBE | DESC | EXPLAIN} tbl [col]` (optionally `db.tbl`), MySQL's
+/// synonyms for `SHOW COLUMNS FROM tbl`. It always yields the non-FULL six-column
+/// shape. A trailing `col` (`DESCRIBE tbl col_name` / `DESCRIBE tbl 'wild'`) is
+/// MySQL's column filter: the columns whose `Field` matches `col` as a `LIKE`
+/// pattern (a plain name matches that one column). `EXPLAIN` is handled only for
+/// this table form — `EXPLAIN <statement>` (a query plan) is left to fall through
+/// as unsupported.
 fn parse_describe(sql: &str) -> Option<ShowColumns> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = tokenize(trimmed);
@@ -1359,15 +1361,25 @@ fn parse_describe(sql: &str) -> Option<ShowColumns> {
 
     let kw = |t: &str, kw: &str| t.eq_ignore_ascii_case(kw);
 
+    let is_explain = toks.get(k).is_some_and(|t| kw(t, "EXPLAIN"));
     if !toks
         .get(k)
-        .is_some_and(|t| kw(t, "DESCRIBE") || kw(t, "DESC"))
+        .is_some_and(|t| kw(t, "DESCRIBE") || kw(t, "DESC") || kw(t, "EXPLAIN"))
     {
         return None;
     }
     k += 1;
 
-    let mut table = toks.get(k)?.clone();
+    // `EXPLAIN` is also `EXPLAIN [FORMAT=... | ANALYZE] <statement>` — a query
+    // plan the front-end does not support. Only the `EXPLAIN tbl` table form is a
+    // `DESCRIBE` synonym, so bail out when what follows leads an explainable
+    // statement (or the EXPLAIN options) rather than a table name.
+    let lead = toks.get(k)?;
+    if is_explain && is_explainable_statement_lead(lead) {
+        return None;
+    }
+
+    let mut table = lead.clone();
     k += 1;
     // `db.tbl`: the real table name follows the dot.
     if toks.get(k).is_some_and(|t| t == ".") {
@@ -1376,15 +1388,52 @@ fn parse_describe(sql: &str) -> Option<ShowColumns> {
         k += 1;
     }
 
-    // A trailing column name or wildcard (DESCRIBE tbl col) is not handled here.
+    // An optional trailing column name or wildcard (`DESCRIBE tbl col`): MySQL
+    // filters the output to the columns whose `Field` matches `col` as a `LIKE`
+    // pattern (a quoted `'wild'` or a bare identifier; a plain name matches that
+    // one column).
+    let filter = match toks.get(k) {
+        Some(raw) => {
+            let value = unquote_token(raw).unwrap_or_else(|| raw.clone());
+            k += 1;
+            Some(ColumnFilter {
+                column: "Field".to_string(),
+                like: true,
+                value,
+            })
+        }
+        None => None,
+    };
+
+    // Any further tokens are unsupported.
     if k != toks.len() {
         return None;
     }
     Some(ShowColumns {
         full: false,
         table,
-        filter: None,
+        filter,
     })
+}
+
+/// Whether `tok` leads an explainable statement (or an `EXPLAIN` option), so that
+/// `EXPLAIN <tok> ...` is a query plan rather than the `EXPLAIN tbl` table form.
+fn is_explainable_statement_lead(tok: &str) -> bool {
+    matches!(
+        tok.to_ascii_uppercase().as_str(),
+        "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "REPLACE"
+            | "WITH"
+            | "TABLE"
+            | "VALUES"
+            | "FORMAT"
+            | "ANALYZE"
+            | "INTO"
+            | "("
+    )
 }
 
 /// Parses `SHOW [FULL] TABLES [{FROM|IN} db] [LIKE 'pat' | WHERE <preds>]`.
@@ -2157,6 +2206,40 @@ mod tests {
             .unwrap()
             .filter
             .is_none());
+    }
+
+    #[test]
+    fn parses_describe_and_explain() {
+        // The bare DESCRIBE / DESC / EXPLAIN table form (non-FULL, no filter).
+        for sql in ["DESCRIBE t", "DESC t", "EXPLAIN t", "DESCRIBE mydb.t"] {
+            let p = parse_describe(sql).unwrap_or_else(|| panic!("{sql}"));
+            assert!(!p.full);
+            assert_eq!(p.table, "t");
+            assert!(p.filter.is_none());
+        }
+
+        // A trailing column name / wildcard becomes a `LIKE` filter on `Field`.
+        for sql in ["DESCRIBE t n", "EXPLAIN t n", "DESC t 'n%'"] {
+            let f = parse_describe(sql)
+                .unwrap_or_else(|| panic!("{sql}"))
+                .filter
+                .unwrap_or_else(|| panic!("{sql} filter"));
+            assert_eq!(f.column, "Field");
+            assert!(f.like);
+        }
+        assert_eq!(parse_describe("DESCRIBE t 'n%'").unwrap().filter.unwrap().value, "n%");
+
+        // `EXPLAIN <statement>` is a query plan, not the table form — left to fall
+        // through as unsupported.
+        for sql in [
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN ANALYZE SELECT 1",
+            "EXPLAIN FORMAT=JSON SELECT 1",
+            "EXPLAIN DELETE FROM t",
+            "EXPLAIN UPDATE t SET a = 1",
+        ] {
+            assert!(parse_describe(sql).is_none(), "{sql}");
+        }
     }
 
     #[test]

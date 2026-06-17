@@ -1,0 +1,48 @@
+# EXPLAIN <table> and DESCRIBE <table> <column>.
+#
+# MySQL's EXPLAIN tbl_name is a synonym for DESCRIBE / SHOW COLUMNS, and DESCRIBE
+# / EXPLAIN accept a trailing column name or wildcard that filters the output to
+# the matching columns (treating it as a LIKE pattern over the Field column). The
+# front-end handled only the bare DESCRIBE tbl form and rejected EXPLAIN and the
+# column-filter forms as unsupported.
+#
+# (EXPLAIN <statement> -- a query plan -- is a separate feature and stays
+# unsupported, so it is not exercised here.) The table avoids a NOT NULL column
+# with no default, whose `Default` the front-end reports as the empty string
+# rather than MySQL's NULL (a separate documented divergence). Expected to pass
+# against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE dscr (id INT PRIMARY KEY AUTO_INCREMENT, slug VARCHAR(50), n INT DEFAULT 0)
+
+# EXPLAIN tbl lists every column, like DESCRIBE / SHOW COLUMNS.
+query
+EXPLAIN dscr
+----
+id	int	NO	PRI	NULL	auto_increment
+slug	varchar(50)	YES		NULL	
+n	int	YES		0	
+
+# DESCRIBE tbl col filters the output to that one column.
+query
+DESCRIBE dscr n
+----
+n	int	YES		0	
+
+# DESC (the short keyword) with an explicit column.
+query
+DESC dscr id
+----
+id	int	NO	PRI	NULL	auto_increment
+
+# EXPLAIN tbl col filters the same way.
+query
+EXPLAIN dscr slug
+----
+slug	varchar(50)	YES		NULL	
+
+# A quoted wildcard pattern matches by LIKE over the column name.
+query
+DESCRIBE dscr 'n%'
+----
+n	int	YES		0	
