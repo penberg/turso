@@ -10893,6 +10893,16 @@ fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
               WHEN {base} IN ('bool', 'boolean') THEN 'tinyint' \
               ELSE {base} END"
     );
+    // MySQL's `COLUMN_DEFAULT` is the default's bare value, not the stored SQL
+    // literal: a string default is unquoted (`DEFAULT 'x'` -> `x`, `DEFAULT ''`
+    // -> the empty string), with any doubled inner quote un-escaped, while a
+    // numeric or expression default (`0`, `CURRENT_TIMESTAMP`) and NULL pass
+    // through. `p.dflt_value` is the literal text, so strip the surrounding
+    // single quotes off a string literal and collapse `''` to `'` -- the same
+    // normalization `SHOW COLUMNS` applies (`normalize_default`).
+    let column_default = "CASE WHEN p.dflt_value LIKE '''%''' \
+         THEN replace(substr(p.dflt_value, 2, length(p.dflt_value) - 2), '''''', '''') \
+         ELSE p.dflt_value END";
     let sql = format!(
         "SELECT \
          'def' AS TABLE_CATALOG, \
@@ -10900,7 +10910,7 @@ fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
          m.name AS TABLE_NAME, \
          p.name AS COLUMN_NAME, \
          p.cid + 1 AS ORDINAL_POSITION, \
-         p.dflt_value AS COLUMN_DEFAULT, \
+         {column_default} AS COLUMN_DEFAULT, \
          CASE WHEN p.\"notnull\" = 1 OR p.pk > 0 THEN 'NO' ELSE 'YES' END AS IS_NULLABLE, \
          {data_type} AS DATA_TYPE, \
          CASE WHEN lower(p.type) IN ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext', 'enum', 'set') THEN 'utf8mb4' ELSE NULL END AS CHARACTER_SET_NAME, \

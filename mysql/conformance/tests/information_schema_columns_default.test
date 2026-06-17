@@ -1,0 +1,50 @@
+# information_schema.COLUMNS.COLUMN_DEFAULT — bare value, not the SQL literal.
+#
+# MySQL's `COLUMN_DEFAULT` is the default's bare value: a string default is
+# reported unquoted (`DEFAULT 'x'` -> `x`, `DEFAULT ''` -> the empty string) with
+# any doubled inner quote un-escaped, while a numeric or expression default (`0`,
+# `CURRENT_TIMESTAMP`) and a NULL default pass through. The front-end derives the
+# default from the engine catalog (`pragma_table_info`), whose `dflt_value` is the
+# stored SQL literal, so `information_schema.COLUMNS` reported the quoted form
+# (`''`, `'none'`) even though `SHOW COLUMNS` already strips the quotes. WordPress
+# (`wpdb` / `dbDelta`) and migration tools compare column defaults.
+#
+# The fix strips the surrounding single quotes off a string-literal default and
+# collapses a doubled inner quote (`''` -> `'`), matching MySQL and `SHOW
+# COLUMNS`'s `normalize_default`.
+#
+# Filters by the current database and a file-unique table name, so other tests'
+# tables do not affect the comparison. Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE iscoldef (
+    id INT PRIMARY KEY,
+    name VARCHAR(60) NOT NULL DEFAULT '',
+    cnt INT NOT NULL DEFAULT 0,
+    label VARCHAR(20) DEFAULT 'none',
+    quoted VARCHAR(20) DEFAULT 'a''b',
+    flag TINYINT DEFAULT 1,
+    txt TEXT
+)
+
+# A string default is unquoted (`''` becomes the empty string, `'none'` becomes
+# `none`), a doubled inner quote is collapsed (`'a''b'` -> `a'b`), and numeric /
+# NULL defaults are unchanged.
+query
+SELECT COLUMN_NAME, COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscoldef' ORDER BY ORDINAL_POSITION
+----
+id	NULL
+name	
+cnt	0
+label	none
+quoted	a'b
+flag	1
+txt	NULL
+
+# Filtering on the normalized value works: the empty-string default matches `''`,
+# not the literal text.
+query
+SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscoldef' AND COLUMN_DEFAULT = ''
+----
+1
