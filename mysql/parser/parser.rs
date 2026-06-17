@@ -7882,18 +7882,22 @@ impl Parser {
     /// '+00:00', '+05:30')` moves the time forward 5½ hours, as in MySQL. A DATE
     /// argument is treated as midnight (the result is a DATETIME, like MySQL).
     ///
-    /// A guard returns NULL unless both offsets have the `±HH:MM` shape, so a NULL
-    /// or unparseable offset yields NULL (and a NULL `dt` propagates through
-    /// `datetime`). This matches a real mysqld with **no time-zone tables loaded**,
-    /// the common deployment. The named-zone form (`'US/Eastern'`, `'UTC'`), which
-    /// needs those tables, is the one divergence: it returns NULL here rather than
-    /// a converted value (see `mysql/COMPAT.md`).
+    /// The literal named zones `'UTC'` and `'GMT'` (case-insensitive) are accepted
+    /// — normalized to the `+00:00` offset by [`normalize_named_utc`] — since they
+    /// are available even without the time-zone tables, so `CONVERT_TZ(dt, 'UTC',
+    /// '+02:00')` works. A guard returns NULL unless both (normalized) zones have
+    /// the `±HH:MM` shape, so a NULL or unparseable zone yields NULL (and a NULL
+    /// `dt` propagates through `datetime`). This matches a real mysqld with **no
+    /// time-zone tables loaded**, the common deployment. The remaining named-zone
+    /// forms (`'US/Eastern'`, `'America/New_York'`), which need those tables, are
+    /// the one divergence: they return NULL here rather than a converted value
+    /// (see `mysql/COMPAT.md`).
     fn convert_tz_call(&mut self) -> Result<ast::Expr> {
         let dt = self.expr()?;
         self.expect(&Token::Comma, "`,`")?;
-        let from_tz = self.expr()?;
+        let from_tz = normalize_named_utc(self.expr()?);
         self.expect(&Token::Comma, "`,`")?;
-        let to_tz = self.expr()?;
+        let to_tz = normalize_named_utc(self.expr()?);
         self.expect(&Token::RParen, "`)`")?;
 
         let str_lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
@@ -10059,6 +10063,23 @@ fn unrequote(literal: &str) -> String {
         .and_then(|s| s.strip_suffix('\''))
         .unwrap_or(literal);
     inner.replace("''", "'")
+}
+
+/// Rewrites a `CONVERT_TZ` time-zone argument that is the named zone `'UTC'` or
+/// `'GMT'` (a string literal, case-insensitive) to the equivalent numeric offset
+/// `'+00:00'`, which the offset-shift lowering understands. MySQL accepts these
+/// named zones (the only ones available without the optional time-zone tables,
+/// which the engine does not have); every other value passes through unchanged
+/// (a numeric `±HH:MM` offset works as before, and an unknown named zone still
+/// yields NULL, as in MySQL without the tables loaded).
+fn normalize_named_utc(expr: ast::Expr) -> ast::Expr {
+    if let ast::Expr::Literal(ast::Literal::String(s)) = &expr {
+        let inner = unrequote(s);
+        if inner.eq_ignore_ascii_case("UTC") || inner.eq_ignore_ascii_case("GMT") {
+            return ast::Expr::Literal(ast::Literal::String(requote("+00:00")));
+        }
+    }
+    expr
 }
 
 /// Whether `tok` is one of the keywords that introduces a join clause, used to
@@ -16538,6 +16559,25 @@ mod tests {
             panic!("expected a printf() modifier");
         };
         assert_eq!(inner.as_str(), "printf");
+    }
+
+    #[test]
+    fn convert_tz_normalizes_named_utc() {
+        let lit = |s: &str| ast::Expr::Literal(ast::Literal::String(requote(s)));
+        // The named zones `UTC` / `GMT` (case-insensitive) fold to the `+00:00`
+        // offset the lowering understands.
+        for z in ["UTC", "utc", "GMT", "Gmt"] {
+            assert_eq!(normalize_named_utc(lit(z)), lit("+00:00"));
+        }
+        // A numeric offset and any other zone pass through unchanged.
+        assert_eq!(normalize_named_utc(lit("+05:30")), lit("+05:30"));
+        assert_eq!(
+            normalize_named_utc(lit("America/New_York")),
+            lit("America/New_York")
+        );
+        // A non-literal (e.g. a column) is untouched.
+        let col = parse_expr("tz_col").unwrap();
+        assert_eq!(normalize_named_utc(col.clone()), col);
     }
 
     #[test]

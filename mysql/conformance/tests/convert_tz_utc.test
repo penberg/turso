@@ -1,0 +1,40 @@
+# CONVERT_TZ with the named zone 'UTC' / 'GMT'.
+#
+# CONVERT_TZ(dt, from_tz, to_tz) shifts a datetime between time zones. The
+# front-end lowers it to numeric ±HH:MM-offset arithmetic, so a numeric offset
+# works but a named zone yielded NULL. MySQL accepts the named zones 'UTC' and
+# 'GMT' even without the optional time-zone tables loaded, so the front-end now
+# normalizes those literals to the +00:00 offset.
+#
+# (Other named zones like 'America/New_York' still need the time-zone tables the
+# engine lacks, so they remain NULL; not exercised here.) Expected to pass against
+# both turso-mysql-server and a real mysqld.
+
+# UTC -> UTC is the identity.
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', 'UTC', 'UTC')
+----
+2024-06-15 12:00:00
+
+# Named UTC on either side combines with a numeric offset.
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', 'UTC', '+02:00')
+----
+2024-06-15 14:00:00
+
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', '+05:30', 'UTC')
+----
+2024-06-15 06:30:00
+
+# 'GMT' is equivalent, and the zone name is case-insensitive.
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', 'gmt', '+05:30')
+----
+2024-06-15 17:30:00
+
+# A plain numeric-offset conversion still works.
+query
+SELECT CONVERT_TZ('2024-06-15 12:00:00', '+00:00', '-08:00')
+----
+2024-06-15 04:00:00
