@@ -93,6 +93,10 @@ impl<'a> Lexer<'a> {
             },
             b'+' => self.single(Token::Plus),
             b'?' => self.single(Token::Param),
+            // MySQL system-variable reference `@@[scope.]name`. A single `@` (a
+            // user variable) is not part of the supported grammar and lexes as
+            // `Other('@')` below.
+            b'@' if self.peek_at(1) == Some(b'@') => self.read_system_var(),
             b'`' => self.read_delimited(b'`', "identifier")?,
             // In MySQL's default `sql_mode` a double-quoted token is a string
             // literal, not an identifier (which uses backticks); `ANSI_QUOTES`
@@ -208,6 +212,35 @@ impl<'a> Lexer<'a> {
         // Identifier bytes are ASCII by construction, so this is valid UTF-8.
         let s = String::from_utf8_lossy(&self.input[start..self.pos]).into_owned();
         Token::Word(s)
+    }
+
+    /// Reads a MySQL system-variable reference `@@[scope.]name`, the leading `@@`
+    /// at the cursor. A `session.` / `global.` / `local.` scope qualifier is
+    /// recognized and stripped, leaving the bare variable name in the token.
+    fn read_system_var(&mut self) -> Token {
+        self.pos += 2; // consume `@@`
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            // The name may carry a `scope.` prefix, so `.` is part of the run.
+            if is_ident_cont(c) || c == b'.' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let raw = String::from_utf8_lossy(&self.input[start..self.pos]).into_owned();
+        let name = match raw.split_once('.') {
+            Some((scope, rest))
+                if matches!(
+                    scope.to_ascii_lowercase().as_str(),
+                    "session" | "global" | "local"
+                ) =>
+            {
+                rest.to_string()
+            }
+            _ => raw,
+        };
+        Token::SystemVar(name)
     }
 
     fn read_number(&mut self) -> Token {
@@ -470,6 +503,35 @@ mod tests {
                 _ => None,
             })
             .expect("a string token")
+    }
+
+    #[test]
+    fn lexes_system_variable() {
+        // `@@name` becomes a `SystemVar` token holding the bare name.
+        assert_eq!(
+            tokens("@@max_allowed_packet"),
+            vec![Token::SystemVar("max_allowed_packet".to_string())]
+        );
+        // The `session.` / `global.` / `local.` scope prefix is stripped.
+        assert_eq!(
+            tokens("@@global.autocommit"),
+            vec![Token::SystemVar("autocommit".to_string())]
+        );
+        assert_eq!(
+            tokens("@@SESSION.sql_mode"),
+            vec![Token::SystemVar("sql_mode".to_string())]
+        );
+        // It composes with operators: `@@x > 0`.
+        assert_eq!(
+            tokens("@@version_compile_os>0"),
+            vec![
+                Token::SystemVar("version_compile_os".to_string()),
+                Token::Gt,
+                Token::Num("0".to_string()),
+            ]
+        );
+        // A single `@` (a user variable) is not a system variable.
+        assert_eq!(tokens("@x"), vec![Token::Other('@'), Token::Word("x".to_string())]);
     }
 
     #[test]

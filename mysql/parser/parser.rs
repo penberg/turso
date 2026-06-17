@@ -4121,6 +4121,26 @@ impl Parser {
                 self.advance();
                 Ok(ast::Expr::Literal(ast::Literal::Blob(b)))
             }
+            // A MySQL system variable `@@[scope.]name` folds to its constant value
+            // (the same table the server reports for `SELECT @@var` / `SHOW
+            // VARIABLES`), so it works inside an expression (`LENGTH(@@version)`,
+            // `@@max_allowed_packet > 0`). A numeric value becomes a numeric
+            // literal so arithmetic / comparison behave as in MySQL; any other
+            // value becomes a string literal. An unmodelled variable is rejected,
+            // since the front-end reports only a fixed set.
+            Some(Token::SystemVar(name)) => {
+                let name = name.clone();
+                self.advance();
+                let value = crate::system_variable_value(&name).ok_or_else(|| {
+                    ParseError::Unsupported(format!("system variable @@{name} is not supported yet"))
+                })?;
+                let literal = if value.parse::<i64>().is_ok() {
+                    ast::Literal::Numeric(value.to_string())
+                } else {
+                    ast::Literal::String(requote(value))
+                };
+                Ok(ast::Expr::Literal(literal))
+            }
             // A `?` positional placeholder, bound at execution time. Each one
             // takes the next 1-based parameter index in appearance order.
             Some(Token::Param) => {

@@ -1,0 +1,50 @@
+# @@system_variable references inside expressions.
+#
+# MySQL lets a `@@var` system-variable reference appear anywhere a value can
+# (`LENGTH(@@version)`, `@@max_allowed_packet > 0`, `WHERE @@autocommit = 1`),
+# not only as a bare `SELECT @@var`. The front-end answered only the bare form
+# (in the session dispatcher) and the lexer rejected `@` inside an expression.
+# The lexer now tokenizes `@@[scope.]name` and the parser folds it to the same
+# constant value the server reports for `SELECT @@var` / `SHOW VARIABLES`, so it
+# works in expressions.
+#
+# Uses variables whose front-end value equals a real mysqld's
+# (@@max_allowed_packet = 67108864, @@autocommit = 1, @@foreign_key_checks = 1,
+# @@lower_case_table_names = 0, @@version_compile_os = 'Linux'), so the results
+# match. Expected to pass against both turso-mysql-server and a real mysqld.
+
+# A numeric variable behaves numerically: comparison and arithmetic.
+query
+SELECT @@max_allowed_packet > 0, @@max_allowed_packet + 1
+----
+1	67108865
+
+# Boolean/flag variables compare as expected.
+query
+SELECT @@autocommit = 1, @@foreign_key_checks = 1, @@lower_case_table_names = 0
+----
+1	1	1
+
+# A string variable works inside string functions.
+query
+SELECT LENGTH(@@version_compile_os), CONCAT('os=', @@version_compile_os)
+----
+5	os=Linux
+
+# An explicit scope qualifier (`@@global.` / `@@session.`) is accepted.
+query
+SELECT @@global.max_allowed_packet > 1000, @@session.autocommit = 1
+----
+1	1
+
+# Usable in a WHERE clause.
+statement ok
+CREATE TABLE sysvar_t (id INT PRIMARY KEY)
+
+statement ok
+INSERT INTO sysvar_t VALUES (1), (2)
+
+query
+SELECT id FROM sysvar_t WHERE @@autocommit = 1 AND id = 2
+----
+2

@@ -9,6 +9,12 @@
 //! of) the `CREATE TABLE`-only front-end parser, so that real MySQL clients can
 //! connect and reach the statements the parser does support.
 
+// The system-variable table lives in the parser crate (the single source of
+// truth) so the parser can fold an `@@var` reference inside an expression to its
+// value; re-export it here for the `SHOW VARIABLES` path in `show.rs`.
+pub use turso_mysql_parser::{system_variable_value, SYSTEM_VARIABLES};
+use turso_mysql_parser::SERVER_VERSION;
+
 /// A canned response to a recognized session query.
 pub enum SessionResponse {
     /// Reply with a bare OK packet (no result set).
@@ -104,7 +110,13 @@ fn eval(expr: &str) -> Option<Option<String>> {
             .trim_start_matches("SESSION.")
             .trim_start_matches("global.")
             .trim_start_matches("GLOBAL.");
-        return Some(Some(system_variable(name)));
+        // Only a bare `@@var` reference is answered here; `@@var <op> ...` and
+        // other expressions over it are not a plain variable name, so let them
+        // fall through to the parser (which folds `@@var` to its value).
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(Some(system_variable(name)));
+        }
+        return None;
     }
     match expr.to_ascii_uppercase().as_str() {
         "VERSION()" => Some(Some(SERVER_VERSION.to_string())),
@@ -117,72 +129,11 @@ fn eval(expr: &str) -> Option<Option<String>> {
     }
 }
 
-const SERVER_VERSION: &str = "8.0.0-turso";
-
-/// The MySQL system variables the front-end reports plausible constant values
-/// for, as `(name, value)` pairs. Values are rendered as text (the text protocol
-/// sends everything as strings). This is the single source of truth for both
-/// `SELECT @@var` (here) and `SHOW VARIABLES [LIKE ...]` (in `show.rs`).
-pub const SYSTEM_VARIABLES: &[(&str, &str)] = &[
-    ("autocommit", "1"),
-    ("big_tables", "0"),
-    ("character_set_client", "utf8mb4"),
-    ("character_set_connection", "utf8mb4"),
-    ("character_set_database", "utf8mb4"),
-    ("character_set_results", "utf8mb4"),
-    ("character_set_server", "utf8mb4"),
-    ("character_set_system", "utf8mb3"),
-    ("collation_connection", "utf8mb4_general_ci"),
-    ("collation_database", "utf8mb4_general_ci"),
-    ("collation_server", "utf8mb4_general_ci"),
-    ("default_storage_engine", "InnoDB"),
-    ("default_tmp_storage_engine", "InnoDB"),
-    ("foreign_key_checks", "1"),
-    ("group_concat_max_len", "1024"),
-    ("have_query_cache", "NO"),
-    ("hostname", "turso"),
-    ("init_connect", ""),
-    ("innodb_strict_mode", "1"),
-    ("interactive_timeout", "28800"),
-    ("license", "MIT"),
-    ("lower_case_table_names", "0"),
-    ("max_allowed_packet", "67108864"),
-    ("max_execution_time", "0"),
-    ("net_buffer_length", "16384"),
-    ("net_read_timeout", "30"),
-    ("net_write_timeout", "60"),
-    ("performance_schema", "0"),
-    ("protocol_version", "10"),
-    ("sql_auto_is_null", "0"),
-    ("sql_big_selects", "1"),
-    ("sql_mode", ""),
-    ("sql_notes", "1"),
-    ("sql_safe_updates", "0"),
-    ("sql_select_limit", "18446744073709551615"),
-    ("sql_warnings", "0"),
-    ("system_time_zone", "UTC"),
-    ("time_zone", "SYSTEM"),
-    ("transaction_isolation", "REPEATABLE-READ"),
-    ("transaction_read_only", "0"),
-    ("tx_isolation", "REPEATABLE-READ"),
-    ("tx_read_only", "0"),
-    ("unique_checks", "1"),
-    ("version", SERVER_VERSION),
-    ("version_comment", "Turso MySQL front-end"),
-    ("version_compile_os", "Linux"),
-    ("wait_timeout", "28800"),
-];
-
 /// Returns a plausible value for a MySQL system variable. Values are rendered as
 /// text (the text protocol sends everything as strings); unknown variables yield
 /// an empty string.
 fn system_variable(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    SYSTEM_VARIABLES
-        .iter()
-        .find(|(n, _)| *n == lower)
-        .map(|(_, v)| (*v).to_string())
-        .unwrap_or_default()
+    system_variable_value(name).unwrap_or_default().to_string()
 }
 
 /// Drops a trailing `LIMIT ...` clause (clients append `LIMIT 1` to some probes).

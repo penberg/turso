@@ -61,6 +61,10 @@ pub enum Token {
     Plus,
     /// `?` — a positional statement-parameter placeholder.
     Param,
+    /// A MySQL system-variable reference `@@[scope.]name`, holding the variable
+    /// name with any `session.` / `global.` / `local.` scope prefix stripped
+    /// (e.g. `@@global.max_allowed_packet` → `max_allowed_packet`).
+    SystemVar(String),
     /// Any other single character (operators like `*`, `<`, `=`, etc.). The
     /// supported grammar never consumes these, but lexing them keeps
     /// unsupported statements parseable enough to be reported cleanly.
@@ -97,6 +101,7 @@ impl Token {
             Token::Minus => "`-`".to_string(),
             Token::Plus => "`+`".to_string(),
             Token::Param => "`?`".to_string(),
+            Token::SystemVar(name) => format!("system variable `@@{name}`"),
             Token::Other(c) => format!("`{c}`"),
         }
     }
