@@ -1,0 +1,55 @@
+# information_schema.COLUMNS.EXTRA — auto_increment flag.
+#
+# MySQL reports `auto_increment` in a column's `EXTRA` for an `AUTO_INCREMENT`
+# column. A MySQL `AUTO_INCREMENT` column lowers to the engine's rowid
+# `AUTOINCREMENT` on the single integer primary key, and `SHOW COLUMNS` already
+# recovers it (it reads the stored `CREATE TABLE` text for the keyword), but the
+# `information_schema.COLUMNS` rewrite reported an empty `EXTRA` for every column.
+# WordPress's schema diffing (`dbDelta`) and migration tools read `EXTRA` to know
+# which column auto-increments.
+#
+# The fix flags the primary-key column when the table's stored schema carries the
+# `AUTOINCREMENT` keyword -- the same condition `SHOW COLUMNS` uses -- so a plain
+# `INTEGER PRIMARY KEY` (no `AUTO_INCREMENT`) and a composite primary key, which
+# the engine never marks `AUTOINCREMENT`, correctly stay empty.
+#
+# Filters by the current database and file-unique table names. Expected to pass
+# against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE iscolx_ai (id INT PRIMARY KEY AUTO_INCREMENT, slug VARCHAR(60) NOT NULL, n INT DEFAULT 0)
+
+statement ok
+CREATE TABLE iscolx_plain (id INT PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE iscolx_comp (a INT, b INT, PRIMARY KEY (a, b))
+
+# The auto-increment primary key reports `auto_increment`; the other columns are
+# empty.
+query
+SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscolx_ai' ORDER BY ORDINAL_POSITION
+----
+id	auto_increment
+slug	
+n	
+
+# A plain (non-auto-increment) primary key stays empty.
+query
+SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscolx_plain' ORDER BY ORDINAL_POSITION
+----
+id	
+v	
+
+# A composite primary key (never auto-increment) stays empty for both columns.
+query
+SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscolx_comp' ORDER BY ORDINAL_POSITION
+----
+a	
+b	
+
+# Filtering on the flag finds exactly the one auto-increment column.
+query
+SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'iscolx\_%' AND EXTRA = 'auto_increment'
+----
+1

@@ -10917,7 +10917,8 @@ fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
          CASE WHEN lower(p.type) IN ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext', 'enum', 'set') THEN 'utf8mb4_general_ci' ELSE NULL END AS COLLATION_NAME, \
          lower(p.type) AS COLUMN_TYPE, \
          CASE WHEN p.pk > 0 THEN 'PRI' ELSE '' END AS COLUMN_KEY, \
-         '' AS EXTRA \
+         CASE WHEN p.pk > 0 AND upper(m.sql) LIKE '%AUTOINCREMENT%' \
+              THEN 'auto_increment' ELSE '' END AS EXTRA \
          FROM sqlite_schema m \
          JOIN pragma_table_info(m.name) p \
          WHERE m.type = 'table' \
