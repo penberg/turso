@@ -3849,17 +3849,13 @@ impl Parser {
     /// (an uncorrelated subquery — evaluated identically on both engines).
     fn in_list(&mut self, lhs: ast::Expr, not: bool) -> Result<ast::Expr> {
         self.expect(&Token::LParen, "`(`")?;
-        // MySQL compares the operand to each list member under the default
-        // (case-insensitive) collation, but the engine compares the bare operand
-        // case-sensitively, so `'B' IN ('a', 'b')` would miss. Wrap the operand
-        // in `COLLATE NOCASE` so a string comparison folds ASCII case as MySQL
-        // does (inert for a numeric operand); it is evaluated once.
-        let lhs = nocase_collate(lhs);
         if self.eat_keyword("SELECT") {
             let rhs = self.parse_select()?;
             self.expect(&Token::RParen, "`)`")?;
             return Ok(ast::Expr::InSelect {
-                lhs: Box::new(lhs),
+                // The operand folds ASCII case so a string comparison matches
+                // MySQL's default collation (inert for a number); see below.
+                lhs: Box::new(nocase_collate(lhs)),
                 not,
                 rhs,
             });
@@ -3882,6 +3878,19 @@ impl Parser {
             break;
         }
         self.expect(&Token::RParen, "`)`")?;
+        // MySQL compares the operand to each list member. With a string operand it
+        // folds ASCII case under the default collation (the engine compares the
+        // bare operand case-sensitively, so `'B' IN ('a', 'b')` would miss); wrap
+        // it in `COLLATE NOCASE`, evaluated once. But when the operand is a
+        // function call and every member is a numeric literal, MySQL instead
+        // coerces the string result to a number, so evaluate the call in a numeric
+        // context (`+ 0`) — `WP_Date_Query` emits `DATE_FORMAT(post_date, '%H') IN
+        // (9, 10, 11)` for an hour-set filter.
+        let lhs = if is_function_call(&lhs) && rhs.iter().all(|e| is_numeric_literal(e)) {
+            numeric_coerce(lhs)
+        } else {
+            nocase_collate(lhs)
+        };
         Ok(ast::Expr::InList {
             lhs: Box::new(lhs),
             not,
@@ -3898,8 +3907,18 @@ impl Parser {
         // As with `IN`, MySQL's range comparison uses the default case-insensitive
         // collation; wrap the operand in `COLLATE NOCASE` so a string `BETWEEN`
         // folds ASCII case (`'M' BETWEEN 'a' AND 'z'` is true), inert for numbers.
+        // But when the operand is a function call and both bounds are numeric
+        // literals, MySQL coerces the string result to a number instead, so
+        // evaluate the call in a numeric context (`+ 0`) — `WP_Date_Query` emits
+        // `DATE_FORMAT(post_date, '%H.%i%s') BETWEEN 9.0 AND 13.0` for a time range.
+        let lhs = if is_function_call(&lhs) && is_numeric_literal(&start) && is_numeric_literal(&end)
+        {
+            numeric_coerce(lhs)
+        } else {
+            nocase_collate(lhs)
+        };
         Ok(ast::Expr::Between {
-            lhs: Box::new(nocase_collate(lhs)),
+            lhs: Box::new(lhs),
             not,
             start: Box::new(start),
             end: Box::new(end),
@@ -12587,6 +12606,38 @@ mod tests {
             panic!("expected an equality comparison");
         };
         assert!(matches!(&*lhs, ast::Expr::FunctionCall { .. }));
+    }
+
+    #[test]
+    fn function_in_numeric_list_or_between_is_coerced() {
+        // `f(...) IN (9, 12)` — an all-numeric list coerces the function operand.
+        let ast::Expr::InList { lhs, .. } =
+            parse_expr("DATE_FORMAT(x, '%H') IN (9, 12)").unwrap()
+        else {
+            panic!("expected an IN list");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Binary(_, ast::Operator::Add, _)));
+
+        // A mixed or string list keeps the case-folding NOCASE wrap, not `+ 0`.
+        let ast::Expr::InList { lhs, .. } = parse_expr("DATE_FORMAT(x, '%H') IN (9, 'a')").unwrap()
+        else {
+            panic!("expected an IN list");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Collate(..)));
+
+        // `f(...) BETWEEN 9.0 AND 13.0` — numeric bounds coerce the operand.
+        let ast::Expr::Between { lhs, .. } =
+            parse_expr("DATE_FORMAT(x, '%H.%i%s') BETWEEN 9.0 AND 13.0").unwrap()
+        else {
+            panic!("expected a BETWEEN");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Binary(_, ast::Operator::Add, _)));
+
+        // A bare column is never coerced (preserves index use).
+        let ast::Expr::InList { lhs, .. } = parse_expr("col IN (9, 12)").unwrap() else {
+            panic!("expected an IN list");
+        };
+        assert!(matches!(&*lhs, ast::Expr::Collate(..)));
     }
 
     #[test]
