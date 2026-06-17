@@ -1,0 +1,33 @@
+# ALTER TABLE ... DROP COLUMN of a missing column reports 1091.
+#
+# MySQL fails a DROP of a nonexistent column with ER_CANT_DROP_FIELD_OR_KEY
+# (1091, "Can't DROP ...; check that column/key exists") -- the same code as a
+# missing index drop -- not the ER_BAD_FIELD_ERROR (1054) it uses when a *query*
+# references a missing column. The front-end mapped both to 1054 (they share the
+# engine's "no such column" message), so a failed DROP COLUMN carried the wrong
+# code that tools and `$wpdb` branch on via mysql_errno().
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (the
+# `statement error <code>` directive pins the MySQL error number, so the differing
+# message text does not matter).
+
+statement ok
+CREATE TABLE adcol (id INT PRIMARY KEY, a INT, b INT)
+
+# Dropping a column the table does not have is 1091, not 1054.
+statement error 1091
+ALTER TABLE adcol DROP COLUMN nope
+
+# The multi-operation form (expanded into one statement per operation) reports the
+# same code when one of its DROP COLUMNs names a missing column.
+statement error 1091
+ALTER TABLE adcol ADD COLUMN c INT, DROP COLUMN nope
+
+# A query that references a missing column still reports ER_BAD_FIELD_ERROR
+# (1054), so the two codes stay distinct as in MySQL.
+statement error 1054
+SELECT nope FROM adcol
+
+# Dropping a column that exists still succeeds.
+statement ok
+ALTER TABLE adcol DROP COLUMN b

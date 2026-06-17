@@ -355,16 +355,23 @@ fn run_query(
     };
     debug!(%sql, "parsed by mysql front-end");
 
-    // More than one statement comes only from a multi-table `DROP TABLE a, b`,
-    // which the front-end expands into one `DROP TABLE` per table (the engine has
-    // no multi-table drop). Run each for side effects and reply with a single OK;
-    // a failure on any table returns its error.
+    // More than one statement comes from a form the front-end expands into one
+    // engine statement per item — a multi-table `DROP TABLE a, b` or a
+    // multi-operation `ALTER TABLE` (the engine has neither). Run each for side
+    // effects and reply with a single OK; a failure on any returns its error,
+    // with the same statement-specific code mapping the single-statement path uses.
     if stmts.len() != 1 {
         for stmt in stmts {
             let is_drop_table = matches!(&stmt, ast::Stmt::DropTable { .. });
+            let is_alter_drop_column = matches!(
+                &stmt,
+                ast::Stmt::AlterTable(at) if matches!(&at.body, ast::AlterTableBody::DropColumn(_))
+            );
             if let Err(e) = run_for_side_effects(conn, stmt) {
                 return if is_drop_table {
                     drop_table_error_response(first_seq, &e)
+                } else if is_alter_drop_column {
+                    drop_column_error_response(first_seq, &e)
                 } else {
                     error_response(first_seq, &e)
                 };
@@ -669,6 +676,13 @@ fn execute_stmt(
     // A `DROP TABLE` of a missing table is `ER_BAD_TABLE_ERROR` (1051) in MySQL,
     // not the generic missing-table `ER_NO_SUCH_TABLE` (1146).
     let is_drop_table = matches!(stmt, ast::Stmt::DropTable { .. });
+    // An `ALTER TABLE ... DROP COLUMN` of a missing column is
+    // `ER_CANT_DROP_FIELD_OR_KEY` (1091), not the generic missing-column
+    // `ER_BAD_FIELD_ERROR` (1054) a query reference gets.
+    let is_alter_drop_column = matches!(
+        &stmt,
+        ast::Stmt::AlterTable(at) if matches!(&at.body, ast::AlterTableBody::DropColumn(_))
+    );
 
     // MySQL treats `COMMIT` / `ROLLBACK` with no transaction in progress as a
     // silent no-op, whereas the engine errors ("no transaction is active").
@@ -716,6 +730,8 @@ fn execute_stmt(
             *last_row_count = -1;
             return if is_drop_table {
                 drop_table_error_response(first_seq, &e)
+            } else if is_alter_drop_column {
+                drop_column_error_response(first_seq, &e)
             } else {
                 error_response(first_seq, &e)
             };
@@ -1075,6 +1091,24 @@ fn drop_table_error_response(seq: u8, error: &LimboError) -> Vec<u8> {
     out
 }
 
+/// Builds an ERR-packet response for a failed `ALTER TABLE ... DROP COLUMN`.
+/// MySQL reports a missing column here with `ER_CANT_DROP_FIELD_OR_KEY` (1091,
+/// "Can't DROP ...; check that column/key exists"), not the `ER_BAD_FIELD_ERROR`
+/// (1054) it uses when a query references a missing column. Any other error maps
+/// as usual.
+fn drop_column_error_response(seq: u8, error: &LimboError) -> Vec<u8> {
+    let (code, state) = error_code_and_state(error);
+    let (code, state) = if code == ER_BAD_FIELD_ERROR {
+        (ER_CANT_DROP_FIELD_OR_KEY, *b"42000")
+    } else {
+        (code, state)
+    };
+    let mut out = Vec::new();
+    let err = ErrPacket::new(code, error.to_string()).with_state(state);
+    encode_frame(&mut out, seq, &err.encode());
+    out
+}
+
 /// Produces a deterministic 20-byte auth scramble for a connection. Credentials
 /// are not verified yet, so the exact bytes do not matter; they only need to be
 /// well-formed for clients that compute a response.
@@ -1177,6 +1211,27 @@ mod tests {
         assert_eq!(
             code_of(&drop_table_error_response(1, &other)),
             ER_BAD_FIELD_ERROR
+        );
+    }
+
+    #[test]
+    fn drop_column_remaps_missing_column_code() {
+        let code_of = |bytes: &[u8]| u16::from_le_bytes([bytes[5], bytes[6]]);
+
+        // `ALTER TABLE ... DROP COLUMN` of a missing column reports
+        // `ER_CANT_DROP_FIELD_OR_KEY` (1091), where a query reference gives 1054.
+        let missing = LimboError::ParseError("no such column: c".into());
+        assert_eq!(code_of(&error_response(1, &missing)), ER_BAD_FIELD_ERROR);
+        assert_eq!(
+            code_of(&drop_column_error_response(1, &missing)),
+            ER_CANT_DROP_FIELD_OR_KEY
+        );
+
+        // Any other error is unchanged by the drop-column mapping.
+        let other = LimboError::ParseError("no such table: t".into());
+        assert_eq!(
+            code_of(&drop_column_error_response(1, &other)),
+            ER_NO_SUCH_TABLE
         );
     }
 
