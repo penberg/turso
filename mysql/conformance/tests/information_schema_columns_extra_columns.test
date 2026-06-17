@@ -1,0 +1,36 @@
+# information_schema.COLUMNS — PRIVILEGES / COLUMN_COMMENT / GENERATION_EXPRESSION
+# / SRS_ID.
+#
+# The COLUMNS emulation exposed the type/key/extra columns but not these, so a
+# query selecting `PRIVILEGES`, `COLUMN_COMMENT`, `GENERATION_EXPRESSION`, or
+# `SRS_ID` (which schema-introspection and migration tools read) errored with
+# "no such column". They now report the same fixed values MySQL gives an ordinary
+# column: `PRIVILEGES` is `select,insert,update,references`, `COLUMN_COMMENT` and
+# `GENERATION_EXPRESSION` are empty (the engine catalog tracks neither), and
+# `SRS_ID` is NULL.
+#
+# Filters by the current database and a file-unique table name. Expected to pass
+# against both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE iscxc (id INT PRIMARY KEY, name VARCHAR(60), n INT)
+
+# Each non-generated, uncommented column reports the fixed values.
+query
+SELECT COLUMN_NAME, PRIVILEGES, COLUMN_COMMENT, GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscxc' ORDER BY ORDINAL_POSITION
+----
+id	select,insert,update,references		
+name	select,insert,update,references		
+n	select,insert,update,references		
+
+# SRS_ID is NULL for an ordinary (non-spatial) column.
+query
+SELECT SRS_ID FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscxc' AND COLUMN_NAME = 'name'
+----
+NULL
+
+# The PRIVILEGES value is selectable as a filter, too.
+query
+SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iscxc' AND PRIVILEGES = 'select,insert,update,references'
+----
+3

@@ -10904,6 +10904,10 @@ fn is_information_schema_columns(name: &ast::QualifiedName) -> bool {
 /// `sqlite_schema` with the `pragma_table_info` table-valued function. The fixed
 /// single charset is reported as `utf8mb4` / `utf8mb4_general_ci` on the character
 /// columns and NULL elsewhere, and `COLUMN_KEY` is `PRI` for a primary-key column.
+/// `PRIVILEGES` is the fixed `select,insert,update,references`, `COLUMN_COMMENT` /
+/// `GENERATION_EXPRESSION` are empty (the engine catalog tracks neither a column
+/// comment nor a generation expression), and `SRS_ID` is NULL (no spatial
+/// columns) — the constant values MySQL reports for an ordinary column.
 ///
 /// Parsed with the engine parser (`turso_parser`) rather than the front-end's,
 /// because the front-end FROM grammar does not model the `pragma_table_info`
@@ -10961,7 +10965,11 @@ fn information_schema_columns_select(current_db: Option<&str>) -> ast::Select {
          lower(p.type) AS COLUMN_TYPE, \
          CASE WHEN p.pk > 0 THEN 'PRI' ELSE '' END AS COLUMN_KEY, \
          CASE WHEN p.pk > 0 AND upper(m.sql) LIKE '%AUTOINCREMENT%' \
-              THEN 'auto_increment' ELSE '' END AS EXTRA \
+              THEN 'auto_increment' ELSE '' END AS EXTRA, \
+         'select,insert,update,references' AS PRIVILEGES, \
+         '' AS COLUMN_COMMENT, \
+         '' AS GENERATION_EXPRESSION, \
+         NULL AS SRS_ID \
          FROM sqlite_schema m \
          JOIN pragma_table_info(m.name) p \
          WHERE m.type = 'table' \
