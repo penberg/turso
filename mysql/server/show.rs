@@ -1707,15 +1707,29 @@ fn table_row_count(conn: &Arc<Connection>, table: &str) -> Result<i64, LimboErro
     Ok(count)
 }
 
-/// The parsed form of a `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern']`
-/// statement: the optional `LIKE` pattern (`None` for the bare form).
+/// The parsed form of a `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern' | WHERE
+/// ...]` statement: the optional `LIKE` pattern and/or a single `WHERE` predicate
+/// over the output columns (`None`/`None` for the bare form).
 struct ShowVariables {
     like: Option<String>,
+    where_filter: Option<VarFilter>,
 }
 
-/// Parses `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern']`, returning `None`
-/// for any other statement — including the `SHOW VARIABLES WHERE ...` form,
-/// which carries an arbitrary predicate and is left to fall through.
+/// A single `WHERE` predicate on the `SHOW VARIABLES` output: `Variable_name` or
+/// `Value` compared with `=` or `LIKE` to a string value.
+struct VarFilter {
+    /// `true` filters on the `Value` column, `false` on `Variable_name`.
+    on_value: bool,
+    /// `true` for `LIKE` (wildcard match), `false` for `=` (case-insensitive
+    /// equality, as MySQL's default collation).
+    like: bool,
+    value: String,
+}
+
+/// Parses `SHOW [GLOBAL|SESSION] VARIABLES [LIKE 'pattern' | WHERE <col> {= |
+/// LIKE} 'value']`, returning `None` for any other statement. The `WHERE` form
+/// recognizes a single `=`/`LIKE` predicate over the `Variable_name` or `Value`
+/// output column; a more complex predicate falls through as unsupported.
 fn parse_show_variables(sql: &str) -> Option<ShowVariables> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = tokenize(trimmed);
@@ -1750,11 +1764,43 @@ fn parse_show_variables(sql: &str) -> Option<ShowVariables> {
         None
     };
 
-    // Any trailing tokens (e.g. WHERE) are not handled here.
+    // Optional `WHERE <col> {= | LIKE} 'value'` (mutually exclusive with `LIKE`),
+    // over one of the two output columns. A more complex predicate (an `AND`, an
+    // unknown column, a non-string value) falls through as unsupported.
+    let where_filter = if like.is_none() && toks.get(k).is_some_and(|t| kw(t, "WHERE")) {
+        k += 1;
+        let col = toks.get(k)?;
+        let on_value = if kw(col, "Variable_name") {
+            false
+        } else if kw(col, "Value") {
+            true
+        } else {
+            return None;
+        };
+        k += 1;
+        let like = match toks.get(k)?.as_str() {
+            "=" => false,
+            t if kw(t, "LIKE") => true,
+            _ => return None,
+        };
+        k += 1;
+        let value = unquote_token(toks.get(k)?)?;
+        k += 1;
+        Some(VarFilter {
+            on_value,
+            like,
+            value,
+        })
+    } else {
+        None
+    };
+
+    // Any further tokens (a compound `WHERE ... AND ...`, a trailing `WHERE`
+    // after `LIKE`, etc.) are not handled here.
     if k != toks.len() {
         return None;
     }
-    Some(ShowVariables { like })
+    Some(ShowVariables { like, where_filter })
 }
 
 /// Builds the `SHOW VARIABLES` result set (`Variable_name`, `Value`) from the
@@ -1765,6 +1811,17 @@ fn build_variables(show: &ShowVariables) -> ColumnsResult {
         .iter()
         .filter(|(name, _)| match &show.like {
             Some(pattern) => like_match(pattern, name),
+            None => true,
+        })
+        .filter(|(name, value)| match &show.where_filter {
+            Some(f) => {
+                let target = if f.on_value { value } else { name };
+                if f.like {
+                    like_match(&f.value, target)
+                } else {
+                    target.eq_ignore_ascii_case(&f.value)
+                }
+            }
             None => true,
         })
         .map(|(name, value)| vec![Some((*name).to_string()), Some((*value).to_string())])
@@ -2097,9 +2154,26 @@ mod tests {
         // The GLOBAL / SESSION scope is accepted.
         assert!(parse_show_variables("SHOW GLOBAL VARIABLES LIKE 'autocommit'").is_some());
         assert!(parse_show_variables("SHOW SESSION VARIABLES").is_some());
-        // Unrelated statements and the WHERE form fall through.
+        // Unrelated statements fall through.
         assert!(parse_show_variables("SHOW TABLES").is_none());
-        assert!(parse_show_variables("SHOW VARIABLES WHERE Variable_name = 'x'").is_none());
+        // The WHERE form is now recognized over the two output columns.
+        let f = parse_show_variables("SHOW VARIABLES WHERE Variable_name = 'autocommit'")
+            .unwrap()
+            .where_filter
+            .expect("a filter");
+        assert!(!f.on_value);
+        assert!(!f.like);
+        assert_eq!(f.value, "autocommit");
+        let f = parse_show_variables("SHOW VARIABLES WHERE Value LIKE 'utf8%'")
+            .unwrap()
+            .where_filter
+            .expect("a filter");
+        assert!(f.on_value);
+        assert!(f.like);
+        // A WHERE on an unknown column, a compound WHERE, or a WHERE after LIKE
+        // falls through.
+        assert!(parse_show_variables("SHOW VARIABLES WHERE Foo = 'x'").is_none());
+        assert!(parse_show_variables("SHOW VARIABLES LIKE 'a%' WHERE Value = '1'").is_none());
     }
 
     #[test]
@@ -2107,6 +2181,7 @@ mod tests {
         // An exact name yields one row.
         let one = build_variables(&ShowVariables {
             like: Some("autocommit".to_string()),
+            where_filter: None,
         });
         assert_eq!(one.rows.len(), 1);
         assert_eq!(one.rows[0][0].as_deref(), Some("autocommit"));
@@ -2116,6 +2191,7 @@ mod tests {
         // matching is case-insensitive.
         let many = build_variables(&ShowVariables {
             like: Some("CHARACTER_SET_C%".to_string()),
+            where_filter: None,
         });
         let names: Vec<_> = many.rows.iter().map(|r| r[0].clone().unwrap()).collect();
         assert_eq!(names, ["character_set_client", "character_set_connection"]);
@@ -2123,8 +2199,36 @@ mod tests {
         // An unknown variable yields no rows.
         let none = build_variables(&ShowVariables {
             like: Some("no_such_xyzzy".to_string()),
+            where_filter: None,
         });
         assert!(none.rows.is_empty());
+
+        // The `WHERE Variable_name = ...` form selects that one variable.
+        let by_name = build_variables(&ShowVariables {
+            like: None,
+            where_filter: Some(VarFilter {
+                on_value: false,
+                like: false,
+                value: "max_allowed_packet".to_string(),
+            }),
+        });
+        assert_eq!(by_name.rows.len(), 1);
+        assert_eq!(by_name.rows[0][1].as_deref(), Some("67108864"));
+
+        // `WHERE Value LIKE ...` filters on the value column.
+        let by_value = build_variables(&ShowVariables {
+            like: None,
+            where_filter: Some(VarFilter {
+                on_value: true,
+                like: true,
+                value: "InnoDB".to_string(),
+            }),
+        });
+        assert!(by_value
+            .rows
+            .iter()
+            .all(|r| r[1].as_deref() == Some("InnoDB")));
+        assert!(!by_value.rows.is_empty());
     }
 
     #[test]

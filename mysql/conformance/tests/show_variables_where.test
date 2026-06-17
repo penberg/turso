@@ -1,0 +1,36 @@
+# SHOW VARIABLES WHERE — predicate over the output columns.
+#
+# Besides `LIKE 'pat'`, MySQL's SHOW VARIABLES accepts a WHERE clause filtering
+# its `Variable_name` / `Value` output rows. The front-end recognized only the
+# LIKE form and rejected WHERE. It now applies a single `=` / `LIKE` predicate
+# over either column.
+#
+# Filters select a single front-end-modeled variable whose value equals a real
+# mysqld's (max_allowed_packet = 67108864, version_compile_os = 'Linux',
+# lower_case_table_names = 0), so the comparison matches; a multi-row LIKE is
+# avoided because a real server models hundreds more variables. Expected to pass
+# against both turso-mysql-server and a real mysqld.
+
+# `WHERE Variable_name = 'name'` selects that one variable.
+query
+SHOW VARIABLES WHERE Variable_name = 'max_allowed_packet'
+----
+max_allowed_packet	67108864
+
+# A `LIKE` predicate on the name column honors MySQL's backslash escape, so the
+# escaped underscores match literally and select just the one variable.
+query
+SHOW VARIABLES WHERE Variable_name LIKE 'version\_compile\_os'
+----
+version_compile_os	Linux
+
+# The GLOBAL/SESSION scope is accepted before the WHERE form, too.
+query
+SHOW GLOBAL VARIABLES WHERE Variable_name = 'lower_case_table_names'
+----
+lower_case_table_names	0
+
+# A predicate that matches nothing yields an empty result.
+query
+SHOW VARIABLES WHERE Variable_name = 'no_such_variable_xyz'
+----
