@@ -8944,6 +8944,8 @@ fn build_compound_interval(
     }
     let negate = net_negate ^ leading_neg;
 
+    // Keep a copy of the target for the date-vs-datetime result check below.
+    let target_for_result = target.clone();
     let mut args = vec![Box::new(target)];
     for (part, field) in parts.iter().zip(fields) {
         let value: i64 = part.parse().map_err(|_| {
@@ -8954,7 +8956,7 @@ fn build_compound_interval(
             &format!("{signed:+} {field}"),
         )))));
     }
-    Ok(ast::Expr::FunctionCall {
+    let datetime_result = ast::Expr::FunctionCall {
         name: ast::Name::from_string("datetime"),
         distinctness: None,
         args,
@@ -8964,7 +8966,20 @@ fn build_compound_interval(
             filter_clause: None,
             over_clause: None,
         },
-    })
+    };
+    // A compound unit whose fields are all date units (`YEAR_MONTH`) returns a
+    // DATE when the target has no time of day, like the single date-unit
+    // intervals — `DATE_ADD(DATE '2024-06-17', INTERVAL '1-2' YEAR_MONTH)` is the
+    // date `2025-08-17`, not a datetime. A unit with a time field (`DAY_HOUR`,
+    // `MINUTE_SECOND`, …) always returns a datetime.
+    let all_date_fields = fields
+        .iter()
+        .all(|f| matches!(*f, "years" | "months" | "days"));
+    if all_date_fields {
+        Ok(date_unit_result(&target_for_result, datetime_result))
+    } else {
+        Ok(datetime_result)
+    }
 }
 
 /// Builds `CAST(a / b AS INTEGER)` — the integer quotient (truncated toward
@@ -14683,10 +14698,26 @@ mod tests {
             datetime_mods("DATE_ADD(d, INTERVAL '1:2:3' HOUR_SECOND)"),
             ["'+1 hours'", "'+2 minutes'", "'+3 seconds'"]
         );
-        assert_eq!(
-            datetime_mods("DATE_ADD(d, INTERVAL '2-3' YEAR_MONTH)"),
-            ["'+2 years'", "'+3 months'"]
-        );
+        // `YEAR_MONTH` is date-only, so its result is wrapped in the date-vs-
+        // datetime guard (a `CASE`) like the single date-unit intervals; the
+        // datetime() call with its modifiers lives in the `THEN` branch.
+        let ast::Expr::Case { when_then_pairs, .. } =
+            parse_expr("DATE_ADD(d, INTERVAL '2-3' YEAR_MONTH)").unwrap()
+        else {
+            panic!("expected a date-vs-datetime CASE for a YEAR_MONTH interval");
+        };
+        let ast::Expr::FunctionCall { name, args, .. } = &*when_then_pairs[0].1 else {
+            panic!("expected the THEN branch to be a datetime() call");
+        };
+        assert_eq!(name.as_str(), "datetime");
+        let mods: Vec<&str> = args[1..]
+            .iter()
+            .map(|a| match a.as_ref() {
+                ast::Expr::Literal(ast::Literal::String(s)) => s.as_str(),
+                _ => panic!("expected a string modifier"),
+            })
+            .collect();
+        assert_eq!(mods, ["'+2 years'", "'+3 months'"]);
         assert_eq!(
             datetime_mods("DATE_ADD(d, INTERVAL '1 2:3:4' DAY_SECOND)"),
             ["'+1 days'", "'+2 hours'", "'+3 minutes'", "'+4 seconds'"]

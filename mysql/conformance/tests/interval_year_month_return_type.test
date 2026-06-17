@@ -1,0 +1,42 @@
+# DATE_ADD / DATE_SUB with a YEAR_MONTH interval returns a DATE.
+#
+# MySQL's DATE_ADD returns a DATE (no time) when the target is a date and the
+# interval is date-only -- this holds for the single units YEAR / MONTH / DAY /
+# WEEK / QUARTER and for the compound YEAR_MONTH. The front-end lowered the
+# single date units through a date-vs-datetime guard but the compound units
+# always through datetime(), so `DATE_ADD(DATE, INTERVAL '1-2' YEAR_MONTH)` came
+# back as a datetime `2025-08-17 00:00:00` instead of the date `2025-08-17`.
+# YEAR_MONTH now uses the same guard, since both its fields are date units.
+#
+# A compound unit that includes a time field (DAY_HOUR, MINUTE_SECOND, ...) still
+# returns a datetime, and a target that already has a time keeps it. Expected to
+# pass against both turso-mysql-server and a real mysqld.
+
+# A date target plus a YEAR_MONTH interval stays a date.
+query
+SELECT DATE_ADD('2024-06-17', INTERVAL '1-2' YEAR_MONTH)
+----
+2025-08-17
+
+query
+SELECT DATE_SUB('2024-06-17', INTERVAL '0-3' YEAR_MONTH)
+----
+2024-03-17
+
+# A target with a time of day keeps the time (returns a datetime).
+query
+SELECT DATE_ADD('2024-06-17 10:30:00', INTERVAL '1-2' YEAR_MONTH)
+----
+2025-08-17 10:30:00
+
+# A compound unit with a time field still returns a datetime from a date target.
+query
+SELECT DATE_ADD('2024-06-17', INTERVAL '2 3' DAY_HOUR)
+----
+2024-06-19 03:00:00
+
+# It matches the single date-unit intervals, which already returned a date.
+query
+SELECT DATE_ADD('2024-06-17', INTERVAL 14 MONTH), DATE_ADD('2024-06-17', INTERVAL '1-2' YEAR_MONTH)
+----
+2025-08-17	2025-08-17
