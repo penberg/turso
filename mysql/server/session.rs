@@ -27,8 +27,9 @@ pub enum SessionResponse {
 }
 
 /// Tries to handle `sql` as a session/introspection query. Returns `None` if it
-/// is a real statement that should go to the parser.
-pub fn try_handle(sql: &str) -> Option<SessionResponse> {
+/// is a real statement that should go to the parser. `current_db` is the
+/// connection's selected database, reported by `DATABASE()` / `SCHEMA()`.
+pub fn try_handle(sql: &str, current_db: Option<&str>) -> Option<SessionResponse> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
 
@@ -74,7 +75,7 @@ pub fn try_handle(sql: &str) -> Option<SessionResponse> {
 
     // `SELECT @@var, ...` / `SELECT VERSION()` and similar introspection.
     if upper.starts_with("SELECT ") || upper.starts_with("SELECT\t") {
-        return handle_select(&trimmed[6..]);
+        return handle_select(&trimmed[6..], current_db);
     }
 
     None
@@ -83,7 +84,7 @@ pub fn try_handle(sql: &str) -> Option<SessionResponse> {
 /// Handles a `SELECT` whose every item is a system variable or a known
 /// session function. Returns `None` if any item is something else, so genuine
 /// `SELECT` statements fall through to the parser.
-fn handle_select(list: &str) -> Option<SessionResponse> {
+fn handle_select(list: &str, current_db: Option<&str>) -> Option<SessionResponse> {
     let list = strip_trailing_limit(list).trim();
     if list.is_empty() {
         return None;
@@ -92,7 +93,7 @@ fn handle_select(list: &str) -> Option<SessionResponse> {
     let mut values = Vec::new();
     for item in split_top_level_commas(list) {
         let (expr, alias) = split_alias(item.trim());
-        let value = eval(expr)?;
+        let value = eval(expr, current_db)?;
         columns.push(alias.unwrap_or_else(|| expr.to_string()));
         values.push(value);
     }
@@ -102,7 +103,7 @@ fn handle_select(list: &str) -> Option<SessionResponse> {
 /// Evaluates a single session expression. The outer `Option` is `None` when the
 /// expression is not one we handle; the inner `Option` distinguishes a value
 /// from SQL `NULL`.
-fn eval(expr: &str) -> Option<Option<String>> {
+fn eval(expr: &str, current_db: Option<&str>) -> Option<Option<String>> {
     let expr = expr.trim();
     if let Some(var) = expr.strip_prefix("@@") {
         let name = var
@@ -120,7 +121,10 @@ fn eval(expr: &str) -> Option<Option<String>> {
     }
     match expr.to_ascii_uppercase().as_str() {
         "VERSION()" => Some(Some(SERVER_VERSION.to_string())),
-        "DATABASE()" | "SCHEMA()" => Some(None),
+        // The connection's current database, or SQL NULL when none is selected —
+        // matching MySQL and the parser's folding of `DATABASE()` in a larger
+        // expression.
+        "DATABASE()" | "SCHEMA()" => Some(current_db.map(str::to_string)),
         "CONNECTION_ID()" => Some(Some("1".to_string())),
         "USER()" | "CURRENT_USER()" | "SESSION_USER()" | "SYSTEM_USER()" => {
             Some(Some("root@localhost".to_string()))
@@ -183,11 +187,11 @@ mod tests {
     #[test]
     fn set_is_ok() {
         assert!(matches!(
-            try_handle("SET autocommit=1"),
+            try_handle("SET autocommit=1", None),
             Some(SessionResponse::Ok)
         ));
         assert!(matches!(
-            try_handle("SET NAMES utf8mb4"),
+            try_handle("SET NAMES utf8mb4", None),
             Some(SessionResponse::Ok)
         ));
     }
@@ -201,12 +205,12 @@ mod tests {
             "FLUSH TABLES WITH READ LOCK",
         ] {
             assert!(
-                matches!(try_handle(sql), Some(SessionResponse::Ok)),
+                matches!(try_handle(sql, None), Some(SessionResponse::Ok)),
                 "expected `{sql}` to be a no-op OK"
             );
         }
         // Bare `FLUSH` (no target) is left to the parser, which rejects it.
-        assert!(try_handle("FLUSH").is_none());
+        assert!(try_handle("FLUSH", None).is_none());
     }
 
     #[test]
@@ -218,7 +222,7 @@ mod tests {
             "DROP PROCEDURE IF EXISTS db.foo",
         ] {
             assert!(
-                matches!(try_handle(sql), Some(SessionResponse::Ok)),
+                matches!(try_handle(sql, None), Some(SessionResponse::Ok)),
                 "expected `{sql}` to be a no-op OK"
             );
         }
@@ -231,14 +235,14 @@ mod tests {
             "DROP PROCEDURE IF EXISTS",
             "DROP TABLE IF EXISTS foo",
         ] {
-            assert!(try_handle(sql).is_none(), "expected `{sql}` to fall through");
+            assert!(try_handle(sql, None).is_none(), "expected `{sql}` to fall through");
         }
     }
 
     #[test]
     fn system_variable_select() {
         let Some(SessionResponse::Row { columns, values }) =
-            try_handle("SELECT @@max_allowed_packet")
+            try_handle("SELECT @@max_allowed_packet", None)
         else {
             panic!("expected a row");
         };
@@ -250,7 +254,7 @@ mod tests {
     fn data_loading_toggle_variables_default_on() {
         // mysqldump / import flows read these; both default to 1 in MySQL.
         for var in ["@@foreign_key_checks", "@@unique_checks"] {
-            let Some(SessionResponse::Row { values, .. }) = try_handle(&format!("SELECT {var}"))
+            let Some(SessionResponse::Row { values, .. }) = try_handle(&format!("SELECT {var}"), None)
             else {
                 panic!("expected a row for {var}");
             };
@@ -272,7 +276,7 @@ mod tests {
             ("@@sql_select_limit", "18446744073709551615"),
             ("@@have_query_cache", "NO"),
         ] {
-            let Some(SessionResponse::Row { values, .. }) = try_handle(&format!("SELECT {var}"))
+            let Some(SessionResponse::Row { values, .. }) = try_handle(&format!("SELECT {var}"), None)
             else {
                 panic!("expected a row for {var}");
             };
@@ -283,7 +287,7 @@ mod tests {
     #[test]
     fn multi_variable_select_with_aliases() {
         let Some(SessionResponse::Row { columns, values }) =
-            try_handle("SELECT @@max_allowed_packet AS p, @@wait_timeout AS w")
+            try_handle("SELECT @@max_allowed_packet AS p, @@wait_timeout AS w", None)
         else {
             panic!("expected a row");
         };
@@ -296,8 +300,26 @@ mod tests {
 
     #[test]
     fn real_select_falls_through() {
-        assert!(try_handle("SELECT id FROM users").is_none());
-        assert!(try_handle("SELECT 1").is_none());
+        assert!(try_handle("SELECT id FROM users", None).is_none());
+        assert!(try_handle("SELECT 1", None).is_none());
+    }
+
+    #[test]
+    fn database_and_schema_report_the_current_db() {
+        // The bare fast-path forms report the connection's selected database.
+        for sql in ["SELECT DATABASE()", "SELECT SCHEMA()", "select database()"] {
+            let Some(SessionResponse::Row { values, .. }) = try_handle(sql, Some("wordpress"))
+            else {
+                panic!("expected a row for `{sql}`");
+            };
+            assert_eq!(values, vec![Some("wordpress".to_string())], "{sql}");
+        }
+        // With no database selected, they are SQL NULL.
+        let Some(SessionResponse::Row { values, .. }) = try_handle("SELECT DATABASE()", None)
+        else {
+            panic!("expected a row");
+        };
+        assert_eq!(values, vec![None]);
     }
 
     #[test]
@@ -310,11 +332,11 @@ mod tests {
             "UNLOCK TABLE",
         ] {
             assert!(
-                matches!(try_handle(sql), Some(SessionResponse::Ok)),
+                matches!(try_handle(sql, None), Some(SessionResponse::Ok)),
                 "expected `{sql}` to be acknowledged"
             );
         }
         // `LOCK INSTANCE` / `LOCK TABLESPACE` are not table locks and fall through.
-        assert!(try_handle("LOCK INSTANCE FOR BACKUP").is_none());
+        assert!(try_handle("LOCK INSTANCE FOR BACKUP", None).is_none());
     }
 }

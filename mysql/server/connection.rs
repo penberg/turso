@@ -344,7 +344,7 @@ fn run_query(
     // Client libraries probe the connection with session/introspection queries
     // (`SELECT @@max_allowed_packet`, `SET ...`) before running real SQL. Answer
     // those here so the parser only ever sees user statements.
-    if let Some(response) = session::try_handle(dispatch_sql) {
+    if let Some(response) = session::try_handle(dispatch_sql, current_db) {
         return encode_session_response(first_seq, response);
     }
 

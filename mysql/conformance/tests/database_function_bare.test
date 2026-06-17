@@ -1,0 +1,35 @@
+# Bare SELECT DATABASE() / SCHEMA() report the connection's current database.
+#
+# A bare `SELECT DATABASE()` (and the other connection-probe SELECTs) is answered
+# by the server's session fast-path before the parser sees it. That fast-path
+# returned a hard-coded NULL for DATABASE() / SCHEMA(), so a connection that had
+# selected a database still saw NULL -- even though the parser already folded
+# DATABASE() to the real name inside a larger expression (the two paths
+# disagreed). WordPress's multisite and dbDelta logic read the current database
+# name this way. The fast-path now reports the connection's selected database, or
+# NULL when none is selected, matching MySQL and the parser.
+#
+# The conformance harness connects both targets to the database `conformance`, so
+# the bare forms below return that name. (An expression over DATABASE() goes to
+# the parser, which already handled it -- see introspection_fn.test; these bare
+# forms exercise the fast-path that was wrong.) Expected to pass against both
+# turso-mysql-server and a real mysqld.
+
+# The bare DATABASE() probe.
+query
+SELECT DATABASE()
+----
+conformance
+
+# Its synonym SCHEMA(), also bare.
+query
+SELECT SCHEMA()
+----
+conformance
+
+# A bare multi-item probe select (still the fast-path) carries the name through,
+# including alongside another introspection function and under an alias.
+query
+SELECT DATABASE(), SCHEMA() AS s
+----
+conformance	conformance
