@@ -1,0 +1,38 @@
+# information_schema.TABLES — DATA_FREE / MAX_DATA_LENGTH / AVG_ROW_LENGTH /
+# CREATE_OPTIONS / UPDATE_TIME / CHECK_TIME / CHECKSUM.
+#
+# The TABLES emulation exposed the name/engine/type/row/length columns but not
+# these, so a query selecting them (which Site Health and backup / migration
+# tools read) errored with "no such column". They now report the same fixed
+# values MySQL gives a freshly created table: a base table has DATA_FREE /
+# MAX_DATA_LENGTH / AVG_ROW_LENGTH 0, CREATE_OPTIONS empty, and UPDATE_TIME /
+# CHECK_TIME / CHECKSUM NULL; a view reports NULL for all of them, as the
+# engine/row columns already treat a view.
+#
+# Filters by the current database and file-unique names. Expected to pass against
+# both turso-mysql-server and a real mysqld.
+
+statement ok
+CREATE TABLE istx_base (id INT PRIMARY KEY, n INT)
+
+statement ok
+CREATE VIEW istx_view AS SELECT id FROM istx_base
+
+# A base table: the size/free columns are 0, CREATE_OPTIONS empty (CREATE_OPTIONS
+# sits before a never-empty last column).
+query
+SELECT DATA_FREE, MAX_DATA_LENGTH, AVG_ROW_LENGTH, CREATE_OPTIONS, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'istx_base'
+----
+0	0	0		BASE TABLE
+
+# The time / checksum columns are NULL for a base table.
+query
+SELECT UPDATE_TIME, CHECK_TIME, CHECKSUM FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'istx_base'
+----
+NULL	NULL	NULL
+
+# A view reports NULL for every one of these physical columns.
+query
+SELECT DATA_FREE, MAX_DATA_LENGTH, AVG_ROW_LENGTH, CREATE_OPTIONS, CHECKSUM FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'istx_view'
+----
+NULL	NULL	NULL	NULL	NULL

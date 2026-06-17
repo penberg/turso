@@ -10749,12 +10749,19 @@ fn information_schema_tables_select(current_db: Option<&str>) -> Result<ast::Sel
          CASE WHEN type = 'view' THEN NULL ELSE 10 END AS VERSION, \
          CASE WHEN type = 'view' THEN NULL ELSE 'Dynamic' END AS ROW_FORMAT, \
          CASE WHEN type = 'view' THEN NULL ELSE 0 END AS TABLE_ROWS, \
+         CASE WHEN type = 'view' THEN NULL ELSE 0 END AS AVG_ROW_LENGTH, \
          CASE WHEN type = 'view' THEN NULL ELSE 0 END AS DATA_LENGTH, \
+         CASE WHEN type = 'view' THEN NULL ELSE 0 END AS MAX_DATA_LENGTH, \
          CASE WHEN type = 'view' THEN NULL ELSE 0 END AS INDEX_LENGTH, \
+         CASE WHEN type = 'view' THEN NULL ELSE 0 END AS DATA_FREE, \
          CASE WHEN type = 'table' AND sqlite_schema.sql LIKE '%AUTOINCREMENT%' \
               THEN (SELECT seq + 1 FROM sqlite_sequence \
                     WHERE sqlite_sequence.name = sqlite_schema.name) \
               ELSE NULL END AS AUTO_INCREMENT, \
+         NULL AS UPDATE_TIME, \
+         NULL AS CHECK_TIME, \
+         NULL AS CHECKSUM, \
+         CASE WHEN type = 'view' THEN NULL ELSE '' END AS CREATE_OPTIONS, \
          CASE WHEN type = 'view' THEN 'VIEW' ELSE '' END AS TABLE_COMMENT \
          FROM sqlite_schema \
          WHERE type IN ('table', 'view') \
