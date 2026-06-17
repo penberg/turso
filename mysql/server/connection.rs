@@ -331,7 +331,7 @@ fn run_query(
     // `SHOW [FULL] COLUMNS FROM tbl` is answered from the schema here; the AST
     // has no `SHOW`, so it cannot go through the parser. Every other `SHOW`
     // falls through and is rejected by the parser as unsupported.
-    if let Some(outcome) = show::try_handle(conn, dispatch_sql) {
+    if let Some(outcome) = show::try_handle(conn, dispatch_sql, current_db) {
         return match outcome {
             Ok(ShowOutcome::Columns(result)) => encode_columns_result(first_seq, result),
             Ok(ShowOutcome::NoSuchTable(name)) => no_such_table_response(first_seq, &name),

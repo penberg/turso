@@ -48,7 +48,11 @@ pub enum ShowOutcome {
 ///
 /// Returns `None` if `sql` is none of these, so every other `SHOW` form falls
 /// through to the parser (which rejects it as unsupported).
-pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcome, LimboError>> {
+pub fn try_handle(
+    conn: &Arc<Connection>,
+    sql: &str,
+    current_db: Option<&str>,
+) -> Option<Result<ShowOutcome, LimboError>> {
     if let Some(parsed) = parse_show_columns(sql).or_else(|| parse_describe(sql)) {
         return Some(build(conn, &parsed));
     }
@@ -70,7 +74,7 @@ pub fn try_handle(conn: &Arc<Connection>, sql: &str) -> Option<Result<ShowOutcom
     if let Some(result) = parse_show_empty_enumeration(sql) {
         return Some(Ok(ShowOutcome::Columns(result)));
     }
-    if let Some(result) = parse_maintenance(sql) {
+    if let Some(result) = parse_maintenance(sql, current_db) {
         return Some(Ok(ShowOutcome::Columns(result)));
     }
     None
@@ -154,11 +158,13 @@ fn parse_show_empty_enumeration(sql: &str) -> Option<ColumnsResult> {
 /// these). The engine has no fragmentation, optimizer statistics, or
 /// MySQL-style corruption, so each is a no-op that reports success: the result
 /// is MySQL's `Table` / `Op` / `Msg_type` / `Msg_text` columns with one
-/// `status` / `OK` row per named table. The `Table` value is the bare table name
-/// (the engine has no schema-qualified name, so it is not `db.tbl` as MySQL
-/// reports), and trailing options (`QUICK`, `EXTENDED`, `FOR UPGRADE`, …) are
-/// ignored. Returns `None` for any other statement.
-fn parse_maintenance(sql: &str) -> Option<ColumnsResult> {
+/// `status` / `OK` row per named table. The `Table` value is MySQL's
+/// schema-qualified `db.tbl` name — the database the statement gives explicitly
+/// (`ANALYZE TABLE db.tbl`), else the connection's current database; with no
+/// current database it falls back to the bare table name. Trailing options
+/// (`QUICK`, `EXTENDED`, `FOR UPGRADE`, …) are ignored. Returns `None` for any
+/// other statement.
+fn parse_maintenance(sql: &str, current_db: Option<&str>) -> Option<ColumnsResult> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = tokenize(trimmed);
     let kw = |t: &str, k: &str| t.eq_ignore_ascii_case(k);
@@ -185,23 +191,31 @@ fn parse_maintenance(sql: &str) -> Option<ColumnsResult> {
 
     // The comma-separated table list (each possibly `db.tbl`). The list ends at
     // the first token that is not followed by a comma; any trailing option
-    // keywords are left unconsumed and ignored.
+    // keywords are left unconsumed and ignored. Each reported `Table` is
+    // schema-qualified `db.tbl`, as MySQL reports — the explicit database if the
+    // statement gives one, else the connection's current database.
     let mut tables = Vec::new();
     loop {
         let Some(first) = toks.get(k) else { break };
+        let mut db = current_db.map(str::to_string);
         let mut table = first.clone();
         k += 1;
         if toks.get(k).is_some_and(|t| t == ".") {
             k += 1;
             match toks.get(k) {
                 Some(t) => {
+                    db = Some(table);
                     table = t.clone();
                     k += 1;
                 }
                 None => return None,
             }
         }
-        tables.push(table);
+        let qualified = match db {
+            Some(db) => format!("{db}.{table}"),
+            None => table,
+        };
+        tables.push(qualified);
         if toks.get(k).is_some_and(|t| t == ",") {
             k += 1;
             continue;
@@ -2152,17 +2166,24 @@ mod tests {
 
     #[test]
     fn parses_maintenance_statements() {
-        // Each op yields a `status`/`OK` row per table with the op name.
-        let r = parse_maintenance("ANALYZE TABLE t").unwrap();
+        // Each op yields a `status`/`OK` row per table with the op name; the
+        // `Table` value is the current database-qualified `db.tbl`, as MySQL.
+        let r = parse_maintenance("ANALYZE TABLE t", Some("mydb")).unwrap();
         assert_eq!(r.columns, vec!["Table", "Op", "Msg_type", "Msg_text"]);
         assert_eq!(
             r.rows,
             vec![vec![
-                Some("t".to_string()),
+                Some("mydb.t".to_string()),
                 Some("analyze".to_string()),
                 Some("status".to_string()),
                 Some("OK".to_string()),
             ]]
+        );
+
+        // With no current database the bare table name is used.
+        assert_eq!(
+            parse_maintenance("ANALYZE TABLE t", None).unwrap().rows[0][0],
+            Some("t".to_string())
         );
 
         // The op name is taken from the keyword.
@@ -2171,22 +2192,34 @@ mod tests {
             ("OPTIMIZE TABLE t", "optimize"),
             ("REPAIR TABLE t", "repair"),
         ] {
-            assert_eq!(parse_maintenance(sql).unwrap().rows[0][1], Some(op.to_string()));
+            assert_eq!(
+                parse_maintenance(sql, Some("mydb")).unwrap().rows[0][1],
+                Some(op.to_string())
+            );
         }
 
         // A comma-separated list gives one row per table; the `LOCAL` modifier
-        // and trailing options are ignored; a `db.tbl` name uses the table part.
-        assert_eq!(parse_maintenance("ANALYZE TABLE a, b").unwrap().rows.len(), 2);
-        assert_eq!(parse_maintenance("OPTIMIZE LOCAL TABLE t").unwrap().rows.len(), 1);
-        assert_eq!(parse_maintenance("CHECK TABLE t QUICK").unwrap().rows.len(), 1);
+        // and trailing options are ignored; an explicit `db.tbl` keeps that db.
         assert_eq!(
-            parse_maintenance("ANALYZE TABLE d.t").unwrap().rows[0][0],
-            Some("t".to_string())
+            parse_maintenance("ANALYZE TABLE a, b", Some("mydb")).unwrap().rows.len(),
+            2
+        );
+        assert_eq!(
+            parse_maintenance("OPTIMIZE LOCAL TABLE t", Some("mydb")).unwrap().rows.len(),
+            1
+        );
+        assert_eq!(
+            parse_maintenance("CHECK TABLE t QUICK", Some("mydb")).unwrap().rows.len(),
+            1
+        );
+        assert_eq!(
+            parse_maintenance("ANALYZE TABLE d.t", Some("mydb")).unwrap().rows[0][0],
+            Some("d.t".to_string())
         );
 
         // Unrelated statements fall through.
-        assert!(parse_maintenance("SELECT 1").is_none());
-        assert!(parse_maintenance("ANALYZE t").is_none()); // missing TABLE
+        assert!(parse_maintenance("SELECT 1", Some("mydb")).is_none());
+        assert!(parse_maintenance("ANALYZE t", Some("mydb")).is_none()); // missing TABLE
     }
 
     #[test]

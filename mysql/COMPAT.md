@@ -555,7 +555,7 @@ SQLite/turso exactly. Any other function is rejected as unsupported.
 
 | Statement          | Status | Comment |
 |--------------------|--------|---------|
-| ANALYZE / CHECK / OPTIMIZE / REPAIR TABLE | 🚧 | Accepted as a no-op that reports success (WordPress's database-repair admin page runs them). The engine has no fragmentation, optimizer statistics, or MySQL-style corruption, so each returns MySQL's `Table`/`Op`/`Msg_type`/`Msg_text` columns with one `status`/`OK` row per named table (comma lists give one row each; the `LOCAL` modifier and trailing options like `QUICK`/`FOR UPGRADE` are ignored). Not byte-identical to mysqld: `Table` is the bare table name (no `db.` prefix), and `OPTIMIZE` returns one status row rather than InnoDB's note + status pair. |
+| ANALYZE / CHECK / OPTIMIZE / REPAIR TABLE | 🚧 | Accepted as a no-op that reports success (WordPress's database-repair admin page runs them). The engine has no fragmentation, optimizer statistics, or MySQL-style corruption, so each returns MySQL's `Table`/`Op`/`Msg_type`/`Msg_text` columns with one `status`/`OK` row per named table (comma lists give one row each; the `LOCAL` modifier and trailing options like `QUICK`/`FOR UPGRADE` are ignored). `Table` is MySQL's schema-qualified `db.tbl` — the database the statement names explicitly, else the connection's current database — so `ANALYZE`/`CHECK TABLE` are byte-identical to mysqld. `OPTIMIZE`/`REPAIR` still diverge on the `Msg_text` (InnoDB returns a note + status pair, or "doesn't support repair", where the engine reports a single `status`/`OK` row). |
 | CHECKSUM TABLE     | ❌     |         |
 
 #### Component, Plugin, and Loadable Function

@@ -1,0 +1,42 @@
+# Table-maintenance statements report a schema-qualified `db.tbl` Table value.
+#
+# MySQL's ANALYZE / CHECK / OPTIMIZE / REPAIR TABLE name the table in the result's
+# `Table` column as `<database>.<table>`. The front-end reported just the bare
+# table name, so WordPress's database-repair page and other tools that key on the
+# qualified name saw a different value. The front-end now qualifies it with the
+# connection's current database (or the database the statement names explicitly).
+#
+# ANALYZE and CHECK are byte-identical to a real mysqld (a no-op status/OK row),
+# so this runs against both turso-mysql-server and a real mysqld. (OPTIMIZE /
+# REPAIR add InnoDB-specific notes the engine does not reproduce; see
+# maintenance_statements.test.) The current database is `conformance`.
+
+statement ok
+CREATE TABLE mtq_a (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE mtq_b (id INT PRIMARY KEY)
+
+# The Table column is qualified with the current database.
+query
+ANALYZE TABLE mtq_a
+----
+conformance.mtq_a	analyze	status	OK
+
+query
+CHECK TABLE mtq_a
+----
+conformance.mtq_a	check	status	OK
+
+# A comma-separated list qualifies each table.
+query
+ANALYZE TABLE mtq_a, mtq_b
+----
+conformance.mtq_a	analyze	status	OK
+conformance.mtq_b	analyze	status	OK
+
+# An explicitly database-qualified name is reported as given.
+query
+CHECK TABLE conformance.mtq_b
+----
+conformance.mtq_b	check	status	OK

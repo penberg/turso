@@ -5,10 +5,11 @@
 # corruption, so each is a no-op that reports success in MySQL's result shape:
 # the Table / Op / Msg_type / Msg_text columns with one status/OK row per table.
 #
-# This is the engine's representation and is NOT byte-identical to a real
-# mysqld: the Table value is the bare table name (the engine has no
-# schema-qualified `db.tbl` name), and OPTIMIZE returns a single status row
-# rather than InnoDB's note + status pair.
+# The `Table` value is MySQL's schema-qualified `db.tbl` (the connection's
+# current database, `conformance` here), matching a real mysqld. ANALYZE / CHECK
+# are byte-identical to MySQL; OPTIMIZE / REPAIR still diverge on the Msg_text
+# (InnoDB returns a note + status pair, or "doesn't support repair", where the
+# engine reports a single status/OK row).
 
 statement ok
 CREATE TABLE IF NOT EXISTS mnt1 (id INT PRIMARY KEY)
@@ -16,41 +17,42 @@ CREATE TABLE IF NOT EXISTS mnt1 (id INT PRIMARY KEY)
 statement ok
 CREATE TABLE IF NOT EXISTS mnt2 (id INT PRIMARY KEY)
 
-# Each operation reports a status OK row, with the operation name in Op.
+# Each operation reports a status OK row, with the operation name in Op, and the
+# table named `<current-db>.<table>` as MySQL reports.
 query
 ANALYZE TABLE mnt1
 ----
-mnt1	analyze	status	OK
+conformance.mnt1	analyze	status	OK
 
 query
 CHECK TABLE mnt1
 ----
-mnt1	check	status	OK
+conformance.mnt1	check	status	OK
 
 query
 OPTIMIZE TABLE mnt1
 ----
-mnt1	optimize	status	OK
+conformance.mnt1	optimize	status	OK
 
 query
 REPAIR TABLE mnt1
 ----
-mnt1	repair	status	OK
+conformance.mnt1	repair	status	OK
 
 # A comma-separated table list reports one row per table.
 query
 ANALYZE TABLE mnt1, mnt2
 ----
-mnt1	analyze	status	OK
-mnt2	analyze	status	OK
+conformance.mnt1	analyze	status	OK
+conformance.mnt2	analyze	status	OK
 
 # Trailing options (QUICK, FOR UPGRADE, ...) and the LOCAL modifier are ignored.
 query
 CHECK TABLE mnt1 QUICK
 ----
-mnt1	check	status	OK
+conformance.mnt1	check	status	OK
 
 query
 OPTIMIZE LOCAL TABLE mnt1
 ----
-mnt1	optimize	status	OK
+conformance.mnt1	optimize	status	OK
