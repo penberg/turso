@@ -1,0 +1,35 @@
+# DROP TABLE of a missing table reports ER_BAD_TABLE_ERROR (1051).
+#
+# MySQL distinguishes two "missing table" error codes: a statement that *uses* a
+# nonexistent table (SELECT / INSERT / ...) fails with ER_NO_SUCH_TABLE (1146),
+# but DROP TABLE of a nonexistent table fails with ER_BAD_TABLE_ERROR (1051,
+# "Unknown table"). The front-end mapped every missing-table error to 1146, so a
+# failed DROP carried the wrong code (tools and `$wpdb` branch on mysql_errno()).
+#
+# Expected to pass against both turso-mysql-server and a real mysqld (the
+# `statement error <code>` directive pins the MySQL error number, so the differing
+# message text does not matter).
+
+statement ok
+CREATE TABLE dtm_keep (id INT PRIMARY KEY)
+
+# A bare DROP of a nonexistent table is 1051, not 1146.
+statement error 1051
+DROP TABLE dtm_absent
+
+# The multi-table form (expanded into one drop per table) reports 1051 when one
+# of the named tables is missing.
+statement error 1051
+DROP TABLE dtm_keep, dtm_absent
+
+# DROP TABLE IF EXISTS of a missing table still succeeds silently.
+statement ok
+DROP TABLE IF EXISTS dtm_absent
+
+# By contrast, a statement that references a missing table keeps ER_NO_SUCH_TABLE
+# (1146), so the two codes stay distinct as in MySQL.
+statement error 1146
+SELECT * FROM dtm_absent
+
+statement error 1146
+INSERT INTO dtm_absent (id) VALUES (1)

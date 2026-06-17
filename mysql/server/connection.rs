@@ -33,6 +33,9 @@ const ER_PARSE_ERROR: u16 = 1064;
 const ER_NOT_SUPPORTED_YET: u16 = 1235;
 /// `ER_NO_SUCH_TABLE`: a statement referenced a table that does not exist.
 const ER_NO_SUCH_TABLE: u16 = 1146;
+/// `ER_BAD_TABLE_ERROR`: `DROP TABLE` named a table that does not exist. MySQL
+/// uses this distinct code (not `ER_NO_SUCH_TABLE`) for a failed drop.
+const ER_BAD_TABLE_ERROR: u16 = 1051;
 /// `ER_DUP_ENTRY`: a write violated a UNIQUE or PRIMARY KEY constraint.
 const ER_DUP_ENTRY: u16 = 1062;
 /// `ER_BAD_NULL_ERROR`: a NULL was stored in a `NOT NULL` column.
@@ -351,8 +354,13 @@ fn run_query(
     // a failure on any table returns its error.
     if stmts.len() != 1 {
         for stmt in stmts {
+            let is_drop_table = matches!(&stmt, ast::Stmt::DropTable { .. });
             if let Err(e) = run_for_side_effects(conn, stmt) {
-                return error_response(first_seq, &e);
+                return if is_drop_table {
+                    drop_table_error_response(first_seq, &e)
+                } else {
+                    error_response(first_seq, &e)
+                };
             }
         }
         // Multiple statements only come from a multi-table `DROP TABLE` (DDL), so
@@ -651,6 +659,9 @@ fn execute_stmt(
         stmt,
         ast::Stmt::Insert { .. } | ast::Stmt::Update { .. } | ast::Stmt::Delete { .. }
     );
+    // A `DROP TABLE` of a missing table is `ER_BAD_TABLE_ERROR` (1051) in MySQL,
+    // not the generic missing-table `ER_NO_SUCH_TABLE` (1146).
+    let is_drop_table = matches!(stmt, ast::Stmt::DropTable { .. });
 
     // MySQL treats `COMMIT` / `ROLLBACK` with no transaction in progress as a
     // silent no-op, whereas the engine errors ("no transaction is active").
@@ -696,7 +707,11 @@ fn execute_stmt(
         Err(e) => {
             // A failed statement leaves `ROW_COUNT()` at -1, as in MySQL.
             *last_row_count = -1;
-            return error_response(first_seq, &e);
+            return if is_drop_table {
+                drop_table_error_response(first_seq, &e)
+            } else {
+                error_response(first_seq, &e)
+            };
         }
     };
 
@@ -1021,6 +1036,23 @@ fn error_response(seq: u8, error: &LimboError) -> Vec<u8> {
     out
 }
 
+/// Builds an ERR-packet response for a failed `DROP TABLE`. MySQL reports a
+/// missing table here with `ER_BAD_TABLE_ERROR` (1051, "Unknown table"), not the
+/// `ER_NO_SUCH_TABLE` (1146) it uses when other statements reference one; both
+/// share the `42S02` SQLSTATE. Any other error maps as usual.
+fn drop_table_error_response(seq: u8, error: &LimboError) -> Vec<u8> {
+    let (code, state) = error_code_and_state(error);
+    let code = if code == ER_NO_SUCH_TABLE {
+        ER_BAD_TABLE_ERROR
+    } else {
+        code
+    };
+    let mut out = Vec::new();
+    let err = ErrPacket::new(code, error.to_string()).with_state(state);
+    encode_frame(&mut out, seq, &err.encode());
+    out
+}
+
 /// Produces a deterministic 20-byte auth scramble for a connection. Credentials
 /// are not verified yet, so the exact bytes do not matter; they only need to be
 /// well-formed for clients that compute a response.
@@ -1083,6 +1115,29 @@ mod tests {
         assert_eq!(
             error_code_and_state(&LimboError::Constraint("CHECK constraint failed".into())),
             (ER_ERROR_GENERAL, *b"HY000")
+        );
+    }
+
+    #[test]
+    fn drop_table_remaps_missing_table_code() {
+        // The ERR packet is `[len(3), seq(1), 0xFF, code_lo, code_hi, ...]`, so
+        // the 2-byte little-endian error code sits at offset 5.
+        let code_of = |bytes: &[u8]| u16::from_le_bytes([bytes[5], bytes[6]]);
+
+        // A DROP of a missing table reports `ER_BAD_TABLE_ERROR` (1051), where the
+        // generic mapping would give `ER_NO_SUCH_TABLE` (1146).
+        let missing = LimboError::ParseError("No such table: t".into());
+        assert_eq!(code_of(&error_response(1, &missing)), ER_NO_SUCH_TABLE);
+        assert_eq!(
+            code_of(&drop_table_error_response(1, &missing)),
+            ER_BAD_TABLE_ERROR
+        );
+
+        // Any other error is unchanged by the drop-specific mapping.
+        let other = LimboError::ParseError("no such column: c".into());
+        assert_eq!(
+            code_of(&drop_table_error_response(1, &other)),
+            ER_BAD_FIELD_ERROR
         );
     }
 
