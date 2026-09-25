@@ -1,0 +1,2 @@
+engine,mode,connections,batch_size,run,transactions,rows,seconds,transactions_per_s,rows_per_s,cpu_user_s,cpu_sys_s,cpu_us_per_transaction,hardware_threads,restarts,p50_ms,p99_ms,p999_ms,max_ms,disk_writes,disk_mb,disk_ms_per_write,checkpoints,checkpoint_p50_ms,checkpoint_max_ms
+turso,concurrent,8,100,3,25295,2529500,30.000,843.17,84316.67,124.372,83.340,8211.59,24,0,7.269,36.717,52.718,74.442,74844,380.4,0.244,27,235.64,1106.22

@@ -1,0 +1,2 @@
+engine,mode,connections,batch_size,run,transactions,rows,seconds,transactions_per_s,rows_per_s,cpu_user_s,cpu_sys_s,cpu_us_per_transaction,hardware_threads,restarts,p50_ms,p99_ms,p999_ms,max_ms,disk_writes,disk_mb,disk_ms_per_write,checkpoints,checkpoint_p50_ms,checkpoint_max_ms
+sqlite,immediate,16,100,2,39469,3946900,30.000,1315.63,131563.33,2.715,1.898,116.89,24,0,0.772,0.854,1.055,23944.420,129686,865.8,0.231,34,3.25,6.03
